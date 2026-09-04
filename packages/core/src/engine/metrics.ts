@@ -43,9 +43,15 @@ export function summariseSession(
 
   let energyKwh: number | null = null
   if (kind === 'charge') {
+    // The car's counter is cumulative but not necessarily zeroed at the point
+    // this session opened: a session that resumed after a pause inherits
+    // whatever the counter had already reached, so subtract the opening value.
+    // If the counter went backwards the car zeroed it mid-session, and the
+    // reading itself is the best estimate we have — never a negative energy.
     const added = lastOf(points, (s) => s.chargeEnergyAddedKwh)
     const startAdded = firstOf(points, (s) => s.chargeEnergyAddedKwh) ?? 0
-    energyKwh = added !== null ? round(added - startAdded, 3) : null
+    energyKwh =
+      added !== null ? round(added >= startAdded ? added - startAdded : added, 3) : null
   } else if (startSoc !== null && endSoc !== null) {
     energyKwh = round(((startSoc - endSoc) / 100) * opts.usableCapacityKwh, 3)
   }

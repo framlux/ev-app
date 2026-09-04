@@ -8,6 +8,27 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The schema tests in packages/db run against this; without it they skip
+    # themselves and the migrations ship untested.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ev
+          POSTGRES_PASSWORD: ev
+          POSTGRES_DB: ev
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: '5432'
+      PGUSER: ev
+      PGPASSWORD: ev
+      PGDATABASE: ev
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

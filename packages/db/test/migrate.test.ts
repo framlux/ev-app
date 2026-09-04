@@ -2,8 +2,26 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { closePool, getPool } from '../src/pool.js'
 import { runMigrations } from '../src/migrate.js'
 
-// Skipped when no Postgres is pointed at, so CI without Docker stays green.
+/**
+ * These tests need a real Postgres. Locally, point them at a throwaway one:
+ *
+ *   docker run --rm -d -e POSTGRES_PASSWORD=ev -e POSTGRES_USER=ev \
+ *     -e POSTGRES_DB=ev -p 55432:5432 postgres:17-alpine
+ *   PGHOST=localhost PGPORT=55432 PGUSER=ev PGPASSWORD=ev PGDATABASE=ev \
+ *     pnpm vitest run packages/db/test/migrate.test.ts
+ *
+ * They may be skipped on a developer machine with no Docker, but never in CI:
+ * a permanently-skipped schema test is a test that reports green while the
+ * partitioning and the one-open-session index rot.
+ */
 const hasDb = Boolean(process.env['PGHOST'])
+
+if (!hasDb && process.env['CI']) {
+  throw new Error(
+    'PGHOST is unset in CI: the schema tests must run against a real Postgres. ' +
+      'See the postgres service in .github/workflows/test.yml.',
+  )
+}
 
 describe.skipIf(!hasDb)('migrations', () => {
   beforeAll(async () => { await runMigrations() })

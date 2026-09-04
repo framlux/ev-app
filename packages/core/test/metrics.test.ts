@@ -34,6 +34,26 @@ describe('summariseSession', () => {
     expect(s.energyKwh).toBeCloseTo(16.4)
     expect(s.maxChargePowerKw).toBe(11)
   })
+
+  it('subtracts the counter reading the session opened on', () => {
+    // A session that follows an earlier charge inherits a counter that is
+    // already well above zero; without the offset it claims energy it did not
+    // add, and estimateCapacity turns that into a capacity above nameplate.
+    const s = summariseSession('charge', [
+      makeSample({ vehicleId: 'v1', ts: t(0),    socPct: 55, chargeEnergyAddedKwh: 16.4, chargePowerKw: 11 }),
+      makeSample({ vehicleId: 'v1', ts: t(3600), socPct: 80, chargeEnergyAddedKwh: 35.4, chargePowerKw: 11 }),
+    ], { usableCapacityKwh: 75 })
+    expect(s.energyKwh).toBeCloseTo(19)
+  })
+
+  it('never reports negative energy when the counter zeroes mid-session', () => {
+    const s = summariseSession('charge', [
+      makeSample({ vehicleId: 'v1', ts: t(0),    socPct: 55, chargeEnergyAddedKwh: 16.4 }),
+      makeSample({ vehicleId: 'v1', ts: t(1800), socPct: 62, chargeEnergyAddedKwh: 2.0 }),
+      makeSample({ vehicleId: 'v1', ts: t(3600), socPct: 70, chargeEnergyAddedKwh: 8.0 }),
+    ], { usableCapacityKwh: 75 })
+    expect(s.energyKwh).toBeCloseTo(8)
+  })
 })
 
 describe('deriveIdles', () => {
