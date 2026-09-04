@@ -14,10 +14,16 @@ RUN pnpm --filter @ev/web build
 FROM node:22-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
-RUN addgroup -S app && adduser -S app -G app
+# Numeric UID, not a name. The kubelet never reads the image's /etc/passwd, so it
+# cannot verify that a named USER is non-root: a pod with runAsNonRoot: true and no
+# runAsUser is REFUSED outright with "image has non-numeric user (app), cannot verify
+# user is non-root". The container never starts, so the failure lands at deploy time,
+# not build time. USER 10001 makes the image self-sufficient regardless of what the
+# manifest sets.
+RUN addgroup -S -g 10001 app && adduser -S -u 10001 -G app app
 COPY --from=build /app/apps/web/build ./build
 COPY --from=build /app/apps/web/package.json ./
 COPY --from=build /app/node_modules ./node_modules
-USER app
+USER 10001
 EXPOSE 3000
 CMD ["node", "build/index.js"]
