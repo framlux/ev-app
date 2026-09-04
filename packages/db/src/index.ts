@@ -1,3 +1,4 @@
-// Placeholder so the package typechecks before Task 8 lands the real modules.
-// Task 8 replaces this with the pool, migrator and repository re-exports.
-export {}
+// Repository modules (src/repo/*.ts) land in Task 12; integration adds their
+// re-exports here.
+export { getPool, closePool } from './pool.js'
+export { runMigrations } from './migrate.js'
