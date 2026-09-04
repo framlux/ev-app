@@ -162,7 +162,9 @@ Nothing downstream of `normalise` knows the vendor. Writing this now costs nothi
 ### 5.1 One-time setup
 
 1. Tesla account with verified email and MFA enabled.
-2. Register the application at `developer.tesla.com`. Domain: `ev.framlux.io`. Requested scopes: `openid`, `vehicle_device_data`, `vehicle_location`. **Deliberately not** `vehicle_cmds` or `vehicle_charging_cmds`.
+2. Register the application at `developer.tesla.com`. Domain: `ev.framlux.io`. Requested scopes: `openid`, `offline_access`, `vehicle_device_data`, `vehicle_location`. **Deliberately not** `vehicle_cmds` or `vehicle_charging_cmds`.
+
+   `offline_access` is required and is easy to miss: without it Tesla returns an access token that expires in 8 hours and **no refresh token at all**, so the integration dies overnight with no obvious cause. It grants no vehicle access of its own — it only permits refresh — so it does not weaken the read-only guarantee.
 3. Generate an EC secp256r1 keypair. The private key becomes a SealedSecret; the public key is served by `ev-web` at `/.well-known/appspecific/com.tesla.3p.public-key.pem`.
 4. Call the partner `register` endpoint for the North America region.
 5. OAuth 2.0 authorization code flow → third-party token. Refresh token stored as a SealedSecret; `ev-ingest` owns refreshing it.

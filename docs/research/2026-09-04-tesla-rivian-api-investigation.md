@@ -50,7 +50,7 @@ Tesla defines three token types. The one we want is the **Third-Party Token**, a
 
 **Scopes available:** `openid`, `vehicle_device_data`, `vehicle_location`, `vehicle_cmds`, `vehicle_charging_cmds`.
 
-> ⚠️ **Superseded — do not use this list when performing the OAuth grant.** The design that came out of this research is read-only, and that guarantee is enforced *only* at the grant: no manifest records the scope set, and a token carrying command scopes behaves identically to a read-only one until something calls a command endpoint. The scopes to request are exactly **`openid`, `vehicle_device_data`, `vehicle_location`** — `vehicle_cmds` and `vehicle_charging_cmds` must **not** be requested. See `docs/superpowers/specs/2026-09-04-ev-app-design.md` §5.1 and the stack repo's `clusters/prod/apps/ev/SECRETS.md`.
+> ⚠️ **Superseded — do not use this list when performing the OAuth grant.** The design that came out of this research is read-only, and that guarantee is enforced *only* at the grant: no manifest records the scope set, and a token carrying command scopes behaves identically to a read-only one until something calls a command endpoint. The scopes to request are exactly **`openid`, `offline_access`, `vehicle_device_data`, `vehicle_location`** — `vehicle_cmds` and `vehicle_charging_cmds` must **not** be requested. See `docs/superpowers/specs/2026-09-04-ev-app-design.md` §5.1 and the stack repo's `clusters/prod/apps/ev/SECRETS.md`.
 
 ### 2.3 Commands need the Vehicle Command Protocol
 
