@@ -1,7 +1,10 @@
 FROM node:22-alpine AS build
 WORKDIR /app
 RUN corepack enable
-COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
+# tsconfig.base.json is not optional: every package tsconfig extends ../../tsconfig.base.json,
+# and without it tsc fails with TS5083 only once the build stage runs - long after the
+# install step that looks like the risky one. .npmrc carries link-workspace-packages.
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml tsconfig.base.json .npmrc ./
 COPY packages/ packages/
 COPY apps/web/ apps/web/
 RUN pnpm install --frozen-lockfile

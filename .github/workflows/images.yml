@@ -26,15 +26,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
+      # ev-ingest's Dockerfile does not exist until plan Task 12 lands. Leaving that
+      # matrix leg to fail red would train everyone to ignore a red images run, which is
+      # exactly when a real regression slips through. Skipping silently is the opposite
+      # trap - a green tick claiming an image was published when none was. So: skip, and
+      # say so loudly in the job summary.
+      - id: check
+        run: |
+          if [ -f "${{ matrix.dockerfile }}" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "### ⏭ ${{ matrix.name }} not built" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`${{ matrix.dockerfile }}\` does not exist yet, so **no image was published**." >> "$GITHUB_STEP_SUMMARY"
+            echo "Expected until the task that creates it lands. Remove this leg or add the Dockerfile." >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=${{ matrix.name }} skipped::${{ matrix.dockerfile }} missing - no image published"
+          fi
 
-      - uses: docker/login-action@v3
+      - if: steps.check.outputs.exists == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - if: steps.check.outputs.exists == 'true'
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: meta
+        if: steps.check.outputs.exists == 'true'
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/framlux/${{ matrix.name }}
@@ -43,7 +63,8 @@ jobs:
             type=ref,event=tag
             type=semver,pattern={{version}}
 
-      - uses: docker/build-push-action@v6
+      - if: steps.check.outputs.exists == 'true'
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
