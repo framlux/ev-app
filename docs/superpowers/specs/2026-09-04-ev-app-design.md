@@ -227,19 +227,41 @@ Image tags are pinned in the kustomization `images:` block, as CRM does.
 
 `ev-telemetry.framlux.io` — `IngressRouteTCP` with `tls.passthrough: true`, whose route rule matches `HostSNI` on that hostname, forwarding to `ev-telemetry:443`. Traefik routes on SNI without terminating, so fleet-telemetry performs its own mTLS and validates the vehicle's client certificate. No additional MetalLB address is required.
 
-### 7.3 Backups — not optional here
+### 7.3 Backups — deliberately none for now
 
-`PostgresBackupStale` in `clusters/prod/apps/observability/base/prometheus/alerts.yaml` is namespace-wide and excludes only `crm`. A new CNPG cluster with no backup configuration pages within 26 hours, because `cnpg_collector_last_available_backup_timestamp` is exported as 0 rather than omitted.
+**Decision, 2026-09-04 (operator):** `ev-pg` ships with **no backup configuration**, matching
+`crm`. The data is not considered critical at this stage and losing it is acceptable; the
+recorder can simply start again.
 
-We configure real backups rather than adding an exclusion, for the reason this whole project exists: **this data cannot be re-fetched from anywhere.** Losing the database loses the history permanently.
+This reverses the original position in this section, which argued backups were mandatory
+because Tesla and Rivian serve live state only and keep no history, so a lost volume loses
+the archive permanently. That reasoning is still true — it is the cost being knowingly
+accepted, not a factor that was overlooked. It is recorded here so the trade-off is visible
+to whoever revisits it rather than being rediscovered after a disk failure.
 
-- `barmanObjectStore` to `s3://framlux-backups/cnpg/ev`, Backblaze B2 endpoint, gzip on data and WAL, `retentionPolicy: 30d`, matching the analytics cluster.
-- `serverName` set explicitly from the start — the analytics manifest documents what happens when two incarnations share an archive path.
-- `ScheduledBackup` at **05:00** (`"0 0 5 * * *"`, CNPG's six-field format), staggered behind vord-fleet at 02:00, corp-sso at 03:00 and analytics at 04:00.
-- `immediate: true`, so a base backup exists from creation rather than leaving a window in which the alert fires legitimately. Note this only fires on the resource's first reconcile.
-- A `backup-b2-credentials` SealedSecret must be sealed into the `ev` namespace; the existing one is namespace-scoped to analytics.
+What this means concretely:
 
-The stack repo has promtool cases pinning these alert rules. Adding a namespace with working backups requires no rule change, which is the point of doing it this way.
+- No `backup.barmanObjectStore` block on the `Cluster`, no `ScheduledBackup`, and no
+  `backup-b2-credentials` SealedSecret in the `ev` namespace.
+- **`ev` must be added to the exclusions on `PostgresBackupStale` alongside `crm`, in the
+  same change that removes the backup configuration.** This is not optional housekeeping:
+  `cnpg_collector_last_available_backup_timestamp` is exported as `0` rather than omitted
+  when nothing has ever completed, so an unbacked cluster inside the rule's scope pages at
+  `severity: critical` within 26 hours and never clears.
+- `PostgresBackupFailed` and `PostgresWalArchivingFailing` need no exclusion, for the same
+  reason they need none for `crm`: with no backup configured, both metrics read `0`, and
+  `0 > 0` is false. Verify this still holds rather than assuming it — the `crm` comment in
+  `alerts.yaml` states it explicitly and the promtool cases pin it.
+- The `PostgresExporterMissing` arm for `ev` remains worthwhile and is unaffected by this
+  decision: it covers the database being unreachable, not unbacked.
+
+**To reverse it** (restore backups later): add the `barmanObjectStore` block with an explicit
+`serverName`, add a `ScheduledBackup` with `immediate: true` at a slot that does not collide
+with vord-fleet 02:00 / corp-sso 03:00 / analytics 04:00, seal `backup-b2-credentials` into
+the `ev` namespace, and **remove `ev` from the `PostgresBackupStale` exclusion in the same
+change**. The analytics cluster is the reference implementation, and its comments record two
+real incidents worth reading first — a `serverName` collision between incarnations, and the
+fact that `immediate: true` only fires on a `ScheduledBackup`'s first reconcile.
 
 ### 7.4 Network policy
 
@@ -286,7 +308,7 @@ These are unknowns, not tasks. Each can invalidate part of the design, so they r
 | Engine logic wrong, history mis-segmented | `raw_message` is the replay tape; derived tables are rebuildable. This is why raw retention is not optional. |
 | Tesla changes Fleet Telemetry | Official and versioned, with announcements. Low, and slow when it happens. |
 | R2 schema differs from R1 | Out of scope here, but the reason every `sample` column is nullable and the adapter interface exists now. |
-| Single-node Postgres on one bare-metal box | Backups to B2 with 30-day retention, verified by the existing alerting. Restore is not tested by this spec; worth a follow-up. |
+| Single-node Postgres on one bare-metal box, **no backups** | Accepted by the operator on 2026-09-04 (§7.3): losing the volume loses the archive permanently and it cannot be re-fetched from Tesla or Rivian, but the data is not critical at this stage and recording can restart. Revisit before this history becomes something you would miss. |
 
 ---
 
