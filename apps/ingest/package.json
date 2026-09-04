@@ -1,0 +1,18 @@
+{
+  "name": "@ev/ingest",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@ev/core": "workspace:*",
+    "@ev/db": "workspace:*",
+    "@ev/tesla": "workspace:*",
+    "mqtt": "^5.10.0",
+    "prom-client": "^15.1.0"
+  }
+}

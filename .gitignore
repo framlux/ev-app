@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.svelte-kit/
+build/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+
+# Local tooling scratch and Tesla keypair material. The public key that gets
+# served lives at apps/web/static/.well-known/appspecific/, not here.
+npm-cache/
+/tesla-private-key.pem
+/tesla-public-key.pem
