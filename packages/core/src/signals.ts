@@ -473,3 +473,18 @@ export const SAMPLE_COLUMNS = [
   { column: 'semi_cruise_speed_limit_kph',
     key: 'semiCruiseSpeedLimitKph', sql: 'REAL', ts: 'number' },
 ] as const satisfies readonly SampleColumn[]
+
+
+/**
+ * The catalogue's numeric columns, as a union of their TS keys.
+ *
+ * Exists for the read API's sample series: a series point is `number | null`
+ * per field, and a caller that writes `point.outsideTempC` should get a number
+ * back rather than the widest thing an index signature could hold. Derived from
+ * the catalogue, so a numeric column added tomorrow is chartable with no edit
+ * here — and a column that stops being numeric stops being offered.
+ */
+export type NumericSampleKey = Extract<
+  (typeof SAMPLE_COLUMNS)[number],
+  { readonly ts: 'number' }
+>['key']

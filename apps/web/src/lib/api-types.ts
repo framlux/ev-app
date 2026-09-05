@@ -1,3 +1,5 @@
+import type { NumericSampleKey } from '@ev/core'
+
 /**
  * The read API contract.
  *
@@ -406,21 +408,20 @@ export interface BatteryHealthResponse {
  * ------------------------------------------------------------------ */
 
 /**
- * The only field names `?fields=` accepts, as a value so both the route's
- * validator and the pages that build the query string use one list.
+ * A `?fields=` name. The accepted SET is derived from the column catalogue in
+ * `server/queries.ts` (SAMPLE_FIELDS) rather than listed here, because the
+ * listed version was seven names and stayed seven when the catalogue grew to
+ * two hundred — quietly making the series API refuse almost every signal we
+ * had just started paying to record. It lives on the server side so the
+ * catalogue does not have to reach the browser bundle to validate a query.
  */
-export const SAMPLE_FIELDS = [
-  'socPct',
-  'rangeKm',
-  'odometerKm',
-  'speedKph',
-  'chargePowerKw',
-  'insideTempC',
-  'outsideTempC',
-] as const
+export type SampleField = NumericSampleKey
 
-export type SampleField = (typeof SAMPLE_FIELDS)[number]
-
+/**
+ * `ts` is always present; every requested field is present and possibly null;
+ * fields that were not requested are absent. Absent and null mean different
+ * things here — "you did not ask" versus "the car did not say".
+ */
 /**
  * `ts` is always present; every requested field is present and possibly null;
  * fields that were not requested are absent. Absent and null mean different

@@ -164,7 +164,7 @@ type SlotValue = number | string | boolean | Date | Record<string, number>
  * testable before the column exists.
  */
 export const SQL_DECODERS: Record<SqlType, (value: unknown) => SlotValue | null> = {
-  'REAL': num,
+  'REAL': real,
   'DOUBLE PRECISION': num,
   'INT': int,
   'BOOLEAN': bool,
@@ -490,6 +490,31 @@ const scaled = (v: unknown, factor: number): number | null => {
 const INT_MAX = 2_147_483_647
 
 /**
+ * Postgres `REAL` is float4, and it OVERFLOWS rather than saturating: binding
+ * 1e39 raises "value out of range: overflow" and takes the transaction with it.
+ *
+ * Same argument as INT_MAX, and the same consequence, which is why it is not
+ * merely tidiness: a rejected bind rolls back in `transactionally`, the message
+ * is never acked, and MQTT redelivers it forever — the permanent stall. This
+ * module's own header warns that a field's JSON type drifts between vehicle
+ * software builds, so an absurd numeric string is an in-contract input, not a
+ * hypothetical.
+ */
+const FLOAT4_MAX = 3.4028234663852886e38
+
+/**
+ * A `REAL` column's decoder: a number that column can actually hold, or null.
+ *
+ * `DOUBLE PRECISION` keeps plain `num` — float8 spans the whole of what
+ * `Number.isFinite` admits, so there is nothing left to guard against.
+ */
+function real(v: unknown): number | null {
+  const n = num(v)
+  if (n === null) return null
+  return Math.abs(n) > FLOAT4_MAX ? null : n
+}
+
+/**
  * ROUND OR REJECT. A count that arrives as 3.0000001 is a count, and refusing it
  * would lose a real reading; a count of 3e9 is not one this column can hold, and
  * binding it would take the transaction down with it.
@@ -519,7 +544,11 @@ function str(v: unknown): string | null {
  * value the car meant to send.
  */
 function text(v: unknown): string | null {
-  if (typeof v === 'string') return v.trim() === '' ? null : v
+  // A NUL byte is not storable in a Postgres text column at all - the parameter
+  // is rejected with "invalid byte sequence for encoding UTF8: 0x00", which is
+  // the same wedge as a numeric overflow. Nothing the car legitimately sends
+  // contains one, so refusing the value loses nothing real.
+  if (typeof v === 'string') return v.trim() === '' || v.includes('\u0000') ? null : v
   if (typeof v === 'number') return Number.isFinite(v) ? String(v) : null
   if (typeof v === 'boolean') return String(v)
   if (typeof v === 'object' && v !== null) {

@@ -1408,3 +1408,45 @@ describe('BatteryGauge null vs zero', () => {
 		expect(html({ socPct: Number.NaN })).toContain('unknown-track')
 	})
 })
+
+/**
+ * The series allowlist is derived, not listed.
+ *
+ * It held seven names while the catalogue grew to two hundred, so `?fields=`
+ * answered 400 for almost every signal the ingest worker had just started
+ * paying to record — the documented escape hatch for everything the UI does not
+ * chart, closed while looking open.
+ */
+describe('sample series field allowlist', () => {
+	const WINDOW = { from: '2026-09-01T00:00:00.000Z', to: '2026-09-05T00:00:00.000Z' }
+
+	it('accepts a newly captured numeric signal', () => {
+		const q = parseSampleQuery(
+			new URLSearchParams({ ...WINDOW, fields: 'packVoltage,nominalFullPackEnergyKwh' })
+		)
+		expect(q.fields).toEqual(['packVoltage', 'nominalFullPackEnergyKwh'])
+	})
+
+	it('still accepts the original seven', () => {
+		const q = parseSampleQuery(
+			new URLSearchParams({
+				...WINDOW,
+				fields: 'socPct,rangeKm,odometerKm,speedKph,chargePowerKw,insideTempC,outsideTempC'
+			})
+		)
+		expect(q.fields).toHaveLength(7)
+	})
+
+	it('refuses a non-numeric column, which has no meaningful average to decimate', () => {
+		// `locked` is a real captured column — it is simply not a time series.
+		expect(() => parseSampleQuery(new URLSearchParams({ ...WINDOW, fields: 'locked' }))).toThrow(
+			/unknown field/
+		)
+	})
+
+	it('refuses a name that is not a column at all', () => {
+		expect(() =>
+			parseSampleQuery(new URLSearchParams({ ...WINDOW, fields: 'shippedNextTuesday' }))
+		).toThrow(/unknown field/)
+	})
+})

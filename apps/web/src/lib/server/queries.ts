@@ -58,7 +58,7 @@ import type {
   VehicleWithState,
   Vendor,
 } from '../api-types.js'
-import { LIVE_STATE_FIELDS, SAMPLE_FIELDS } from '../api-types.js'
+import { LIVE_STATE_FIELDS } from '../api-types.js'
 import { getPool } from './db.js'
 
 /* ------------------------------------------------------------------ *
@@ -1130,34 +1130,41 @@ export async function getBatteryHealth(
  * ------------------------------------------------------------------ */
 
 /**
- * Contract field name to column name.
+ * The field names `?fields=` accepts, and their columns.
  *
- * This map is what makes the dynamic SELECT list safe: the keys are a
- * validated `SampleField` union and the values are literals written here, so
- * nothing from the request ever reaches the SQL text. Adding a field means
- * editing SAMPLE_FIELDS and this map together, and TypeScript fails the build
- * if only one of them changes.
+ * DERIVED from the column catalogue, not listed. The listed version held seven
+ * names and went on holding seven when the catalogue grew to two hundred, which
+ * made the series API answer 400 for almost every signal the ingest worker had
+ * just started paying to record — the spec's own escape hatch ("everything else
+ * is reachable through samples?fields=") closed while looking open.
+ *
+ * Numeric columns only: a series point is `number | null` and `chart.ts`
+ * decimates by averaging, which a boolean or an enum name cannot survive. Those
+ * columns are still readable through the state endpoints; they are simply not a
+ * time series.
+ *
+ * The dynamic SELECT stays safe for the same reason it always did: a request
+ * names a KEY, and the column text comes from this map, so nothing from the
+ * request reaches the SQL.
  */
-const SAMPLE_FIELD_COLUMNS: Record<SampleField, string> = {
-  socPct: 'soc_pct',
-  rangeKm: 'range_km',
-  odometerKm: 'odometer_km',
-  speedKph: 'speed_kph',
-  chargePowerKw: 'charge_power_kw',
-  insideTempC: 'inside_temp_c',
-  outsideTempC: 'outside_temp_c',
-}
+const SERIES_COLUMNS: readonly SampleColumn[] = SAMPLE_COLUMNS.filter((c) => c.ts === 'number')
 
-/** Decimal places per field, applied for the same float4-noise reason as mapState. */
-const SAMPLE_FIELD_DP: Record<SampleField, number> = {
-  socPct: 1,
-  rangeKm: 1,
-  odometerKm: 1,
-  speedKph: 1,
-  chargePowerKw: 1,
-  insideTempC: 1,
-  outsideTempC: 1,
-}
+export const SAMPLE_FIELDS: readonly string[] = SERIES_COLUMNS.map((c) => c.key)
+
+const SAMPLE_FIELD_COLUMNS: Record<string, string> = Object.fromEntries(
+  SERIES_COLUMNS.map((c) => [c.key, c.column])
+)
+
+/**
+ * Decimal places per field, applied for the same float4-noise reason as
+ * mapState: a REAL round-trips as 20.100000381469727 and rendering that is
+ * noise, not precision. One place suits every quantity we chart — percentages,
+ * temperatures, speeds, powers — except position, which needs the precision it
+ * has, and odometers, which are large enough that a decimal place is the point.
+ */
+const SAMPLE_FIELD_DP: Record<string, number> = Object.fromEntries(
+  SERIES_COLUMNS.map((c) => [c.key, c.sql === 'DOUBLE PRECISION' ? 5 : 1])
+)
 
 export async function getSampleSeries(
   vehicleId: string,

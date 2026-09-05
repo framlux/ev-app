@@ -531,3 +531,40 @@ describe('per-type decoders (§3.4)', () => {
     expect(VALUE_CONVERTERS['milesToKm']('')).toBeNull()
   })
 })
+
+
+/**
+ * IN-RANGE FOR THE TYPE IS NOT THE SAME AS STORABLE IN THE COLUMN.
+ *
+ * The §3.4 bindability tests above feed each column a value of the WRONG TYPE
+ * and check it decodes to null. That misses the case that actually wedges
+ * ingest: a value of the RIGHT type that the column still refuses. Postgres
+ * float4 overflows above ~3.4e38 and int4 above 2^31-1, and a text parameter
+ * rejects a NUL byte outright — each raises on BIND, which rolls the
+ * transaction back, leaves the message unacked, and has MQTT redeliver it
+ * forever. The car cannot send these today; the module header records that JSON
+ * types drift between vehicle software builds, which is how one arrives.
+ */
+describe('decoders refuse values their column cannot hold', () => {
+	const cases: Array<[SqlType, unknown, string]> = [
+		['REAL', 1e39, 'float4 overflows above ~3.4e38'],
+		['REAL', '1e39', 'and the same as the numeric string the wire may send'],
+		['REAL', -1e39, 'in both directions'],
+		['INT', 3e9, 'int4 stops at 2147483647'],
+		['TEXT', 'before\u0000after', 'a NUL byte cannot be stored in text at all'],
+	]
+
+	for (const [sql, payload, why] of cases) {
+		it(`${sql}: rejects ${JSON.stringify(payload)} — ${why}`, () => {
+			expect(SQL_DECODERS[sql](payload)).toBeNull()
+		})
+	}
+
+	it('still accepts the largest value the column CAN hold', () => {
+		// The guard must not be a blanket refusal of large numbers: a real
+		// lifetime-energy counter is legitimately large.
+		expect(SQL_DECODERS['REAL'](3.4e38)).toBe(3.4e38)
+		expect(SQL_DECODERS['INT'](2_147_483_647)).toBe(2_147_483_647)
+		expect(SQL_DECODERS['DOUBLE PRECISION'](1e39)).toBe(1e39)
+	})
+})
