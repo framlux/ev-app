@@ -20,6 +20,7 @@ import MapView from '../src/lib/components/Map.svelte'
 import PaginatedSessions from '../src/lib/components/PaginatedSessions.svelte'
 import SessionList from '../src/lib/components/SessionList.svelte'
 import StatTile from '../src/lib/components/StatTile.svelte'
+import TelemetryOutcome from '../src/lib/components/TelemetryOutcome.svelte'
 import TimeSeriesChart from '../src/lib/components/TimeSeriesChart.svelte'
 import VehicleCard from '../src/lib/components/VehicleCard.svelte'
 
@@ -30,6 +31,7 @@ import ChargesPage from '../src/routes/vehicles/[id]/charges/+page.svelte'
 import BatteryPage from '../src/routes/vehicles/[id]/battery/+page.svelte'
 import DriveDetailPage from '../src/routes/drives/[id]/+page.svelte'
 import ChargeDetailPage from '../src/routes/charges/[id]/+page.svelte'
+import TelemetryPage from '../src/routes/settings/telemetry/+page.svelte'
 
 import { nullState } from './support/state.js'
 
@@ -762,5 +764,197 @@ describe('LiveIndicator', () => {
 			props: { connection: 'connecting', sampleTs: null, clock: NOW }
 		})
 		expect(body).not.toContain('Live')
+	})
+})
+
+/**
+ * The telemetry settings page (spec §3.8).
+ *
+ * Its three states are not edge cases either — they are the page's whole life.
+ * A fresh install has no `telemetry_status` row at all; for the twenty-three
+ * hours a day nobody is consented it renders a row that may be days old and
+ * must say so; and only in the minutes after a consent does it have a Tesla
+ * session to act with. Each one is a different branch through the same markup,
+ * and two of them render nothing but nulls — which is exactly the shape that
+ * ships broken because there is no data to see it break with.
+ *
+ * The fourth case below is the day-one state of the APPLICATION rather than of
+ * this feature: a deployment whose ingest worker has never registered a
+ * vehicle has no VIN to name, and the page is reachable in that state.
+ */
+describe('the telemetry settings page renders in every state that occurs', () => {
+	const NOW = '2026-09-05T12:00:00.000Z'
+
+	const VEH = { id: 'veh-1', displayName: 'Model Y', vin: '5YJ3E1EA1PF000000' }
+
+	const CATALOGUE = { fieldCount: 41, hostname: 'ev-telemetry.framlux.io', port: 443 }
+
+	/** Every observed column null: the row a push creates before any check. */
+	function status(overrides: Record<string, unknown> = {}) {
+		return {
+			vehicleId: VEH.id,
+			synced: null,
+			fieldCount: null,
+			caPresent: null,
+			firmware: null,
+			keyPaired: null,
+			streamingEnabled: null,
+			checkedAt: null,
+			pushedAt: null,
+			...overrides
+		}
+	}
+
+	function telemetryPage(data: Record<string, unknown>): string {
+		return render(TelemetryPage as never, {
+			props: {
+				data: {
+					vehicle: VEH,
+					status: null,
+					tesla: { connected: false, expiresAt: null },
+					catalogue: CATALOGUE,
+					now: NOW,
+					...data
+				}
+			} as never
+		}).body
+	}
+
+	it('day one: no row has ever been written, and it says so rather than showing zeros', () => {
+		const body = telemetryPage({ status: null })
+		// "Nobody has asked" is a third state, distinct from `synced: false`. A
+		// zero field count or an "Applied: no" here would be a claim about the
+		// car that nothing in the database supports.
+		expect(body).toContain('Never checked')
+		expect(body).not.toContain('0 fields')
+		// The catalogue half is knowable without Tesla and without a row, so it
+		// is shown: it is what the button would push.
+		expect(body).toContain('41')
+		assertNoBrokenValues(body)
+	})
+
+	it('a stale row with no Tesla session shows the age of what it knows', () => {
+		const body = telemetryPage({
+			status: status({
+				synced: false,
+				fieldCount: 36,
+				caPresent: true,
+				firmware: '2025.2.6',
+				keyPaired: true,
+				streamingEnabled: true,
+				checkedAt: '2026-09-03T12:00:00.000Z',
+				pushedAt: '2026-09-03T11:00:00.000Z'
+			})
+		})
+		// The age is the point of the cached row: a "not synced" from two days
+		// ago and one from a minute ago call for completely different actions.
+		expect(body).toContain('2 days ago')
+		expect(body).toContain('2025.2.6')
+		// 36 applied against 41 catalogued is the difference §3.8 asks for, and
+		// it is visible with no Tesla session at all.
+		expect(body).toContain('36')
+		expect(body).toContain('41')
+		expect(body).toContain('Not connected')
+		assertNoBrokenValues(body)
+	})
+
+	it('disables both actions while there is no Tesla session, naming the reason', () => {
+		const body = telemetryPage({ status: status({ synced: true, checkedAt: NOW }) })
+		expect(body).toMatch(/<button[^>]*disabled[^>]*>\s*Check now/)
+		expect(body).toMatch(/<button[^>]*disabled[^>]*>\s*Push configuration/)
+		// The affordance that fixes it is a connect, never a sign-in (§3.4a).
+		expect(body).toContain('Connect to Tesla')
+		expect(body).not.toMatch(/sign\s*in\s*with\s*tesla/i)
+	})
+
+	it('a connected session shows the expiry and enables both actions', () => {
+		const body = telemetryPage({
+			status: status({ synced: true, fieldCount: 41, caPresent: true, checkedAt: NOW }),
+			tesla: { connected: true, expiresAt: '2026-09-05T20:00:00.000Z' }
+		})
+		// There is no refresh path by design, so the expiry is not trivia: it is
+		// how long the operator has before the next full Tesla login.
+		expect(body).toContain('in 8 hours')
+		expect(body).toContain('Connected')
+		expect(body).not.toMatch(/<button[^>]*disabled/)
+		assertNoBrokenValues(body)
+	})
+
+	it('names the VIN in the confirmation the push demands, so a mis-click cannot reconfigure a car', () => {
+		const body = telemetryPage({
+			status: status({ synced: true, checkedAt: NOW }),
+			tesla: { connected: true, expiresAt: '2026-09-05T20:00:00.000Z' }
+		})
+		// The same sentence the browser confirm() asks, rendered as the button's
+		// title — which is what makes the wording assertable at all, and tells
+		// the operator what the button does before they press it.
+		expect(body).toMatch(new RegExp(`title="[^"]*${VEH.vin}`))
+	})
+
+	it('renders for a deployment that has registered no vehicle at all', () => {
+		// The state of a freshly deployed install: no vehicle row, so no VIN and
+		// nothing to key a status row by. The page must explain that rather than
+		// throw on a null VIN.
+		const body = telemetryPage({ vehicle: null, status: null })
+		expect(body).toContain('No vehicle')
+		expect(body).toMatch(/<button[^>]*disabled[^>]*>\s*Push configuration/)
+		assertNoBrokenValues(body)
+	})
+})
+
+/**
+ * The half of §3.8 a field COUNT cannot express: WHICH fields differ.
+ *
+ * This panel only ever appears after a button press, so as markup inside the
+ * page it would never be rendered by any test at all — three lists, an empty
+ * state per list and two tones, none of them exercised until an operator with
+ * a live Tesla consent pressed a button against a real car. That is the reason
+ * it is a component.
+ */
+describe('the telemetry outcome panel', () => {
+	it('lists the differences a check found, one line each', () => {
+		const { body } = render(TelemetryOutcome as never, {
+			props: {
+				ok: true,
+				headline: 'The car does not have the configuration the catalogue defines.',
+				differences: [
+					'field Location: applied every 60s, catalogue says 10s',
+					'field DriveRail is in the catalogue and not applied'
+				]
+			} as never
+		})
+		expect(body).toContain('Differences')
+		expect(body).toContain('DriveRail')
+		expect(body).toContain('every 60s')
+		assertNoBrokenValues(body)
+	})
+
+	it('says nothing about lists it has no entries for', () => {
+		const { body } = render(TelemetryOutcome as never, {
+			props: { ok: true, headline: 'Already applied — nothing was sent to the car.' } as never
+		})
+		// A "Blockers" heading over no blockers reads as a fault that was found.
+		expect(body).not.toContain('Blockers')
+		expect(body).not.toContain('Warnings')
+		expect(body).not.toContain('Differences')
+		assertNoBrokenValues(body)
+	})
+
+	it('shows a refusal with the blocker that caused it', () => {
+		const { body } = render(TelemetryOutcome as never, {
+			props: {
+				ok: false,
+				headline: 'the car cannot apply a telemetry configuration',
+				blockers: ['the virtual key is not paired with VIN-UNDER-TEST.'],
+				warnings: ['third-party data streaming is disabled on the car.']
+			} as never
+		})
+		// The two are not the same claim: a blocker refuses the push, a warning
+		// does not, and a panel that drew them alike would hide which is which.
+		expect(body).toContain('Blockers')
+		expect(body).toContain('virtual key is not paired')
+		expect(body).toContain('Warnings')
+		expect(body).toContain('bad')
+		assertNoBrokenValues(body)
 	})
 })

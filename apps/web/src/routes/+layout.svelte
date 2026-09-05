@@ -17,6 +17,10 @@
 			<span>EV</span>
 		</a>
 		<div class="spacer"></div>
+		<!-- The one operational page on a site that is otherwise about driving.
+		     It belongs in the header rather than on a vehicle page because it is
+		     about this install's plumbing, not about the car (spec §3.8). -->
+		<a class="navlink" href="/settings/telemetry">Telemetry</a>
 		<ThemeToggle />
 	</nav>
 
@@ -57,6 +61,15 @@
 
 	.spacer {
 		flex: 1;
+	}
+
+	.navlink {
+		font-size: 0.86rem;
+		color: var(--text-muted);
+	}
+
+	.navlink:hover {
+		color: var(--text);
 	}
 
 	main {

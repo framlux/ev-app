@@ -20,6 +20,11 @@ import {
 	type TelemetryCheck,
 	type TelemetryStatus
 } from './db.js'
+import type {
+	TelemetryCheckResult,
+	TelemetryPushResult,
+	TelemetryStatusDto
+} from '../telemetry-types.js'
 import { ApiProblem } from './queries.js'
 import { clearTeslaToken, getTeslaToken } from './tesla-session.js'
 import { teslaClient, type TeslaClient } from './tesla-client.js'
@@ -53,47 +58,20 @@ export interface TelemetryDeps {
 	now: () => Date
 }
 
-/** The cached row as JSON: the same fields, with the two instants as ISO. */
-export interface TelemetryStatusDto {
-	vehicleId: string
-	synced: boolean | null
-	fieldCount: number | null
-	caPresent: boolean | null
-	firmware: string | null
-	keyPaired: boolean | null
-	streamingEnabled: boolean | null
-	checkedAt: string | null
-	pushedAt: string | null
-}
-
-export interface TelemetryCheckResult {
-	vin: string
-	status: TelemetryStatusDto
-	/** Preflight blockers. A CHECK reports them; only a push refuses on them. */
-	blockers: string[]
-	warnings: string[]
-	/** Whether the applied config is the one the catalogue would push (§3.6). */
-	matches: boolean
-	differences: string[]
-	/** Fields the catalogue would push, against `status.fieldCount` applied. */
-	desiredFieldCount: number
-}
-
-export interface TelemetryPushResult {
-	vin: string
-	pushed: boolean
-	/** True when the car already had exactly this configuration (§3.6). */
-	alreadyApplied: boolean
-	desiredFieldCount: number
-	warnings: string[]
-	differences: string[]
-	/**
-	 * Both null when nothing was pushed: that path writes nothing at all, so
-	 * there is no fresh row to hand back and the page reads the cached one.
-	 */
-	pushedAt: string | null
-	status: TelemetryStatusDto | null
-}
+/**
+ * The three response shapes are declared in `$lib/telemetry-types.ts` and
+ * re-exported here.
+ *
+ * They are what the page reads back out of `fetch`, and a page cannot import
+ * anything under `$lib/server` — so a single definition has to live outside it.
+ * Re-exporting keeps this module the one import path the routes and the tests
+ * already use.
+ */
+export type {
+	TelemetryCheckResult,
+	TelemetryPushResult,
+	TelemetryStatusDto
+} from '../telemetry-types.js'
 
 /* ------------------------------------------------------------------ *
  * The shared half
@@ -205,7 +183,14 @@ function toCheck(o: Observed, checkedAt: Date): TelemetryCheck {
 	}
 }
 
-function toDto(row: TelemetryStatus): TelemetryStatusDto {
+/**
+ * One row, one JSON shape — exported because the PAGE LOAD reads the same row
+ * (§3.8's "the applied status with its age", which it must show with no Tesla
+ * session at all) and then replaces it wholesale with what a check answers. Two
+ * mappings would let the page's rendering of a cached row and its rendering of
+ * a fresh one disagree about the same nine columns.
+ */
+export function toTelemetryStatusDto(row: TelemetryStatus): TelemetryStatusDto {
 	return {
 		vehicleId: row.vehicleId,
 		synced: row.synced,
@@ -231,7 +216,7 @@ async function writeAndRead(
 	})
 	// Unreachable: the write above created the row in the same transaction.
 	if (!row) throw new Error(`telemetry_status vanished for ${vehicleId} after writing it`)
-	return toDto(row)
+	return toTelemetryStatusDto(row)
 }
 
 /* ------------------------------------------------------------------ *
