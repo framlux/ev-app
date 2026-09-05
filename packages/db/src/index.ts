@@ -1,5 +1,6 @@
 export { getPool, closePool } from './pool.js'
 export { runMigrations, runMigrationsUnderGate, MIGRATION_GATE_KEY } from './migrate.js'
+export * from './listen.js'
 
 /**
  * Repository modules.
