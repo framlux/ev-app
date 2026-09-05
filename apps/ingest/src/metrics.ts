@@ -73,6 +73,43 @@ export const handlerErrorsTotal = new Counter({
   registers: [registry],
 })
 
+/**
+ * Create every labelled series at startup, before any message arrives.
+ *
+ * WHY THIS EXISTS. A Prometheus series does not exist until it is first written,
+ * and `ev_ingest_last_sample_timestamp_seconds` carries a `vehicle` label, so
+ * before the first successful sample it is an EMPTY VECTOR. The EvIngestStalled
+ * rule is `time() - max by (vehicle) (ev_ingest_last_sample_timestamp_seconds)`,
+ * and that expression over an empty vector yields no samples at all, so the rule
+ * never fires. The worker that restarts and then ingests NOTHING - the exact
+ * failure the alert was written to catch - is the one case the alert was blind
+ * to.
+ *
+ * Initialising the gauge to 0 is not a lie: 0 is 1970, which reads as "no sample
+ * ever", and `time() - 0` is enormous, so the alert fires immediately on a
+ * worker that starts and stays silent. The counters are seeded for the same
+ * reason: `rate()` and `increase()` over an absent series return nothing, so an
+ * unseeded `ev_ingest_parse_failures_total` cannot be alerted on either.
+ *
+ * Call once, at startup, from the worker entrypoint.
+ */
+export function initialiseSeries(vehicleId: string, vendor = 'tesla'): void {
+  lastSampleTimestampSeconds.set({ vehicle: vehicleId }, 0)
+  mqttConnected.set(0)
+  samplesWrittenTotal.inc({ vendor }, 0)
+  sessionsOpenedTotal.inc(0)
+  sessionsClosedTotal.inc(0)
+  handlerErrorsTotal.inc(0)
+  for (const record of RECORD_KINDS) messagesTotal.inc({ vendor, record }, 0)
+  for (const reason of PARSE_FAILURE_REASONS) parseFailuresTotal.inc({ reason }, 0)
+}
+
+/** Every value `MqttHooks.onRecord` can report. Kept here so the series exist. */
+const RECORD_KINDS = ['metrics', 'alert', 'error', 'connectivity'] as const
+
+/** Every value `MqttHooks.onParseFailure` can report. */
+const PARSE_FAILURE_REASONS = ['topic', 'json', 'empty', 'unknown-vehicle'] as const
+
 export function startMetricsServer(port: number): Server {
   const server = createServer((req, res) => {
     if (req.url === '/metrics') {

@@ -1,5 +1,6 @@
 import mqtt from 'mqtt'
 import type { RawMessage } from './deps.js'
+import type { RecordKind, TeslaEnvelope } from './pipeline.js'
 
 export interface MqttOptions {
   url: string
@@ -16,16 +17,24 @@ export interface MqttOptions {
   topic: string
   /** Our own vehicle id (the `vehicle.id` FK), not the VIN. */
   vehicleId: string
-  /** The VIN we expect on the wire; records for any other VIN are dropped. */
+  /** The VIN we expect on the wire; messages for any other VIN are dropped. */
   vin: string | null
 }
 
 export interface MqttHooks {
-  onRecord?(record: string): void
-  onParseFailure?(reason: string): void
+  onRecord?(record: RecordKind): void
+  onParseFailure?(reason: ParseFailure): void
   onHandlerError?(err: unknown): void
   onConnectionChange?(connected: boolean): void
 }
+
+/**
+ * Why a message was discarded. Separate reasons because they mean different
+ * things operationally: a rise in `topic` means fleet-telemetry changed its
+ * layout under us, a rise in `json` means a broken publisher, and
+ * `unknown-vehicle` is usually just a second car on a shared broker.
+ */
+export type ParseFailure = 'topic' | 'json' | 'empty' | 'unknown-vehicle'
 
 /** The part of a PUBLISH packet this module needs. Keeps fakes tiny. */
 export interface PublishPacketLike {
@@ -47,17 +56,86 @@ export interface MqttClientLike {
 
 export type MessageHandler = (packet: PublishPacketLike, done: (err?: Error) => void) => void
 
+/** What a topic said. `field` is only populated for metrics/alerts/errors. */
+export interface TopicInfo {
+  kind: RecordKind
+  vin: string
+  /** Metrics: the Tesla field name. Alerts/errors: the alert or error name. */
+  field: string | null
+}
+
+/**
+ * Parse a fleet-telemetry topic.
+ *
+ * Layout, from `datastore/mqtt` (topic_base is "ev" here):
+ *
+ *   metrics:      ev/<VIN>/v/<FieldName>
+ *   alerts:       ev/<VIN>/alerts/<AlertName>/current   and   .../history
+ *   errors:       ev/<VIN>/errors/<ErrorName>
+ *   connectivity: ev/<VIN>/connectivity
+ *
+ * The VIN is therefore always the SECOND segment. It is emphatically not at a
+ * fixed offset from the END: an earlier version of this function took
+ * `parts[length - 2]`, which yields the literal string "v" for every metrics
+ * message and "errors" for every error - so every message looked like it
+ * belonged to a vehicle we had never heard of.
+ *
+ * A topic that matches none of these shapes returns null. It is then counted and
+ * skipped rather than guessed at: guessing which segment is a VIN is how
+ * telemetry ends up attributed to the wrong car, and the sample table has no way
+ * to tell that apart afterwards.
+ */
+export function parseTopic(topic: string): TopicInfo | null {
+  const parts = topic.split('/').filter((p) => p.length > 0)
+  const vin = parts[1]
+  const kind = parts[2]
+  if (!vin || !kind) return null
+
+  if (kind === 'v' && parts.length === 4 && parts[3]) {
+    return { kind: 'metrics', vin, field: parts[3] }
+  }
+  if (kind === 'alerts' && parts.length === 5 && parts[3]) {
+    // .../current and .../history are the two publish points; anything else is
+    // a shape we do not know.
+    if (parts[4] !== 'current' && parts[4] !== 'history') return null
+    return { kind: 'alert', vin, field: parts[3] }
+  }
+  if (kind === 'errors' && parts.length === 4 && parts[3]) {
+    return { kind: 'error', vin, field: parts[3] }
+  }
+  if (kind === 'connectivity' && parts.length === 3) {
+    return { kind: 'connectivity', vin, field: null }
+  }
+  return null
+}
+
+/** The VIN alone, or null if the topic is not one we recognise. */
+export function vinOf(topic: string): string | null {
+  return parseTopic(topic)?.vin ?? null
+}
+
 /**
  * Build the QoS 1 message handler.
  *
- * Two outcomes and they are not the same:
+ * ACK ORDERING IS THE POINT OF THIS FUNCTION. The receiver runs with
+ * `reliable_ack_sources {"V":"mqtt"}`, which chains the vehicle's own
+ * acknowledgement to the broker accepting the message: once we PUBACK, the car
+ * is free to discard it. So `done()` is called strictly AFTER `onMessage`
+ * resolves, and `onMessage` resolves only after COMMIT. Acking first would
+ * convert any crash in between into data that no longer exists anywhere.
  *
- * - The payload is unusable (bad JSON, a VIN that is not ours). It is counted
- *   and ACKED. Nothing about redelivering it would make it parse, and an
- *   unacked message is redelivered ahead of everything behind it — one poison
- *   record would wedge the whole durable session.
- * - Handling failed (the database is down). It is counted and NOT acked, so the
- *   broker keeps it and delivers it again after the reconnect.
+ * Three outcomes, and they are not the same:
+ *
+ * - The message is unusable (a topic shape we do not know, a body that is not
+ *   JSON, a VIN that is not ours). Counted and ACKED. Nothing about redelivering
+ *   it would make it parse, and an unacked message is redelivered ahead of
+ *   everything behind it - one poison message would wedge the durable session.
+ * - Handling failed (the database is down). Counted and NOT acked, so the broker
+ *   keeps it and delivers it again after the reconnect.
+ * - It worked. Acked after the commit.
+ *
+ * Nothing here throws: a single bad message must never kill the worker, because
+ * a dead worker loses every message that arrives while it is down.
  */
 export function makeMessageHandler(
   opts: MqttOptions,
@@ -66,37 +144,65 @@ export function makeMessageHandler(
 ): MessageHandler {
   return (packet, done) => {
     const topic = packet.topic === undefined ? '' : packet.topic.toString()
-    const record = recordType(topic)
-    hooks.onRecord?.(record)
+    const info = parseTopic(topic)
+    if (!info) {
+      hooks.onParseFailure?.('topic')
+      done()
+      return
+    }
+    hooks.onRecord?.(info.kind)
 
-    let payload: unknown
+    // A message for a VIN we are not configured for cannot be attributed to a
+    // `vehicle` row, and inserting it anyway is a foreign key violation on every
+    // redelivery. Drop it visibly instead.
+    if (opts.vin !== null && info.vin !== opts.vin) {
+      hooks.onParseFailure?.('unknown-vehicle')
+      done()
+      return
+    }
+
+    const body = bodyOf(packet)
+    // A zero-length payload is how MQTT clears a retained message, not a broken
+    // publisher. Counted separately so it cannot drown the signal from real
+    // decode failures.
+    if (body.length === 0) {
+      hooks.onParseFailure?.('empty')
+      done()
+      return
+    }
+
+    let value: unknown
     try {
-      payload = JSON.parse(bodyOf(packet))
+      // The metrics payload is the VALUE ALONE - a bare number, string, boolean,
+      // `{latitude, longitude}`, or `null` for Value_Invalid. `null` parses
+      // fine and is a legitimate "reading unavailable"; the normaliser drops it.
+      value = JSON.parse(body)
     } catch {
       hooks.onParseFailure?.('json')
       done()
       return
     }
 
-    const vin = vinOf(topic, payload)
-    // A record for a VIN we are not configured for cannot be attributed to a
-    // `vehicle` row, and inserting it anyway is a foreign key violation on
-    // every redelivery. Drop it visibly instead.
-    if (opts.vin !== null && vin !== null && vin !== opts.vin) {
-      hooks.onParseFailure?.('unknown-vehicle')
-      done()
-      return
+    // The field name exists ONLY in the topic, so it is folded into the payload
+    // before the message reaches the tape. `raw_message` has no topic column,
+    // and a stored value with no field name attached would be unreplayable -
+    // reprocess would have a number and no idea what it measured.
+    const envelope: TeslaEnvelope = {
+      kind: info.kind,
+      vin: info.vin,
+      field: info.field,
+      value,
     }
 
     onMessage({
       vehicleId: opts.vehicleId,
       vendor: 'tesla',
+      // The metrics transport carries no timestamp of its own: `getDatumValue`
+      // publishes the value alone. Arrival time is the only time we have.
       receivedAt: new Date(),
       source: 'telemetry',
-      payload,
+      payload: envelope,
     }).then(
-      // done() with no argument is what sends the PUBACK. It runs after the
-      // handler's promise resolves, and the handler resolves after COMMIT.
       () => done(),
       (err: unknown) => {
         hooks.onHandlerError?.(err)
@@ -160,27 +266,6 @@ export function subscribe(
   })
   attach(client, opts, onMessage, hooks)
   return client
-}
-
-/** Last topic segment: 'v', 'alerts', 'errors', 'connectivity'. */
-export function recordType(topic: string): string {
-  const parts = topic.split('/').filter((p) => p.length > 0)
-  return parts[parts.length - 1]?.toLowerCase() ?? 'unknown'
-}
-
-/**
- * The VIN, from the topic if fleet-telemetry put it there, otherwise from the
- * record body. Topic layout is `<base>/<vin>/<record>`.
- */
-export function vinOf(topic: string, payload: unknown): string | null {
-  const parts = topic.split('/').filter((p) => p.length > 0)
-  const fromTopic = parts.length >= 2 ? parts[parts.length - 2] : undefined
-  if (fromTopic) return fromTopic
-  if (payload && typeof payload === 'object' && 'vin' in payload) {
-    const vin = (payload as { vin?: unknown }).vin
-    if (typeof vin === 'string' && vin.length > 0) return vin
-  }
-  return null
 }
 
 function bodyOf(packet: PublishPacketLike): string {

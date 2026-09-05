@@ -1,37 +1,49 @@
 /**
- * Tesla Fleet Telemetry -> canonical `VehicleSample`.
+ * Tesla Fleet Telemetry (MQTT transport) -> canonical `VehicleSample`.
  *
- * The car streams JSON because the server config sets `transmit_decoded_records:
- * true` and `prefer_typed: true`. A telemetry record ("V" record type) looks
- * roughly like:
+ * WHAT THE WIRE ACTUALLY LOOKS LIKE. This module was rewritten against
+ * fleet-telemetry's `datastore/mqtt/mqtt_payload.go`, not against the protobuf
+ * or Kafka shapes, because the two transports do not agree and the difference
+ * is total rather than cosmetic:
  *
- *   { "vin": "5YJ...", "createdAt": "2026-09-04T10:00:00Z",
- *     "data": [ { "key": "Soc", "value": { "doubleValue": 72.5 } }, ... ] }
+ *   - `processVehicleFields()` publishes ONE MQTT MESSAGE PER FIELD. There is no
+ *     record envelope and no `data` array on this transport, so "one message ->
+ *     one VehicleSample" is not a shape that exists here. One message carries
+ *     one field of one vehicle.
+ *   - The field NAME is only in the topic (`<base>/<VIN>/v/<FieldName>`); the
+ *     payload is the JSON-encoded VALUE ALONE, because `getDatumValue()` has
+ *     already unwrapped the protobuf oneof before publishing. So a payload is a
+ *     bare number, a bare string (this includes every enum, rendered as its
+ *     `.String()` name), a bare boolean, `{"latitude":..,"longitude":..}` for
+ *     Location, or `null` for `Value_Invalid`. Wrapper arms such as
+ *     `doubleValue` / `stringValue` / `invalid` belong to the protobuf
+ *     transport and NEVER arrive here.
+ *   - The metrics payload carries NO TIMESTAMP. Only connectivity carries
+ *     `createdAt`. Sample time therefore has to come from message arrival.
  *
- * Two properties of that feed drive every decision below.
+ * Because a sample needs several fields, this module only decodes and collapses;
+ * the ACCUMULATION of fields into a sample (and the timing of when to emit one)
+ * lives in the ingest worker, which is the layer that knows about message
+ * arrival, transactions and restarts. See `apps/ingest/src/pipeline.ts`.
  *
- * 1. The wire shape is only loosely pinned. `prefer_typed` means each value is a
- *    protobuf `Value` oneof rendered as a single-key object, but WHICH key
- *    appears depends on the field, the firmware, and how the record was
- *    marshalled (protojson emits camelCase; some builds emit snake_case). Tesla
- *    also adds new fields and new oneof arms without warning. So the parser
- *    accepts a family of shapes and, crucially, ignores anything it does not
- *    recognise instead of throwing: one unknown arm must never cost us the other
- *    twenty fields in the same message.
+ * ABSENT MUST NEVER BECOME ZERO. `VehicleSample` makes every field nullable
+ * precisely so "the car did not say" stays distinguishable from "the car said
+ * 0". A parser that defaulted to 0 would tell the segmenter the car is parked at
+ * 0 kph drawing 0 kW, which silently ends drives and charges. Every decoder here
+ * returns `null` for anything it cannot vouch for, and an unknown field name is
+ * ignored rather than guessed at.
  *
- * 2. Absent must never become zero. `VehicleSample` makes every field nullable
- *    precisely so that "the car did not say" stays distinguishable from "the car
- *    said 0". A parser that defaults to 0 would tell the segmenter the car is
- *    parked at 0 kph and drawing 0 kW, which silently ends drives and charges.
- *    Every extractor here returns `null` on any shape it cannot vouch for, and a
- *    field only lands when a value was genuinely read.
+ * TYPE DRIFT. Upstream warns that a field's JSON type can change between vehicle
+ * software versions - the vehicle's speed may arrive as `12.3` in one build and
+ * as `"12.3"` in another. So numbers accept both, while still refusing `''`,
+ * `'abc'`, NaN and Infinity, each of which `Number()` would happily turn into a
+ * number-shaped lie.
  *
- * UNITS. Tesla streams US customary units for distance regardless of the
- * display setting on the touchscreen: `VehicleSpeed` is mph, `Odometer` and
- * `RatedRange` are miles. Our model is kph/km, so those three are converted by
- * MILES_TO_KM. Everything else is already in our units and is passed through
- * untouched: temperatures are Celsius, charging power is kW, charging energy is
- * kWh, `Soc` is a percentage, and TPMS pressures are bar.
+ * UNITS. Tesla streams US customary units for distance regardless of the display
+ * setting on the touchscreen: `VehicleSpeed` is mph, `Odometer` and `RatedRange`
+ * are miles. Our model is kph/km, so those three are converted by MILES_TO_KM.
+ * Everything else is already in our units: temperatures Celsius, charging power
+ * kW, charging energy kWh, `Soc` a percentage, TPMS pressures bar.
  */
 
 import {
@@ -54,310 +66,293 @@ export const MILES_TO_KM = 1.609344
 const milesToKm = (miles: number | null): number | null =>
   miles === null ? null : miles * MILES_TO_KM
 
-/** The subset of a sample a field handler is allowed to populate. */
-type SampleFields = Partial<Omit<VehicleSample, 'vehicleId' | 'ts'>>
-
 /**
- * Accumulator for one record.
+ * The accumulated latest-known value of every slot we can fill from Tesla.
  *
- * Several Tesla fields collapse into one canonical field (AC/DC power, AC/DC
- * energy, the four TPMS corners, the two charge-state enums). Those cannot be
- * written straight into `SampleFields` as they are encountered: entries arrive
- * in arbitrary order, so a later `DCChargingPower: invalid` would otherwise
- * clobber an earlier good `ACChargingPower`. They are staged here and resolved
- * once, after the whole `data` array has been walked.
+ * This is deliberately NOT a `VehicleSample`. Several Tesla fields collapse into
+ * one canonical field (AC/DC power, AC/DC energy, the four TPMS corners, the two
+ * charge-state enums), and since each arrives in its own MQTT message the
+ * collapse cannot happen at decode time - it happens once, in
+ * `teslaStateToSample`, over whatever has accumulated.
+ *
+ * Every slot is nullable and `null` means "never reported", which is what keeps
+ * an unreported field null in the emitted sample instead of 0.
  */
-interface Draft {
-  fields: SampleFields
+export interface TeslaFieldState {
+  socPct: number | null
+  rangeKm: number | null
+  odometerKm: number | null
+  speedKph: number | null
+  insideTempC: number | null
+  outsideTempC: number | null
+  lat: number | null
+  lon: number | null
+  locked: boolean | null
+  doorsOpen: boolean | null
+  tpmsFl: number | null
+  tpmsFr: number | null
+  tpmsRl: number | null
+  tpmsRr: number | null
   acPowerKw: number | null
   dcPowerKw: number | null
   acEnergyKwh: number | null
   dcEnergyKwh: number | null
+  /**
+   * Which rail was last seen actually drawing power. Derived, not reported.
+   * It is what makes the cumulative energy counters usable - see
+   * `teslaStateToSample`.
+   */
+  activeRail: 'ac' | 'dc' | null
   /** From `ChargeState`. */
   chargeStateBasic: ChargeState | null
-  /** From `DetailedChargeState`; preferred when both are present. */
+  /** From `DetailedChargeState`; preferred when both are known. */
   chargeStateDetailed: ChargeState | null
-  tpms: Record<string, number>
+  /** From connectivity messages, not from a metric. */
+  powerState: PowerState | null
 }
 
+/** What one decoded field contributes. Merged into a `TeslaFieldState`. */
+export type TeslaFieldUpdate = Partial<TeslaFieldState>
+
 /**
- * Tesla field name -> how it lands in a `VehicleSample`.
+ * Tesla field name -> the slots it fills.
  *
- * A handler returns `true` only when it actually extracted a usable value.
- * That return is what distinguishes "the record mentioned Soc" from "the record
- * carried a readable Soc", and it is what stops a record made entirely of
- * `{ invalid: true }` values from producing an all-null sample that the
- * segmenter would treat as a real observation.
+ * A decoder returns `null` when the value is unreadable, which is what
+ * distinguishes "the car published Soc" from "the car published a readable Soc".
+ * Only a non-null return is allowed to change accumulated state, so an
+ * unreadable message can never blank a good earlier reading.
  *
- * Keys absent from this map are ignored on purpose. That covers both fields
- * Tesla has not shipped yet and fields we stream but have nowhere to put:
- * `Gear` and `ChargeAmps` are configured on the car but have no `VehicleSample`
- * counterpart, so they are deliberately dropped rather than forced somewhere.
+ * Field names absent from this map are ignored on purpose. That covers fields
+ * Tesla has not shipped yet, and fields we stream but have nowhere to put
+ * (`Gear`, `ChargeAmps` have no `VehicleSample` counterpart, so they are
+ * dropped rather than forced somewhere).
  */
-export const TESLA_FIELD_MAP: Record<string, (value: unknown, into: Draft) => boolean> = {
-  Soc: (v, d) => assignNum(d.fields, 'socPct', num(v)),
+const FIELD_DECODERS: Record<string, (value: unknown) => TeslaFieldUpdate | null> = {
+  Soc: (v) => one('socPct', num(v)),
   // Miles on the wire, km in the model.
-  RatedRange: (v, d) => assignNum(d.fields, 'rangeKm', milesToKm(num(v))),
-  Odometer: (v, d) => assignNum(d.fields, 'odometerKm', milesToKm(num(v))),
-  VehicleSpeed: (v, d) => assignNum(d.fields, 'speedKph', milesToKm(num(v))),
-  InsideTemp: (v, d) => assignNum(d.fields, 'insideTempC', num(v)),
-  OutsideTemp: (v, d) => assignNum(d.fields, 'outsideTempC', num(v)),
+  RatedRange: (v) => one('rangeKm', milesToKm(num(v))),
+  Odometer: (v) => one('odometerKm', milesToKm(num(v))),
+  VehicleSpeed: (v) => one('speedKph', milesToKm(num(v))),
+  InsideTemp: (v) => one('insideTempC', num(v)),
+  OutsideTemp: (v) => one('outsideTempC', num(v)),
 
-  // Staged, not assigned: coalesced in `finish`.
-  ACChargingPower: (v, d) => stage(d, 'acPowerKw', num(v)),
-  DCChargingPower: (v, d) => stage(d, 'dcPowerKw', num(v)),
-  ACChargingEnergyIn: (v, d) => stage(d, 'acEnergyKwh', num(v)),
-  DCChargingEnergyIn: (v, d) => stage(d, 'dcEnergyKwh', num(v)),
+  // Power is reported per rail and coalesced at build time. The rail that is
+  // actually delivering is recorded here, while we can still see it, because
+  // the energy counters cannot be told apart on their own.
+  ACChargingPower: (v) => power('ac', num(v)),
+  DCChargingPower: (v) => power('dc', num(v)),
+  ACChargingEnergyIn: (v) => one('acEnergyKwh', num(v)),
+  DCChargingEnergyIn: (v) => one('dcEnergyKwh', num(v)),
 
-  ChargeState: (v, d) => stage(d, 'chargeStateBasic', chargeState(enumString(v))),
-  DetailedChargeState: (v, d) => stage(d, 'chargeStateDetailed', chargeState(enumString(v))),
+  ChargeState: (v) => one('chargeStateBasic', chargeState(str(v))),
+  DetailedChargeState: (v) => one('chargeStateDetailed', chargeState(str(v))),
 
-  Locked: (v, d) => {
-    const b = bool(v)
-    if (b === null) return false
-    d.fields.locked = b
-    return true
-  },
-  DoorState: (v, d) => {
-    const open = anyDoorOpen(v)
-    if (open === null) return false
-    d.fields.doorsOpen = open
-    return true
-  },
+  Locked: (v) => one('locked', bool(v)),
+  DoorState: (v) => one('doorsOpen', anyDoorOpen(v)),
 
   /**
-   * Latitude and longitude live in a single value, and the pair is only
-   * meaningful whole: a sample carrying a latitude with a null longitude would
-   * be plotted at the prime meridian. Both land or neither does.
+   * Latitude and longitude arrive in ONE message, as a two-key object, and the
+   * pair is only meaningful whole: a sample carrying a latitude with a null
+   * longitude would be plotted on the prime meridian. Both land or neither does.
    */
-  Location: (v, d) => {
-    const loc = location(v)
-    if (!loc) return false
-    d.fields.lat = loc.lat
-    d.fields.lon = loc.lon
-    return true
+  Location: (v) => {
+    const o = asRecord(v)
+    if (!o) return null
+    const lat = num(o['latitude'])
+    const lon = num(o['longitude'])
+    if (lat === null || lon === null) return null
+    return { lat, lon }
   },
 
-  // The four corners collapse into the single tpms JSONB record. Whichever
-  // corners are readable land; the record stays null if none do.
-  TpmsPressureFl: (v, d) => tyre(d, 'fl', num(v)),
-  TpmsPressureFr: (v, d) => tyre(d, 'fr', num(v)),
-  TpmsPressureRl: (v, d) => tyre(d, 'rl', num(v)),
-  TpmsPressureRr: (v, d) => tyre(d, 'rr', num(v)),
+  // The four corners arrive as four separate messages and collapse into the
+  // single tpms JSONB record at build time. Whichever corners are known land;
+  // the record stays null if none do.
+  TpmsPressureFl: (v) => one('tpmsFl', num(v)),
+  TpmsPressureFr: (v) => one('tpmsFr', num(v)),
+  TpmsPressureRl: (v) => one('tpmsRl', num(v)),
+  TpmsPressureRr: (v) => one('tpmsRr', num(v)),
+}
+
+/** The field names this adapter knows how to place. Exported for tests/metrics. */
+export const TESLA_KNOWN_FIELDS: readonly string[] = Object.keys(FIELD_DECODERS)
+
+export function isKnownTeslaField(field: string): boolean {
+  return Object.hasOwn(FIELD_DECODERS, field)
 }
 
 /**
- * Normalise one decoded telemetry record.
+ * Decode one `<base>/<VIN>/v/<FieldName>` message.
  *
- * Returns `null` when the payload carries nothing mappable - an unparseable
- * body, an empty `data` array, only unknown keys, or only unreadable values.
- * Null rather than an all-null sample, because an all-null sample is not
- * "nothing happened": written to the sample table it would look like an
- * observation that the car reported no speed, no SOC and no charge state.
+ * Returns `null` for an unknown field name AND for a value that cannot be
+ * trusted (`null` payload - Value_Invalid - an empty string, a non-numeric
+ * string where a number belongs, an unrecognised enum). Null means "change
+ * nothing": the caller keeps whatever it already knew, which is strictly better
+ * than overwriting a good reading with a fabricated one.
  */
-export function normaliseTeslaMessage(raw: RawMessage): VehicleSample | null {
-  const payload = asRecord(raw.payload)
-  if (!payload) return null
-  const data = payload['data']
-  if (!Array.isArray(data)) return null
+export function decodeTeslaField(field: string, value: unknown): TeslaFieldUpdate | null {
+  const decode = FIELD_DECODERS[field]
+  if (!decode) return null
+  const update = decode(value)
+  // An empty object would count as "something landed" for the caller while
+  // carrying nothing; collapse it to null so the two cases stay distinct.
+  return update && Object.keys(update).length > 0 ? update : null
+}
 
-  const draft: Draft = {
-    fields: {},
-    acPowerKw: null,
-    dcPowerKw: null,
-    acEnergyKwh: null,
-    dcEnergyKwh: null,
-    chargeStateBasic: null,
-    chargeStateDetailed: null,
-    tpms: {},
-  }
-
-  let landed = 0
-  for (const entry of data) {
-    const e = asRecord(entry)
-    const key = e?.['key']
-    if (typeof key !== 'string') continue
-    const apply = TESLA_FIELD_MAP[key]
-    if (!apply) continue // unknown field: ignore, keep the rest of the message
-    if (apply(e?.['value'], draft)) landed++
-  }
-  if (landed === 0) return null
-
-  finish(draft)
+/**
+ * Build a `VehicleSample` from accumulated state.
+ *
+ * `ts` is supplied by the caller because the metrics transport carries no
+ * timestamp of its own: the only time we have is when the message arrived.
+ */
+export function teslaStateToSample(
+  vehicleId: string,
+  ts: Date,
+  state: TeslaFieldUpdate,
+): VehicleSample {
+  const tpms = tpmsRecord(state)
   return makeSample({
-    vehicleId: raw.vehicleId,
-    ts: timestamp(payload['createdAt'], raw.receivedAt),
-    ...draft.fields,
+    vehicleId,
+    ts,
+    socPct: state.socPct ?? null,
+    rangeKm: state.rangeKm ?? null,
+    odometerKm: state.odometerKm ?? null,
+    speedKph: state.speedKph ?? null,
+    insideTempC: state.insideTempC ?? null,
+    outsideTempC: state.outsideTempC ?? null,
+    lat: state.lat ?? null,
+    lon: state.lon ?? null,
+    locked: state.locked ?? null,
+    doorsOpen: state.doorsOpen ?? null,
+    tpms,
+    powerState: state.powerState ?? null,
+    // DetailedChargeState is the finer-grained of the two enums and wins when
+    // both are known.
+    chargeState: state.chargeStateDetailed ?? state.chargeStateBasic ?? null,
+    chargePowerKw: coalescePower(state.acPowerKw ?? null, state.dcPowerKw ?? null),
+    chargeEnergyAddedKwh: chooseEnergy(state),
   })
 }
 
 /**
- * Connectivity records are a separate record type with no `data` array, so
- * `normaliseTeslaMessage` returns null for them. They are the only source of
- * sleep state, which the garage view and the ingest-stall alert both need.
+ * POWER: pick the rail with the greater magnitude.
+ *
+ * AC and DC charging are mutually exclusive on a real car and the inactive rail
+ * reports 0 (or nothing at all), so "greater magnitude" picks the live one, and
+ * still yields 0 - a true reading - when the car is plugged in but not drawing.
+ * If neither rail was readable the result stays null: a 0 here reads downstream
+ * as "charger delivering nothing", which ends a charge session.
  */
-export function normaliseTeslaConnectivity(raw: RawMessage): VehicleSample | null {
-  const payload = asRecord(raw.payload)
-  if (!payload) return null
-  const state = connectivityState(payload['status'])
-  if (!state) return null
-  return makeSample({
-    vehicleId: raw.vehicleId,
-    ts: timestamp(payload['createdAt'], raw.receivedAt),
-    powerState: state,
-  })
-}
-
-/** Resolve everything that was staged rather than assigned directly. */
-function finish(d: Draft): void {
-  // AC and DC charging are mutually exclusive on a real car: the inactive one
-  // reports 0 (or nothing at all). Coalescing on "greater magnitude" therefore
-  // picks the active one when both are present, and still yields 0 - a true
-  // reading - when the car is plugged in but not drawing. If neither field was
-  // readable the result must stay null: a 0 here reads downstream as "charger
-  // delivering nothing", which ends a charge session.
-  d.fields.chargePowerKw = coalesceCharging(d.acPowerKw, d.dcPowerKw)
-  d.fields.chargeEnergyAddedKwh = coalesceCharging(d.acEnergyKwh, d.dcEnergyKwh)
-
-  // DetailedChargeState is the finer-grained of the two enums and wins when
-  // both are present and both recognised.
-  d.fields.chargeState = d.chargeStateDetailed ?? d.chargeStateBasic
-
-  if (Object.keys(d.tpms).length > 0) d.fields.tpms = d.tpms
-}
-
-function coalesceCharging(ac: number | null, dc: number | null): number | null {
+function coalescePower(ac: number | null, dc: number | null): number | null {
   if (ac === null) return dc
   if (dc === null) return ac
   return Math.abs(dc) > Math.abs(ac) ? dc : ac
 }
 
-function assignNum<K extends keyof SampleFields>(
-  fields: SampleFields,
-  key: K,
-  value: number | null,
-): boolean {
-  if (value === null) return false
-  ;(fields as Record<string, unknown>)[key as string] = value
-  return true
+/**
+ * ENERGY: pick by rail, never by magnitude.
+ *
+ * This is the one place where energy must NOT be treated like power.
+ * `ACChargingEnergyIn` and `DCChargingEnergyIn` are CUMULATIVE COUNTERS: the
+ * idle rail does not read 0, it retains a total from an earlier session. Under
+ * the magnitude rule a car DC-fast-charging with 12 kWh added would report the
+ * 40 kWh left over on the AC counter, and worse, would FLIP rails part-way
+ * through as the live counter overtook the stale one - producing a session
+ * energy figure that is a difference between two unrelated counters. Session
+ * energy feeds the battery-capacity estimate, and a bad estimate is written to
+ * a derived table where it looks exactly like a good one.
+ *
+ * So the rail is selected by evidence of actual power flow (`activeRail`, which
+ * the accumulator carries forward from the last non-zero power reading, so it
+ * still holds at the end of a charge when power has dropped back to 0). With no
+ * such evidence, a single known counter is used - there is nothing to confuse it
+ * with - and two known counters yield null rather than a coin toss.
+ */
+function chooseEnergy(state: TeslaFieldUpdate): number | null {
+  const ac = state.acEnergyKwh ?? null
+  const dc = state.dcEnergyKwh ?? null
+  if (state.activeRail === 'ac') return ac
+  if (state.activeRail === 'dc') return dc
+  if (ac === null) return dc
+  if (dc === null) return ac
+  return null
 }
 
-function stage<K extends 'acPowerKw' | 'dcPowerKw' | 'acEnergyKwh' | 'dcEnergyKwh'>(
-  d: Draft,
-  key: K,
-  value: number | null,
-): boolean
-function stage<K extends 'chargeStateBasic' | 'chargeStateDetailed'>(
-  d: Draft,
-  key: K,
-  value: ChargeState | null,
-): boolean
-function stage(d: Draft, key: keyof Draft, value: unknown): boolean {
-  if (value === null) return false
-  ;(d as unknown as Record<string, unknown>)[key as string] = value
-  return true
+function tpmsRecord(state: TeslaFieldUpdate): Record<string, number> | null {
+  const out: Record<string, number> = {}
+  if (state.tpmsFl != null) out['fl'] = state.tpmsFl
+  if (state.tpmsFr != null) out['fr'] = state.tpmsFr
+  if (state.tpmsRl != null) out['rl'] = state.tpmsRl
+  if (state.tpmsRr != null) out['rr'] = state.tpmsRr
+  return Object.keys(out).length > 0 ? out : null
 }
 
-function tyre(d: Draft, corner: string, bar: number | null): boolean {
-  if (bar === null) return false
-  d.tpms[corner] = bar
-  return true
+function one<K extends keyof TeslaFieldState>(
+  key: K,
+  value: TeslaFieldState[K] | null,
+): TeslaFieldUpdate | null {
+  if (value === null) return null
+  return { [key]: value } as TeslaFieldUpdate
 }
-
-/** Numeric wrapper arms, camelCase (protojson) and snake_case (some builds). */
-const NUMERIC_KEYS = [
-  'doubleValue',
-  'double_value',
-  'floatValue',
-  'float_value',
-  'intValue',
-  'int_value',
-  'longValue',
-  'long_value',
-  'uintValue',
-  'uint_value',
-] as const
 
 /**
- * Read a number out of a typed value wrapper.
+ * A power reading also tells us which rail is live, and that is the only
+ * reliable way to read the energy counters. A 0 is recorded as a power value but
+ * does NOT claim the rail: 0 kW on AC while DC delivers is exactly the case the
+ * flag exists to survive.
+ */
+function power(rail: 'ac' | 'dc', kw: number | null): TeslaFieldUpdate | null {
+  if (kw === null) return null
+  const update: TeslaFieldUpdate = rail === 'ac' ? { acPowerKw: kw } : { dcPowerKw: kw }
+  if (kw > 0) update.activeRail = rail
+  return update
+}
+
+/**
+ * Read a number from a metrics payload.
  *
- * Tolerates the bare-number form (untyped records), and the string form that
- * protojson uses for 64-bit ints. Rejects NaN/Infinity and the empty string,
- * both of which `Number()` would otherwise turn into a number-shaped lie: `0`
- * for `''` is exactly the absent-becomes-zero bug this module exists to avoid.
+ * Accepts the bare number and the numeric string, because upstream states the
+ * JSON type of a field can change between vehicle software versions. Rejects
+ * NaN, Infinity, `''` and any non-numeric string: `Number('')` is 0, and a 0
+ * that means "unreadable" is the absent-becomes-zero bug this module exists to
+ * prevent. Booleans are rejected too - `Number(false)` is 0.
  */
 function num(v: unknown): number | null {
   if (typeof v === 'number') return Number.isFinite(v) ? v : null
-  const o = asRecord(v)
-  if (!o || isInvalid(o)) return null
-  for (const k of NUMERIC_KEYS) {
-    const raw = o[k]
-    if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null
-    if (typeof raw === 'string') {
-      const trimmed = raw.trim()
-      if (trimmed === '') return null
-      const n = Number(trimmed)
-      return Number.isFinite(n) ? n : null
-    }
+  if (typeof v === 'string') {
+    const trimmed = v.trim()
+    if (trimmed === '') return null
+    const n = Number(trimmed)
+    return Number.isFinite(n) ? n : null
   }
   return null
 }
 
-/**
- * Read an enum-ish value: a `stringValue`, or one of the dedicated enum arms
- * (`chargingValue`, `detailedChargeStateValue`, ...). The arm name is not worth
- * enumerating - any string-valued single key is accepted and then validated by
- * the mapper, which rejects anything it does not know.
- */
-function enumString(v: unknown): string | null {
-  if (typeof v === 'string') return v
-  const o = asRecord(v)
-  if (!o || isInvalid(o)) return null
-  for (const raw of Object.values(o)) {
-    if (typeof raw === 'string') return raw
-  }
-  return null
+/** Enums arrive as their protobuf `.String()` name, i.e. a bare JSON string. */
+function str(v: unknown): string | null {
+  return typeof v === 'string' && v.trim() !== '' ? v : null
 }
 
 function bool(v: unknown): boolean | null {
   if (typeof v === 'boolean') return v
-  const o = asRecord(v)
-  if (!o || isInvalid(o)) return null
-  for (const k of ['booleanValue', 'boolean_value', 'boolValue', 'bool_value']) {
-    const raw = o[k]
-    if (typeof raw === 'boolean') return raw
-    // Some firmware renders Locked as the string "true"/"false".
-    if (raw === 'true') return true
-    if (raw === 'false') return false
-  }
-  const s = o['stringValue'] ?? o['string_value']
-  if (s === 'true') return true
-  if (s === 'false') return false
+  // Some builds render a boolean field as a string; anything else is unreadable
+  // rather than false, because false is a claim ("the car is unlocked").
+  if (v === 'true') return true
+  if (v === 'false') return false
   return null
-}
-
-function location(v: unknown): { lat: number; lon: number } | null {
-  const o = asRecord(v)
-  if (!o || isInvalid(o)) return null
-  const loc = asRecord(o['locationValue'] ?? o['location_value']) ?? o
-  const lat = num(loc['latitude'])
-  const lon = num(loc['longitude'])
-  // Both or neither: half a fix is worse than none, because it plots.
-  if (lat === null || lon === null) return null
-  return { lat, lon }
 }
 
 /**
  * Tesla enum -> our `ChargeState`.
  *
  * Both the plain form ("Charging") and the prefixed protobuf enum names
- * ("ChargeStateCharging", "DetailedChargeStateCharging") appear depending on
- * how the record was marshalled, so the prefix is stripped before matching.
+ * ("ChargeStateCharging", "DetailedChargeStateCharging") occur, so the prefix is
+ * stripped before matching.
  *
  * An unrecognised value maps to null, never to a guess. Charge state feeds
- * session segmentation directly: guessing "connected" for an unknown enum would
- * fabricate charge sessions, and guessing "disconnected" would truncate real
- * ones. Null just means "this record says nothing about charging", which the
+ * session segmentation directly: guessing "connected" would fabricate charge
+ * sessions and guessing "disconnected" would truncate real ones, and both are
+ * written into derived tables that cannot be told apart from correct ones
+ * afterwards. Null just means "we know nothing new about charging", which the
  * segmenter already handles.
  */
 function chargeState(s: string | null): ChargeState | null {
@@ -388,18 +383,44 @@ function chargeState(s: string | null): ChargeState | null {
 /**
  * Any door open?
  *
- * `doorValue` is a struct of per-door booleans. Absent or unreadable gives null
- * rather than false, because "no door reported" is not "all doors shut" - a
- * false here would show a locked-up car as secure when we simply do not know.
+ * `DoorState` is the one struct-valued field besides Location: a set of per-door
+ * booleans. Absent or unreadable gives null rather than false, because "no door
+ * reported" is not "all doors shut" - a false would show a car we know nothing
+ * about as secure.
  */
 function anyDoorOpen(v: unknown): boolean | null {
-  const o = asRecord(v)
-  if (!o || isInvalid(o)) return null
-  const doors = asRecord(o['doorValue'] ?? o['door_value'])
+  if (typeof v === 'boolean') return v
+  const doors = asRecord(v)
   if (!doors) return null
   const flags = Object.values(doors).filter((x) => typeof x === 'boolean')
   if (flags.length === 0) return null
   return flags.some(Boolean)
+}
+
+/**
+ * Decode a `<base>/<VIN>/connectivity` message.
+ *
+ * Connectivity is the only message on this transport that carries its own
+ * `createdAt`, and the only source of power state, which the garage view and the
+ * stall alert both need. Signature kept as (RawMessage -> VehicleSample | null)
+ * because `apps/ingest/src/deps.ts` still calls it that way.
+ */
+export function normaliseTeslaConnectivity(raw: RawMessage): VehicleSample | null {
+  const payload = asRecord(raw.payload)
+  if (!payload) return null
+  const state = connectivityState(payload['status'])
+  if (!state) return null
+  return makeSample({
+    vehicleId: raw.vehicleId,
+    ts: timestamp(payload['createdAt'], raw.receivedAt),
+    powerState: state,
+  })
+}
+
+/** Just the power state from a connectivity body, for the accumulator. */
+export function decodeTeslaConnectivity(payload: unknown): PowerState | null {
+  const body = asRecord(payload)
+  return body ? connectivityState(body['status']) : null
 }
 
 function connectivityState(s: unknown): PowerState | null {
@@ -414,9 +435,9 @@ function connectivityState(s: unknown): PowerState | null {
 }
 
 /**
- * Prefer the car's own `createdAt`; fall back to when we received the message.
- * An unparseable date must fall back too - an Invalid Date would propagate into
- * a NULL timestamp on insert and lose the sample entirely.
+ * Prefer the message's own `createdAt`; fall back to when we received it. An
+ * unparseable date must fall back too - an Invalid Date propagates into a NULL
+ * timestamp on insert and loses the row entirely.
  */
 function timestamp(createdAt: unknown, receivedAt: Date): Date {
   if (typeof createdAt === 'string' || typeof createdAt === 'number') {
@@ -427,23 +448,8 @@ function timestamp(createdAt: unknown, receivedAt: Date): Date {
 }
 
 /**
- * The `invalid` arm is Fleet Telemetry's explicit "this reading is unavailable".
- * It must read as absent, not as a value.
- *
- * This guard is not redundant with the extractors' shape checks: protobuf JSON
- * happily renders the sibling arm's zero default alongside the flag, so an
- * unavailable speed can arrive as `{ "invalid": true, "doubleValue": 0 }`. Read
- * naively that is a parked car - exactly the absent-becomes-zero failure this
- * module exists to prevent - so the flag is checked before any arm is read.
- */
-function isInvalid(o: Record<string, unknown>): boolean {
-  return o['invalid'] === true || o['invalidValue'] === true || o['invalid_value'] === true
-}
-
-/**
- * Accepts the raw MQTT string body as well as an already-parsed object, and
- * never throws on malformed JSON: a single corrupt message must not take down
- * the ingest loop.
+ * Accepts a raw JSON string as well as an already-parsed object, and never
+ * throws on malformed JSON: one corrupt message must not take down ingest.
  */
 function asRecord(v: unknown): Record<string, unknown> | null {
   if (typeof v === 'string') {

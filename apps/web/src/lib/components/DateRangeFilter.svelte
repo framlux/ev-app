@@ -11,7 +11,13 @@
 
 	// A plain GET form: the filter lives in the URL, so a filtered list is
 	// linkable and survives a reload, and it works with JavaScript disabled.
-	let active = $derived(from != null || to != null)
+	//
+	// Both inputs submit on every Apply, so a page reached by pressing Apply
+	// with nothing picked has `?from=&to=` and the loads hand us '' rather than
+	// null. Testing `!= null` alone therefore offered "Clear" on an unfiltered
+	// list — a control that does nothing, which reads as a filter silently
+	// stuck on. Empty is unfiltered.
+	let active = $derived((from ?? '') !== '' || (to ?? '') !== '')
 </script>
 
 <form method="GET" class="filter">

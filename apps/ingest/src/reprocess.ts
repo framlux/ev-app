@@ -72,6 +72,18 @@ async function main(): Promise<void> {
       })
       count++
     }
+
+    // Flush what is still accumulating, or the tail of every replay is lost.
+    //
+    // Emission is arrival-triggered: a pending burst is written when the NEXT
+    // message shows it is complete. The final burst has no next message, so
+    // without this it is discarded along with the Pipeline object - silently,
+    // and only at the end of the window, which is the hardest place to notice.
+    //
+    // force=true because the quiet period cannot have elapsed: there is no
+    // later arrival to measure it against.
+    await pipeline.flush(new Date(), true)
+
     return count
   })
 

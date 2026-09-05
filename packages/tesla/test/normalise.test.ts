@@ -1,615 +1,285 @@
-/**
- * Contract tests for the Tesla telemetry normaliser.
- *
- * We have no live capture yet, so these fixtures ARE the specification: they
- * pin the wire shapes we expect, the units we convert, and - most importantly -
- * the places where the answer must be null rather than a plausible-looking
- * zero. Each test is written so that a mutation of the implementation (dropping
- * a guard, flipping a coalesce, changing the mile factor) fails a named test.
- */
-
 import { describe, expect, it } from 'vitest'
 import type { RawMessage } from '@ev/core'
 import {
   MILES_TO_KM,
+  decodeTeslaConnectivity,
+  decodeTeslaField,
+  isKnownTeslaField,
   normaliseTeslaConnectivity,
-  normaliseTeslaMessage,
-  TESLA_FIELD_MAP,
+  teslaStateToSample,
+  type TeslaFieldUpdate,
 } from '../src/normalise.js'
 
-const RECEIVED_AT = new Date('2026-09-04T10:00:05Z')
-const CREATED_AT = '2026-09-04T10:00:00Z'
+/**
+ * Every fixture here is a payload as fleet-telemetry's MQTT datastore actually
+ * publishes it: the JSON-encoded VALUE ALONE, one field per message, with the
+ * field name coming from the topic and no timestamp anywhere. The wrapper
+ * objects (`{doubleValue: 72}`, `{invalid: true}`) that the previous version of
+ * these tests asserted on belong to the protobuf/Kafka transport and never
+ * arrive on MQTT - a test built on them passes while production maps nothing.
+ */
 
-type Entry = { key: string; value: unknown }
+const TS = new Date('2026-09-04T10:00:00.000Z')
+const VEHICLE = 'veh-1'
 
-function raw(payload: unknown): RawMessage {
-  return {
-    vehicleId: 'v1',
-    vendor: 'tesla',
-    receivedAt: RECEIVED_AT,
-    source: 'telemetry',
-    payload,
-  }
+/** Decode a field and build the sample it would contribute to on its own. */
+function sampleOf(state: TeslaFieldUpdate) {
+  return teslaStateToSample(VEHICLE, TS, state)
 }
 
-/** A "V" record carrying the given field entries. */
-function record(...data: Entry[]): RawMessage {
-  return raw({ vin: '5YJ3E1EA7KF000001', createdAt: CREATED_AT, data })
+function decoded(field: string, value: unknown): TeslaFieldUpdate {
+  const update = decodeTeslaField(field, value)
+  if (!update) throw new Error(`expected ${field} to decode ${JSON.stringify(value)}`)
+  return update
 }
 
-const d = (n: number) => ({ doubleValue: n })
-
-/** A realistic mid-drive record with every configured field present. */
-const FULL_DRIVE_RECORD: Entry[] = [
-  { key: 'Soc', value: d(72.5) },
-  { key: 'VehicleSpeed', value: d(48.3) },
-  { key: 'Gear', value: { shiftStateValue: 'ShiftStateD' } },
-  { key: 'Location', value: { locationValue: { latitude: 51.5074, longitude: -0.1278 } } },
-  { key: 'Odometer', value: d(41234.7) },
-  { key: 'RatedRange', value: d(210.4) },
-  { key: 'ChargeState', value: { chargingValue: 'ChargeStateDisconnected' } },
-  { key: 'DetailedChargeState', value: { stringValue: 'DetailedChargeStateDisconnected' } },
-  { key: 'ChargeAmps', value: { intValue: 0 } },
-  { key: 'InsideTemp', value: d(21.5) },
-  { key: 'OutsideTemp', value: d(12.0) },
-  { key: 'Locked', value: { booleanValue: true } },
-  {
-    key: 'DoorState',
-    value: {
-      doorValue: {
-        DriverFront: false,
-        DriverRear: false,
-        PassengerFront: false,
-        PassengerRear: false,
-        TrunkFront: false,
-        TrunkRear: false,
-      },
-    },
-  },
-  { key: 'TpmsPressureFl', value: d(2.9) },
-  { key: 'TpmsPressureFr', value: d(2.95) },
-  { key: 'TpmsPressureRl', value: d(3.0) },
-  { key: 'TpmsPressureRr', value: d(3.05) },
-]
-
-describe('normaliseTeslaMessage - field mapping', () => {
-  const s = normaliseTeslaMessage(record(...FULL_DRIVE_RECORD))
-
-  it('produces a sample carrying the vehicle id and the car-supplied timestamp', () => {
-    expect(s?.vehicleId).toBe('v1')
-    // createdAt from the record wins over receivedAt.
-    expect(s?.ts.toISOString()).toBe('2026-09-04T10:00:00.000Z')
+describe('decodeTeslaField: numbers', () => {
+  it('reads a bare JSON number', () => {
+    expect(decoded('Soc', 72.5)).toEqual({ socPct: 72.5 })
+    expect(decoded('InsideTemp', -3)).toEqual({ insideTempC: -3 })
   })
 
-  it('maps the unit-free scalars straight through', () => {
-    expect(s?.socPct).toBe(72.5)
-    expect(s?.insideTempC).toBe(21.5)
-    expect(s?.outsideTempC).toBe(12.0)
+  it('reads a number that arrived as a string', () => {
+    // Upstream warns the JSON type of a field changes between vehicle software
+    // versions: speed can be 12.3 in one build and "12.3" in the next.
+    expect(decoded('Soc', '72.5')).toEqual({ socPct: 72.5 })
+    expect(decoded('Soc', ' 72.5 ')).toEqual({ socPct: 72.5 })
   })
 
-  it('maps location as a pair', () => {
-    expect(s?.lat).toBe(51.5074)
-    expect(s?.lon).toBe(-0.1278)
-  })
-
-  it('maps lock and door state', () => {
-    expect(s?.locked).toBe(true)
-    expect(s?.doorsOpen).toBe(false)
-  })
-
-  it('collapses the four TPMS corners into one record', () => {
-    expect(s?.tpms).toEqual({ fl: 2.9, fr: 2.95, rl: 3.0, rr: 3.05 })
-  })
-
-  it('maps a disconnected charge state and leaves charging figures null while driving', () => {
-    expect(s?.chargeState).toBe('disconnected')
-    expect(s?.chargePowerKw).toBeNull()
-    expect(s?.chargeEnergyAddedKwh).toBeNull()
-  })
-
-  it('does not invent a power state from a telemetry record', () => {
-    // Only connectivity records carry sleep state.
-    expect(s?.powerState).toBeNull()
-  })
-
-  it('falls back to receivedAt when createdAt is missing or unparseable', () => {
-    const noDate = normaliseTeslaMessage(raw({ data: [{ key: 'Soc', value: d(50) }] }))
-    expect(noDate?.ts).toEqual(RECEIVED_AT)
-
-    const badDate = normaliseTeslaMessage(
-      raw({ createdAt: 'not-a-date', data: [{ key: 'Soc', value: d(50) }] }),
-    )
-    expect(badDate?.ts).toEqual(RECEIVED_AT)
-    expect(Number.isNaN(badDate?.ts.getTime())).toBe(false)
-  })
-
-  it('accepts a raw JSON string body as well as a parsed object', () => {
-    const asString = normaliseTeslaMessage(
-      raw(JSON.stringify({ createdAt: CREATED_AT, data: [{ key: 'Soc', value: d(41) }] })),
-    )
-    expect(asString?.socPct).toBe(41)
+  it.each([
+    ['null (Value_Invalid)', null],
+    ['empty string', ''],
+    ['blank string', '   '],
+    ['non-numeric string', 'abc'],
+    ['NaN as a string', 'NaN'],
+    ['Infinity as a string', 'Infinity'],
+    ['a boolean', true],
+    ['an object', { doubleValue: 72 }],
+    ['an array', [72]],
+  ])('refuses to invent a number from %s', (_label, value) => {
+    // Number('') is 0 and Number(false) is 0. A 0 that means "unreadable" is
+    // indistinguishable downstream from a car parked at 0 kph drawing 0 kW.
+    expect(decodeTeslaField('Soc', value)).toBeNull()
+    expect(decodeTeslaField('VehicleSpeed', value)).toBeNull()
   })
 })
 
-describe('unit conversion', () => {
+describe('decodeTeslaField: units', () => {
+  it('converts miles and mph to km and kph', () => {
+    expect(decoded('VehicleSpeed', 40)['speedKph']).toBeCloseTo(40 * MILES_TO_KM, 9)
+    expect(decoded('Odometer', 1000)['odometerKm']).toBeCloseTo(1609.344, 6)
+    expect(decoded('RatedRange', 200)['rangeKm']).toBeCloseTo(321.8688, 6)
+  })
+
+  it('passes through the fields that already arrive in our units', () => {
+    expect(decoded('OutsideTemp', 18.5)).toEqual({ outsideTempC: 18.5 })
+    expect(decoded('ACChargingEnergyIn', 12.25)).toEqual({ acEnergyKwh: 12.25 })
+  })
+
   it('uses the exact international mile', () => {
-    // A boundary in the literal sense: 1.6 or the US survey mile both fail here.
+    // 1.6 or the survey mile would skew every distance, efficiency and capacity
+    // figure by an amount small enough to look plausible.
     expect(MILES_TO_KM).toBe(1.609344)
   })
+})
 
-  const cases: { miles: number; km: number }[] = [
-    { miles: 0, km: 0 },
-    { miles: 1, km: 1.609344 },
-    { miles: 100, km: 160.9344 },
-    { miles: -5, km: -8.04672 },
-    { miles: 0.5, km: 0.804672 },
-  ]
-
-  for (const { miles, km } of cases) {
-    it(`converts ${miles} mi -> ${km} km for speed, odometer and range`, () => {
-      const s = normaliseTeslaMessage(
-        record(
-          { key: 'VehicleSpeed', value: d(miles) },
-          { key: 'Odometer', value: d(miles) },
-          { key: 'RatedRange', value: d(miles) },
-        ),
-      )
-      expect(s?.speedKph).toBeCloseTo(km, 9)
-      expect(s?.odometerKm).toBeCloseTo(km, 9)
-      expect(s?.rangeKm).toBeCloseTo(km, 9)
-    })
-  }
-
-  it('does not convert temperatures, SOC, power, energy or tyre pressure', () => {
-    const s = normaliseTeslaMessage(
-      record(
-        { key: 'InsideTemp', value: d(20) },
-        { key: 'OutsideTemp', value: d(20) },
-        { key: 'Soc', value: d(20) },
-        { key: 'ACChargingPower', value: d(20) },
-        { key: 'ACChargingEnergyIn', value: d(20) },
-        { key: 'TpmsPressureFl', value: d(20) },
-      ),
-    )
-    expect(s?.insideTempC).toBe(20)
-    expect(s?.outsideTempC).toBe(20)
-    expect(s?.socPct).toBe(20)
-    expect(s?.chargePowerKw).toBe(20)
-    expect(s?.chargeEnergyAddedKwh).toBe(20)
-    expect(s?.tpms).toEqual({ fl: 20 })
-  })
-
-  it('converts a zero speed to exactly zero, not null', () => {
-    const s = normaliseTeslaMessage(record({ key: 'VehicleSpeed', value: d(0) }))
-    expect(s?.speedKph).toBe(0)
+describe('decodeTeslaField: unknown fields', () => {
+  it('ignores a field it has no home for', () => {
+    // Gear and ChargeAmps are streamed but have no VehicleSample counterpart,
+    // and Tesla ships new fields without warning. Neither may become a guess.
+    expect(decodeTeslaField('Gear', 'D')).toBeNull()
+    expect(decodeTeslaField('ChargeAmps', 32)).toBeNull()
+    expect(decodeTeslaField('SomethingShippedNextTuesday', 1)).toBeNull()
+    expect(isKnownTeslaField('Soc')).toBe(true)
+    expect(isKnownTeslaField('Gear')).toBe(false)
   })
 })
 
-describe('AC/DC charging coalescing', () => {
-  it('takes AC power when only AC is present', () => {
-    const s = normaliseTeslaMessage(record({ key: 'ACChargingPower', value: d(7.4) }))
-    expect(s?.chargePowerKw).toBe(7.4)
+describe('decodeTeslaField: Location', () => {
+  it('takes latitude and longitude together', () => {
+    expect(decoded('Location', { latitude: 52.2, longitude: 0.13 }))
+      .toEqual({ lat: 52.2, lon: 0.13 })
   })
 
-  it('takes DC power when only DC is present', () => {
-    const s = normaliseTeslaMessage(record({ key: 'DCChargingPower', value: d(148.2) }))
-    expect(s?.chargePowerKw).toBe(148.2)
-  })
-
-  it('takes DC power when it is present and AC reports the idle zero', () => {
-    const s = normaliseTeslaMessage(
-      record(
-        { key: 'ACChargingPower', value: d(0) },
-        { key: 'DCChargingPower', value: d(148.2) },
-      ),
-    )
-    expect(s?.chargePowerKw).toBe(148.2)
-  })
-
-  it('takes AC power when it is present and DC reports the idle zero', () => {
-    // Entry order reversed on purpose: a later idle zero must not clobber an
-    // earlier real reading.
-    const s = normaliseTeslaMessage(
-      record(
-        { key: 'ACChargingPower', value: d(11.0) },
-        { key: 'DCChargingPower', value: d(0) },
-      ),
-    )
-    expect(s?.chargePowerKw).toBe(11.0)
-  })
-
-  it('yields zero when both are genuinely zero', () => {
-    const s = normaliseTeslaMessage(
-      record({ key: 'ACChargingPower', value: d(0) }, { key: 'DCChargingPower', value: d(0) }),
-    )
-    expect(s?.chargePowerKw).toBe(0)
-  })
-
-  it('yields null - never zero - when neither power field is present', () => {
-    const s = normaliseTeslaMessage(record({ key: 'Soc', value: d(60) }))
-    expect(s?.chargePowerKw).toBeNull()
-  })
-
-  it('yields null when both power fields are present but unreadable', () => {
-    const s = normaliseTeslaMessage(
-      record(
-        { key: 'Soc', value: d(60) },
-        { key: 'ACChargingPower', value: { invalid: true } },
-        { key: 'DCChargingPower', value: { invalid: true } },
-      ),
-    )
-    expect(s?.chargePowerKw).toBeNull()
-  })
-
-  it('coalesces AC/DC energy the same way, and stays null when both are absent', () => {
-    expect(
-      normaliseTeslaMessage(record({ key: 'DCChargingEnergyIn', value: d(31.8) }))
-        ?.chargeEnergyAddedKwh,
-    ).toBe(31.8)
-    expect(
-      normaliseTeslaMessage(
-        record(
-          { key: 'ACChargingEnergyIn', value: d(12.25) },
-          { key: 'DCChargingEnergyIn', value: d(0) },
-        ),
-      )?.chargeEnergyAddedKwh,
-    ).toBe(12.25)
-    expect(
-      normaliseTeslaMessage(record({ key: 'Soc', value: d(60) }))?.chargeEnergyAddedKwh,
-    ).toBeNull()
+  it('takes neither when only one is readable', () => {
+    // Half a fix is worse than none, because it plots - on the prime meridian.
+    expect(decodeTeslaField('Location', { latitude: 52.2 })).toBeNull()
+    expect(decodeTeslaField('Location', { latitude: 52.2, longitude: null })).toBeNull()
+    expect(decodeTeslaField('Location', { latitude: 52.2, longitude: '' })).toBeNull()
+    expect(decodeTeslaField('Location', null)).toBeNull()
   })
 })
 
-describe('charge state enums', () => {
-  const known: [string, string][] = [
+describe('decodeTeslaField: enums', () => {
+  it.each([
     ['Charging', 'charging'],
     ['ChargeStateCharging', 'charging'],
-    ['DetailedChargeStateCharging', 'charging'],
     ['Complete', 'complete'],
-    ['ChargeStateComplete', 'complete'],
-    ['Stopped', 'stopped'],
     ['ChargeStateStopped', 'stopped'],
     ['Disconnected', 'disconnected'],
-    ['ChargeStateDisconnected', 'disconnected'],
-    ['Connected', 'connected'],
     ['ChargeStateNoPower', 'connected'],
-    ['ChargeStateStarting', 'connected'],
-  ]
+    ['Starting', 'connected'],
+  ])('maps ChargeState %s', (wire, expected) => {
+    expect(decoded('ChargeState', wire)).toEqual({ chargeStateBasic: expected })
+  })
 
-  for (const [wire, expected] of known) {
-    it(`maps ${wire} -> ${expected}`, () => {
-      const s = normaliseTeslaMessage(record({ key: 'ChargeState', value: { stringValue: wire } }))
-      expect(s?.chargeState).toBe(expected)
+  it('maps the detailed enum with its own prefix', () => {
+    expect(decoded('DetailedChargeState', 'DetailedChargeStateCharging'))
+      .toEqual({ chargeStateDetailed: 'charging' })
+  })
+
+  it.each([null, '', 'ChargeStateSomethingNew', 'charging', 42])(
+    'refuses to guess a charge state from %s', (wire) => {
+      // A guessed charge state fabricates or truncates charge sessions, and the
+      // derived tables keep no record that the value was a guess.
+      expect(decodeTeslaField('ChargeState', wire)).toBeNull()
+      expect(decodeTeslaField('DetailedChargeState', wire)).toBeNull()
     })
-  }
 
-  const unknown = ['ChargeStateUnknown', 'Unknown', '', 'charging', 'CHARGING', 'Chargin']
-  for (const wire of unknown) {
-    it(`maps the unrecognised enum ${JSON.stringify(wire)} -> null, never a guess`, () => {
-      const s = normaliseTeslaMessage(
-        record({ key: 'Soc', value: d(50) }, { key: 'ChargeState', value: { stringValue: wire } }),
-      )
-      expect(s?.chargeState).toBeNull()
-    })
-  }
-
-  it('prefers DetailedChargeState over ChargeState when both are recognised', () => {
-    const s = normaliseTeslaMessage(
-      record(
-        { key: 'ChargeState', value: { stringValue: 'ChargeStateCharging' } },
-        { key: 'DetailedChargeState', value: { stringValue: 'DetailedChargeStateStopped' } },
-      ),
-    )
-    expect(s?.chargeState).toBe('stopped')
-  })
-
-  it('falls back to ChargeState when DetailedChargeState is unrecognised', () => {
-    const s = normaliseTeslaMessage(
-      record(
-        { key: 'ChargeState', value: { stringValue: 'ChargeStateCharging' } },
-        { key: 'DetailedChargeState', value: { stringValue: 'DetailedChargeStateSomethingNew' } },
-      ),
-    )
-    expect(s?.chargeState).toBe('charging')
-  })
-
-  it('accepts the dedicated enum arm as well as stringValue', () => {
-    expect(
-      normaliseTeslaMessage(record({ key: 'ChargeState', value: { chargingValue: 'Charging' } }))
-        ?.chargeState,
-    ).toBe('charging')
-    expect(
-      normaliseTeslaMessage(
-        record({
-          key: 'DetailedChargeState',
-          value: { detailedChargeStateValue: 'DetailedChargeStateComplete' },
-        }),
-      )?.chargeState,
-    ).toBe('complete')
+  it('prefers the detailed enum when both are known', () => {
+    const sample = sampleOf({ chargeStateBasic: 'connected', chargeStateDetailed: 'charging' })
+    expect(sample.chargeState).toBe('charging')
+    expect(sampleOf({ chargeStateBasic: 'connected' }).chargeState).toBe('connected')
   })
 })
 
-describe('location is all-or-nothing', () => {
-  it('lands both coordinates together', () => {
-    const s = normaliseTeslaMessage(
-      record({ key: 'Location', value: { locationValue: { latitude: 51.5, longitude: -0.12 } } }),
-    )
-    expect(s?.lat).toBe(51.5)
-    expect(s?.lon).toBe(-0.12)
+describe('decodeTeslaField: booleans and doors', () => {
+  it('reads Locked as a boolean or as a stringified boolean', () => {
+    expect(decoded('Locked', true)).toEqual({ locked: true })
+    expect(decoded('Locked', 'false')).toEqual({ locked: false })
+    expect(decodeTeslaField('Locked', 'maybe')).toBeNull()
+    expect(decodeTeslaField('Locked', 1)).toBeNull()
   })
 
-  it('lands neither when the longitude is missing', () => {
-    const s = normaliseTeslaMessage(
-      record({ key: 'Soc', value: d(50) }, { key: 'Location', value: { locationValue: { latitude: 51.5 } } }),
-    )
-    expect(s?.lat).toBeNull()
-    expect(s?.lon).toBeNull()
-  })
-
-  it('lands neither when the latitude is missing', () => {
-    const s = normaliseTeslaMessage(
-      record({ key: 'Soc', value: d(50) }, { key: 'Location', value: { locationValue: { longitude: -0.12 } } }),
-    )
-    expect(s?.lat).toBeNull()
-    expect(s?.lon).toBeNull()
-  })
-
-  it('keeps a genuine 0,0 rather than discarding it as falsy', () => {
-    const s = normaliseTeslaMessage(
-      record({ key: 'Location', value: { locationValue: { latitude: 0, longitude: 0 } } }),
-    )
-    expect(s?.lat).toBe(0)
-    expect(s?.lon).toBe(0)
-  })
-
-  it('does not count an unreadable location as mappable content', () => {
-    expect(normaliseTeslaMessage(record({ key: 'Location', value: { invalid: true } }))).toBeNull()
+  it('reports a door open only when a door actually said so', () => {
+    expect(decoded('DoorState', { DriverFront: false, PassengerFront: true }))
+      .toEqual({ doorsOpen: true })
+    expect(decoded('DoorState', { DriverFront: false })).toEqual({ doorsOpen: false })
+    // Nothing readable is not "all doors shut": false would show a car we know
+    // nothing about as secure.
+    expect(decodeTeslaField('DoorState', {})).toBeNull()
+    expect(decodeTeslaField('DoorState', null)).toBeNull()
   })
 })
 
-describe('doors and locks', () => {
-  it('reports doorsOpen true when any single door is open', () => {
-    const s = normaliseTeslaMessage(
-      record({
-        key: 'DoorState',
-        value: { doorValue: { DriverFront: false, PassengerRear: true, TrunkFront: false } },
-      }),
-    )
-    expect(s?.doorsOpen).toBe(true)
+describe('teslaStateToSample: absent stays null', () => {
+  it('never turns a field that was never reported into 0', () => {
+    const sample = sampleOf({ socPct: 72 })
+    expect(sample.socPct).toBe(72)
+    expect(sample.speedKph).toBeNull()
+    expect(sample.odometerKm).toBeNull()
+    expect(sample.chargePowerKw).toBeNull()
+    expect(sample.chargeEnergyAddedKwh).toBeNull()
+    expect(sample.chargeState).toBeNull()
+    expect(sample.locked).toBeNull()
+    expect(sample.tpms).toBeNull()
+    expect(sample.lat).toBeNull()
   })
 
-  it('leaves doorsOpen null when no door flags are readable, rather than claiming shut', () => {
-    const s = normaliseTeslaMessage(
-      record({ key: 'Soc', value: d(50) }, { key: 'DoorState', value: { doorValue: {} } }),
-    )
-    expect(s?.doorsOpen).toBeNull()
-  })
-
-  it('reads locked false as false, not as absent', () => {
-    const s = normaliseTeslaMessage(record({ key: 'Locked', value: { booleanValue: false } }))
-    expect(s?.locked).toBe(false)
-  })
-
-  it('leaves locked null when the value is not boolean-shaped', () => {
-    const s = normaliseTeslaMessage(
-      record({ key: 'Soc', value: d(50) }, { key: 'Locked', value: { stringValue: 'maybe' } }),
-    )
-    expect(s?.locked).toBeNull()
+  it('keeps a genuine zero', () => {
+    expect(sampleOf({ speedKph: 0 }).speedKph).toBe(0)
   })
 })
 
-describe('tolerating the unknown', () => {
-  it('ignores unknown keys without throwing and keeps the rest of the message', () => {
-    const s = normaliseTeslaMessage(
-      record(
-        { key: 'SomeFutureFieldTeslaAdded', value: { stringValue: 'x' } },
-        { key: 'Soc', value: d(64) },
-        { key: 'AnotherOne', value: { weirdWrapper: { nested: [1, 2, 3] } } },
-      ),
-    )
-    expect(s?.socPct).toBe(64)
+describe('teslaStateToSample: TPMS', () => {
+  it('collapses the corners that are known into one record', () => {
+    expect(sampleOf({ tpmsFl: 2.8, tpmsRr: 2.7 }).tpms).toEqual({ fl: 2.8, rr: 2.7 })
+    expect(sampleOf({ tpmsFl: 2.8, tpmsFr: 2.9, tpmsRl: 2.7, tpmsRr: 2.75 }).tpms)
+      .toEqual({ fl: 2.8, fr: 2.9, rl: 2.7, rr: 2.75 })
   })
 
-  it('ignores unknown value wrappers on known keys without throwing', () => {
-    const s = normaliseTeslaMessage(
-      record(
-        { key: 'Soc', value: d(64) },
-        { key: 'Odometer', value: { someNewTypedWrapper: { magnitude: 12 } } },
-      ),
-    )
-    expect(s?.socPct).toBe(64)
-    expect(s?.odometerKm).toBeNull()
-  })
-
-  it('ignores malformed entries', () => {
-    const s = normaliseTeslaMessage(
-      raw({
-        createdAt: CREATED_AT,
-        data: [null, 'nonsense', 42, { novalue: 1 }, { key: 7 }, { key: 'Soc', value: d(30) }],
-      }),
-    )
-    expect(s?.socPct).toBe(30)
-  })
-
-  it('reads the fields we stream but cannot store as unmapped, not as errors', () => {
-    // Gear and ChargeAmps have no VehicleSample counterpart. They must not
-    // appear in the map, and a record made only of them carries nothing.
-    expect(TESLA_FIELD_MAP['Gear']).toBeUndefined()
-    expect(TESLA_FIELD_MAP['ChargeAmps']).toBeUndefined()
-    expect(
-      normaliseTeslaMessage(
-        record(
-          { key: 'Gear', value: { shiftStateValue: 'ShiftStateD' } },
-          { key: 'ChargeAmps', value: { intValue: 32 } },
-        ),
-      ),
-    ).toBeNull()
+  it('leaves tpms null when no corner is known', () => {
+    expect(sampleOf({ socPct: 50 }).tpms).toBeNull()
   })
 })
 
-describe('nothing mappable yields null', () => {
-  const empties: [string, unknown][] = [
-    ['an empty data array', { createdAt: CREATED_AT, data: [] }],
-    ['no data array at all', { createdAt: CREATED_AT, vin: 'X' }],
-    ['a data field that is not an array', { data: { key: 'Soc' } }],
-    ['a null payload', null],
-    ['a non-object payload', 42],
-    ['unparseable JSON', '{not json'],
-  ]
-
-  for (const [label, payload] of empties) {
-    it(`returns null for ${label}`, () => {
-      expect(normaliseTeslaMessage(raw(payload))).toBeNull()
-    })
-  }
-
-  it('returns null when every recognised field is explicitly invalid', () => {
-    expect(
-      normaliseTeslaMessage(
-        record(
-          { key: 'Soc', value: { invalid: true } },
-          { key: 'VehicleSpeed', value: { invalid: true } },
-        ),
-      ),
-    ).toBeNull()
+describe('teslaStateToSample: charging power', () => {
+  it('takes the rail with the greater magnitude', () => {
+    // The inactive rail reads 0 for POWER, so magnitude picks the live one.
+    expect(sampleOf({ acPowerKw: 0, dcPowerKw: 50 }).chargePowerKw).toBe(50)
+    expect(sampleOf({ acPowerKw: 7.4, dcPowerKw: 0 }).chargePowerKw).toBe(7.4)
   })
 
-  it('honours the invalid flag even when a zero-default arm sits beside it', () => {
-    // Protobuf JSON renders the sibling arm's default next to the flag, so this
-    // is the realistic unavailable-reading shape. Reading the 0 would tell the
-    // segmenter the car had parked.
-    expect(
-      normaliseTeslaMessage(record({ key: 'VehicleSpeed', value: { invalid: true, doubleValue: 0 } })),
-    ).toBeNull()
-
-    const s = normaliseTeslaMessage(
-      record(
-        { key: 'Soc', value: d(50) },
-        { key: 'VehicleSpeed', value: { invalid: true, doubleValue: 0 } },
-        { key: 'Locked', value: { invalid: true, booleanValue: false } },
-        { key: 'ChargeState', value: { invalid: true, stringValue: 'Charging' } },
-        {
-          key: 'Location',
-          value: { invalid: true, locationValue: { latitude: 0, longitude: 0 } },
-        },
-        {
-          key: 'DoorState',
-          value: { invalid: true, doorValue: { DriverFront: false } },
-        },
-      ),
-    )
-    expect(s?.speedKph).toBeNull()
-    expect(s?.locked).toBeNull()
-    expect(s?.chargeState).toBeNull()
-    expect(s?.lat).toBeNull()
-    expect(s?.lon).toBeNull()
-    expect(s?.doorsOpen).toBeNull()
+  it('keeps a single readable rail and a genuine zero', () => {
+    expect(sampleOf({ acPowerKw: 7.4 }).chargePowerKw).toBe(7.4)
+    expect(sampleOf({ acPowerKw: 0, dcPowerKw: 0 }).chargePowerKw).toBe(0)
   })
 
-  it('returns null when every recognised field carries an empty numeric string', () => {
-    // Number('') is 0. Turning that into a 0 kph sample would tell the
-    // segmenter the car had parked.
-    expect(normaliseTeslaMessage(record({ key: 'VehicleSpeed', value: { intValue: '' } }))).toBeNull()
-  })
-
-  it('returns null when a numeric field is NaN or Infinity rather than coercing', () => {
-    expect(
-      normaliseTeslaMessage(record({ key: 'VehicleSpeed', value: { doubleValue: 'NaN' } })),
-    ).toBeNull()
-    expect(
-      normaliseTeslaMessage(record({ key: 'VehicleSpeed', value: { doubleValue: Infinity } })),
-    ).toBeNull()
+  it('stays null when neither rail was readable', () => {
+    // A 0 here reads downstream as "charger delivering nothing", which ends a
+    // charge session that is in fact still running.
+    expect(sampleOf({ socPct: 40 }).chargePowerKw).toBeNull()
   })
 })
 
-describe('missing means null, never zero', () => {
-  it('leaves every unmentioned field null on a single-field record', () => {
-    const s = normaliseTeslaMessage(record({ key: 'Soc', value: d(50) }))
-    expect(s).not.toBeNull()
-    expect(s?.socPct).toBe(50)
-    for (const key of [
-      'rangeKm',
-      'odometerKm',
-      'lat',
-      'lon',
-      'speedKph',
-      'powerState',
-      'chargeState',
-      'chargePowerKw',
-      'chargeEnergyAddedKwh',
-      'insideTempC',
-      'outsideTempC',
-      'locked',
-      'doorsOpen',
-      'tpms',
-    ] as const) {
-      expect(s?.[key], `${key} should be null, not a default`).toBeNull()
+describe('teslaStateToSample: charging energy', () => {
+  it('follows the active rail, not the larger counter', () => {
+    // THE BUG THIS TEST EXISTS FOR. The energy fields are CUMULATIVE COUNTERS:
+    // the idle rail retains an earlier session's total instead of reading 0. A
+    // magnitude rule would report the leftover 40 kWh on the AC counter for a
+    // DC charge that has added 12, and would flip rails mid-session once the
+    // live counter overtook the stale one.
+    const state: TeslaFieldUpdate = {
+      activeRail: 'dc', dcPowerKw: 50, acPowerKw: 0,
+      dcEnergyKwh: 12, acEnergyKwh: 40,
     }
+    expect(sampleOf(state).chargeEnergyAddedKwh).toBe(12)
+    expect(sampleOf({ ...state, activeRail: 'ac' }).chargeEnergyAddedKwh).toBe(40)
   })
 
-  it('keeps tpms null when no corner is readable, and partial when some are', () => {
-    expect(
-      normaliseTeslaMessage(
-        record({ key: 'Soc', value: d(50) }, { key: 'TpmsPressureFl', value: { invalid: true } }),
-      )?.tpms,
-    ).toBeNull()
-
-    expect(
-      normaliseTeslaMessage(
-        record(
-          { key: 'TpmsPressureFl', value: d(2.8) },
-          { key: 'TpmsPressureRr', value: { invalid: true } },
-        ),
-      )?.tpms,
-    ).toEqual({ fl: 2.8 })
+  it('still reports the counter once power has dropped back to zero', () => {
+    // The end of a charge is when the total matters most, and by then power is
+    // 0 on both rails - so the rail must be remembered, not re-derived.
+    expect(sampleOf({ activeRail: 'dc', acPowerKw: 0, dcPowerKw: 0, dcEnergyKwh: 31.5 })
+      .chargeEnergyAddedKwh).toBe(31.5)
   })
-})
 
-describe('numeric wrapper arms', () => {
-  const arms: [string, unknown, number][] = [
-    ['doubleValue', { doubleValue: 55.5 }, 55.5],
-    ['floatValue', { floatValue: 55.5 }, 55.5],
-    ['intValue', { intValue: 55 }, 55],
-    ['longValue as a protojson string', { longValue: '55' }, 55],
-    ['snake_case double_value', { double_value: 55.5 }, 55.5],
-    ['a bare number', 55.5, 55.5],
-  ]
+  it('uses the only counter it has when no rail is known', () => {
+    expect(sampleOf({ acEnergyKwh: 12 }).chargeEnergyAddedKwh).toBe(12)
+    expect(sampleOf({ dcEnergyKwh: 12 }).chargeEnergyAddedKwh).toBe(12)
+  })
 
-  for (const [label, value, expected] of arms) {
-    it(`reads ${label}`, () => {
-      expect(normaliseTeslaMessage(record({ key: 'Soc', value }))?.socPct).toBe(expected)
-    })
-  }
-
-  it('reads a zero intValue as zero rather than treating it as absent', () => {
-    const s = normaliseTeslaMessage(record({ key: 'Soc', value: { intValue: 0 } }))
-    expect(s?.socPct).toBe(0)
+  it('reports nothing when two counters disagree and nothing says which is live', () => {
+    // Better a hole in the energy series than a difference between two
+    // unrelated counters, which would be written into battery health as fact.
+    expect(sampleOf({ acEnergyKwh: 40, dcEnergyKwh: 12 }).chargeEnergyAddedKwh).toBeNull()
+    expect(sampleOf({ socPct: 40 }).chargeEnergyAddedKwh).toBeNull()
   })
 })
 
-describe('normaliseTeslaConnectivity', () => {
-  it('maps CONNECTED to online and DISCONNECTED to offline', () => {
-    expect(
-      normaliseTeslaConnectivity(raw({ status: 'CONNECTED', createdAt: CREATED_AT }))?.powerState,
-    ).toBe('online')
-    expect(normaliseTeslaConnectivity(raw({ status: 'DISCONNECTED' }))?.powerState).toBe('offline')
-  })
-
-  it('returns null for an unknown or missing status', () => {
-    expect(normaliseTeslaConnectivity(raw({ status: 'FLAPPING' }))).toBeNull()
-    expect(normaliseTeslaConnectivity(raw({}))).toBeNull()
-    expect(normaliseTeslaConnectivity(raw(null))).toBeNull()
-  })
-
-  it('leaves everything but powerState null', () => {
-    const s = normaliseTeslaConnectivity(raw({ status: 'CONNECTED' }))
-    expect(s?.socPct).toBeNull()
-    expect(s?.speedKph).toBeNull()
-    expect(s?.ts).toEqual(RECEIVED_AT)
-  })
-
-  it('is not confused by a telemetry record, and vice versa', () => {
-    expect(normaliseTeslaConnectivity(record({ key: 'Soc', value: d(50) }))).toBeNull()
-    expect(normaliseTeslaMessage(raw({ status: 'CONNECTED' }))).toBeNull()
+describe('power decoding claims the rail', () => {
+  it('marks the rail active only when power is actually flowing', () => {
+    expect(decoded('DCChargingPower', 50)).toEqual({ dcPowerKw: 50, activeRail: 'dc' })
+    // 0 kW on AC while DC delivers must not claim the AC rail.
+    expect(decoded('ACChargingPower', 0)).toEqual({ acPowerKw: 0 })
+    expect(decodeTeslaField('ACChargingPower', null)).toBeNull()
   })
 })
+
+describe('connectivity', () => {
+  const raw = (payload: unknown): RawMessage => ({
+    vehicleId: VEHICLE, vendor: 'tesla', receivedAt: TS, source: 'telemetry', payload,
+  })
+
+  it('maps the two states and nothing else', () => {
+    expect(decodeTeslaConnectivity({ status: 'CONNECTED' })).toBe('online')
+    expect(decodeTeslaConnectivity({ status: 'DISCONNECTED' })).toBe('offline')
+    expect(decodeTeslaConnectivity({ status: 'SOMETHING' })).toBeNull()
+    expect(decodeTeslaConnectivity(null)).toBeNull()
+  })
+
+  it('prefers the createdAt the connectivity message carries', () => {
+    const sample = normaliseTeslaConnectivity(
+      raw({ status: 'CONNECTED', createdAt: '2026-09-04T09:59:00.000Z' }))
+    expect(sample?.powerState).toBe('online')
+    expect(sample?.ts.toISOString()).toBe('2026-09-04T09:59:00.000Z')
+  })
+
+  it('falls back to arrival time when createdAt is unusable', () => {
+    // An Invalid Date propagates into a NULL timestamp on insert and loses the
+    // row entirely.
+    const sample = normaliseTeslaConnectivity(raw({ status: 'CONNECTED', createdAt: 'nope' }))
+    expect(sample?.ts.toISOString()).toBe(TS.toISOString())
+  })
+})
+

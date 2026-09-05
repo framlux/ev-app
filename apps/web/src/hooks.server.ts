@@ -1,7 +1,7 @@
 import type { Handle } from '@sveltejs/kit'
 import { env } from '$env/dynamic/private'
 import { gateDecision } from '$lib/server/gate.js'
-import { SESSION_COOKIE, readSession } from '$lib/server/session.js'
+import { SESSION_COOKIE, isAuthorisedSubject, readSession } from '$lib/server/session.js'
 
 export { PUBLIC_PATHS, isPublicPath } from '$lib/server/public-paths.js'
 
@@ -31,10 +31,19 @@ export const handle: Handle = async ({ event, resolve }) => {
 		if (bearer) session = await readSession(bearer, key)
 	}
 
+	// The subject is re-checked on every request, not just at the callback. The
+	// cookie is self-contained and lives 30 days, so a session sealed while a
+	// subject was allowed keeps verifying after ALLOWED_SUBJECT changes; without
+	// this, removing someone from the config would not sign them out. Dropping
+	// the session here as well as in gateDecision keeps `locals` from carrying a
+	// user the gate has already refused into a public route's load function.
+	const allowedSubject = env.ALLOWED_SUBJECT ?? ''
+	if (session && !isAuthorisedSubject(session.sub, allowedSubject)) session = null
+
 	event.locals.session = session
 	event.locals.user = session
 
-	const decision = gateDecision(event.url.pathname, event.url.search, session !== null)
+	const decision = gateDecision(event.url.pathname, event.url.search, session, allowedSubject)
 	if (decision.kind === 'unauthorized') {
 		return new Response('unauthorized', {
 			status: 401,

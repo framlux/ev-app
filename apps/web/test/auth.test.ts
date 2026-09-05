@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { SignJWT } from 'jose'
+import { hkdfSync } from 'node:crypto'
+import { SignJWT, compactDecrypt, jwtVerify } from 'jose'
 import { gateDecision } from '../src/lib/server/gate.js'
 import {
 	PUBLIC_PATHS,
@@ -20,6 +21,45 @@ import {
 const KEY = 'a'.repeat(64)
 const OTHER_KEY = 'b'.repeat(64)
 const SUBJECT = 'pocketid-subject-123'
+const OTHER_SUBJECT = 'pocketid-subject-999'
+
+function derivedEncryptionKey(key: string): Uint8Array {
+	return new Uint8Array(
+		hkdfSync(
+			'sha256',
+			new TextEncoder().encode(key),
+			new Uint8Array(0),
+			new TextEncoder().encode('ev-session-encrypt'),
+			32
+		)
+	)
+}
+
+/**
+ * The signing key readSession actually verifies against, re-derived here rather
+ * than exported from session.ts.
+ *
+ * Duplicating the derivation is the point: a test that signs with the raw
+ * SESSION_KEY produces a token readSession rejects for the wrong reason — bad
+ * signature — so the "must be encrypted" guard it claims to cover goes
+ * untested. Signing with this key makes the JWE layer the only thing standing
+ * between the token and acceptance. If session.ts changes its derivation, this
+ * derivation stops matching and the JWE test would quietly degrade back into a
+ * signature-mismatch test, so the test below named "signs the bare token with
+ * the key readSession verifies against" asserts the derivation still agrees.
+ */
+function derivedSigningKey(key: string): Uint8Array {
+	const ikm = new TextEncoder().encode(key)
+	return new Uint8Array(
+		hkdfSync(
+			'sha256',
+			ikm,
+			new Uint8Array(0),
+			new TextEncoder().encode('ev-session-sign'),
+			32
+		)
+	)
+}
 
 describe('isAuthorisedSubject', () => {
 	// Table-driven because every one of these is a way the single-user rule has
@@ -121,19 +161,56 @@ describe('session sealing', () => {
 		expect(await readSession(token.slice(0, -3) + 'aaa', KEY)).toBeNull()
 	})
 
-	it('rejects a bare signed JWT that was never encrypted', async () => {
-		// Guards against a future "optimisation" that drops the JWE layer on read
-		// while leaving it on write: an attacker who learns the signing key derives
-		// nothing here, but a reader that accepts unencrypted input accepts a much
-		// larger class of tokens than it was designed to.
-		const jws = await new SignJWT({})
+	/**
+	 * A JWS that is valid in every respect except that it is not wrapped in the
+	 * JWE. Signed with the *derived* signing key, not the raw SESSION_KEY: with
+	 * the raw key the token fails the signature check and the test passes for a
+	 * reason that has nothing to do with encryption, which is how a readSession
+	 * that falls back to plain jwtVerify slipped past this suite before.
+	 */
+	async function bareSignedToken(): Promise<string> {
+		return new SignJWT({})
 			.setProtectedHeader({ alg: 'HS256' })
 			.setSubject(SUBJECT)
 			.setIssuer('ev-web')
 			.setAudience('ev-session')
 			.setIssuedAt()
 			.setExpirationTime('30d')
-			.sign(new TextEncoder().encode(KEY))
+			.sign(derivedSigningKey(KEY))
+	}
+
+	it('signs the bare token with the key readSession verifies against', async () => {
+		// Load-bearing for the test below: if this stops holding, "rejected" would
+		// no longer mean "rejected for lacking the JWE layer". Proven by decrypting
+		// a real session and verifying its inner JWS with the same derived key.
+		const sealed = await sealSession({ sub: SUBJECT }, KEY)
+		const { plaintext } = await compactDecrypt(sealed, derivedEncryptionKey(KEY))
+		const inner = new TextDecoder().decode(plaintext)
+		const { payload } = await jwtVerify(inner, derivedSigningKey(KEY), {
+			issuer: 'ev-web',
+			audience: 'ev-session'
+		})
+		expect(payload.sub).toBe(SUBJECT)
+	})
+
+	it('rejects a bare signed JWT that was never encrypted', async () => {
+		// Guards against a future "optimisation" that drops the JWE layer on read
+		// while leaving it on write: an attacker who learns the signing key derives
+		// nothing here, but a reader that accepts unencrypted input accepts a much
+		// larger class of tokens than it was designed to.
+		expect(await readSession(await bareSignedToken(), KEY)).toBeNull()
+	})
+
+	it('rejects a bare signed JWT even when it is otherwise entirely valid', async () => {
+		// Same token, stated as the negative of the round trip: it carries the
+		// right subject, issuer, audience and signature, so nothing but the missing
+		// encryption layer can be what refuses it.
+		const jws = await bareSignedToken()
+		const { payload } = await jwtVerify(jws, derivedSigningKey(KEY), {
+			issuer: 'ev-web',
+			audience: 'ev-session'
+		})
+		expect(payload.sub).toBe(SUBJECT)
 		expect(await readSession(jws, KEY)).toBeNull()
 	})
 
@@ -244,17 +321,114 @@ describe('safeNextPath', () => {
 	// holds, so it is attacker-influenced: an open redirect out of an SSO
 	// callback is a credible phishing primitive.
 	it.each([
+		// Ordinary destinations still work; the guard must not eat the real feature.
 		['/sessions/42', '/sessions/42'],
 		['/?tab=charges', '/?tab=charges'],
+		['/sessions/42?tab=map#leg-3', '/sessions/42?tab=map#leg-3'],
+		['/', '/'],
+		// Authority smuggled past a leading slash.
 		['//evil.example/path', '/'],
 		['/\\evil.example', '/'],
+		['/\\\\evil.example', '/'],
 		['https://evil.example', '/'],
+		['//evil.example', '/'],
 		['javascript:alert(1)', '/'],
 		['', '/'],
 		[null, '/'],
 		[undefined, '/']
 	])('maps %s to %s', (input, expected) => {
 		expect(safeNextPath(input as string | null | undefined)).toBe(expected)
+	})
+
+	/**
+	 * The control characters are the vector that got through: browsers strip tab,
+	 * LF and CR from a URL *before* parsing it, so a value starting `/` + control
+	 * passes any `startsWith('//')` check on the server and still resolves
+	 * off-origin in the browser. Asserted twice — that safeNextPath refuses the
+	 * value, and that the URL parser really would have gone off-origin had it not
+	 * — so the test states the threat rather than a spelling of it.
+	 */
+	it.each([
+		['tab', '\t'],
+		['newline', '\n'],
+		['carriage return', '\r'],
+		['NUL', '\u0000'],
+		['vertical tab', '\u000b'],
+		['form feed', '\u000c'],
+		['SOH', '\u0001'],
+		['unit separator', '\u001f'],
+		['DEL', '\u007f']
+	])('refuses a %s smuggled in front of an authority', (_name, control) => {
+		expect(safeNextPath(`/${control}/evil.example`)).toBe('/')
+		expect(safeNextPath(`/${control}${control}evil.example`)).toBe('/')
+	})
+
+	it('refuses the exact tab vector the reviewer walked end to end', () => {
+		// new URL('/\t/evil.example', 'https://ev.framlux.io').href is
+		// 'https://evil.example/'. Pinned here so the danger is visible in the test
+		// rather than only in a comment.
+		expect(new URL('/\t/evil.example', 'https://ev.framlux.io').href).toBe('https://evil.example/')
+		expect(safeNextPath('/\t/evil.example')).toBe('/')
+	})
+
+	it('normalises an encoded traversal instead of passing it through', () => {
+		// %2e is a dot segment to the WHATWG parser, so the browser would resolve
+		// this to '/b' anyway. Agreeing with the parser is the point: what we
+		// return is what the browser would have navigated to.
+		expect(safeNextPath('/a/%2e%2e/b')).toBe('/b')
+		expect(safeNextPath('/a/../../../etc/passwd')).toBe('/etc/passwd')
+	})
+
+	it('never returns a value carrying an origin', () => {
+		for (const candidate of ['/sessions/42', '//evil.example', '/\\evil.example', '/a/../b']) {
+			expect(safeNextPath(candidate).startsWith('/')).toBe(true)
+			expect(safeNextPath(candidate)).not.toMatch(/^\/\//)
+			expect(safeNextPath(candidate)).not.toContain('evil.example')
+		}
+	})
+
+	// Dot-segment collapse - the gap the guard above missed.
+	//
+	// The test above asserts "never returns a value carrying an origin" but its
+	// vector list contained nothing that could violate it, so it passed against a
+	// function for which the property was false for 775 inputs.
+	//
+	// None of these is protocol-relative on the way IN; the WHATWG collapse
+	// creates that property while resolving. A check on the input alone therefore
+	// cannot catch them. Each of these previously returned '//evil.example',
+	// which a browser resolves against our origin as https://evil.example/.
+	it.each([
+		'/x/..//evil.example',
+		'/..//evil.example',
+		'/.//evil.example',
+		'/a/b/../..//evil.example',
+		'/x/%2e%2e//evil.example',
+		'/x/../\\evil.example',
+		'/x/..//\\evil.example'
+	])('collapses %s to something that stays on our origin', (raw) => {
+		const out = safeNextPath(raw)
+		expect(out.startsWith('//')).toBe(false)
+		// The property that actually matters, stated the way a browser sees it.
+		expect(new URL(out, 'https://ev.framlux.io').origin).toBe('https://ev.framlux.io')
+	})
+
+	it('never returns an off-origin path, exhaustively over four segments', () => {
+		// A guard written as a fixed vector list is only as good as the
+		// imagination behind it, which is precisely how the previous one passed
+		// while being wrong. This one cannot be out-imagined the same way.
+		const segs = ['', '..', '.', 'evil.example', 'a', '%2e%2e', '\\evil.example', '%2f']
+		const escaped: string[] = []
+		for (const a of segs)
+			for (const b of segs)
+				for (const c of segs)
+					for (const d of segs) {
+						const raw = `/${[a, b, c, d].join('/')}`
+						const out = safeNextPath(raw)
+						if (new URL(out, 'https://ev.framlux.io').origin !== 'https://ev.framlux.io') {
+							escaped.push(raw)
+						}
+					}
+		expect(escaped).toEqual([])
 	})
 })
 
@@ -266,41 +440,45 @@ describe('safeNextPath', () => {
  * than a request that quietly proceeds without a user.
  */
 describe('gateDecision', () => {
+	const ME = { sub: SUBJECT }
+
 	it('lets a signed-in request through', () => {
-		expect(gateDecision('/sessions/1', '', true)).toEqual({ kind: 'allow' })
+		expect(gateDecision('/sessions/1', '', ME, SUBJECT)).toEqual({ kind: 'allow' })
 	})
 
 	it('lets a public path through with no session', () => {
-		expect(gateDecision('/healthz/ready', '', false)).toEqual({ kind: 'allow' })
-		expect(gateDecision('/.well-known/appspecific/key.pem', '', false)).toEqual({ kind: 'allow' })
+		expect(gateDecision('/healthz/ready', '', null, SUBJECT)).toEqual({ kind: 'allow' })
+		expect(gateDecision('/.well-known/appspecific/key.pem', '', null, SUBJECT)).toEqual({
+			kind: 'allow'
+		})
 	})
 
 	it('redirects an anonymous browser to sign-in, preserving where it was going', () => {
-		expect(gateDecision('/sessions/1', '?tab=map', false)).toEqual({
+		expect(gateDecision('/sessions/1', '?tab=map', null, SUBJECT)).toEqual({
 			kind: 'redirect',
 			location: '/auth/login?next=%2Fsessions%2F1%3Ftab%3Dmap'
 		})
 	})
 
 	it('answers an anonymous API call with 401 rather than a redirect', () => {
-		expect(gateDecision('/api/v1/vehicles', '', false)).toEqual({ kind: 'unauthorized' })
+		expect(gateDecision('/api/v1/vehicles', '', null, SUBJECT)).toEqual({ kind: 'unauthorized' })
 	})
 
 	it('refuses a request whose cookie failed verification exactly as it refuses one with no cookie', async () => {
 		const tampered = (await sealSession({ sub: SUBJECT }, KEY)).slice(0, -3) + 'aaa'
 		// The cookie is present and looks plausible; verification is what decides.
 		expect(await readSession(tampered, KEY)).toBeNull()
-		expect(gateDecision('/', '', (await readSession(tampered, KEY)) !== null)).toEqual(
-			gateDecision('/', '', false)
+		expect(gateDecision('/', '', await readSession(tampered, KEY), SUBJECT)).toEqual(
+			gateDecision('/', '', null, SUBJECT)
 		)
-		expect(gateDecision('/', '', false).kind).toBe('redirect')
+		expect(gateDecision('/', '', null, SUBJECT).kind).toBe('redirect')
 	})
 
 	it('refuses an expired cookie on a protected path', async () => {
 		const expired = await sealSession({ sub: SUBJECT }, KEY, { ttlSeconds: -1 })
 		const session = await readSession(expired, KEY)
 		expect(session).toBeNull()
-		expect(gateDecision('/api/v1/vehicles', '', session !== null)).toEqual({
+		expect(gateDecision('/api/v1/vehicles', '', session, SUBJECT)).toEqual({
 			kind: 'unauthorized'
 		})
 	})
@@ -308,8 +486,67 @@ describe('gateDecision', () => {
 	it('serves the vendor key path even to an expired session', async () => {
 		// The path that must not regress: an un-authenticated fetch of the app's
 		// public key has to keep working or the vehicle integration un-pairs.
-		expect(gateDecision('/.well-known/appspecific/com.tesla.3p.public-key.pem', '', false)).toEqual(
-			{ kind: 'allow' }
-		)
+		expect(
+			gateDecision('/.well-known/appspecific/com.tesla.3p.public-key.pem', '', null, SUBJECT)
+		).toEqual({ kind: 'allow' })
+	})
+
+	/**
+	 * Revocation. The cookie is self-contained and lives 30 days, so the only
+	 * thing that can evict a session mid-life is re-checking the subject on every
+	 * request. Before this existed the callback checked once and the gate trusted
+	 * the seal forever: changing ALLOWED_SUBJECT locked the ex-user out of new
+	 * sign-ins while leaving the session they already held fully working.
+	 */
+	describe('subject re-check on every request', () => {
+		it('refuses a validly-sealed cookie whose subject is no longer allowed', async () => {
+			const sealed = await sealSession({ sub: SUBJECT }, KEY)
+			const session = await readSession(sealed, KEY)
+			// The cryptography is fine — this is an authorisation decision, not a
+			// verification failure, and that distinction is the bug being fixed.
+			expect(session).toEqual({ sub: SUBJECT })
+			expect(gateDecision('/sessions/1', '', session, OTHER_SUBJECT)).toEqual({
+				kind: 'redirect',
+				location: '/auth/login?next=%2Fsessions%2F1'
+			})
+			expect(gateDecision('/api/v1/vehicles', '', session, OTHER_SUBJECT)).toEqual({
+				kind: 'unauthorized'
+			})
+		})
+
+		it('refuses a still-valid session once ALLOWED_SUBJECT is unset', async () => {
+			// Losing the configuration must lock everyone out, never let every
+			// already-issued cookie through.
+			const session = await readSession(await sealSession({ sub: SUBJECT }, KEY), KEY)
+			expect(gateDecision('/sessions/1', '', session, '')).toEqual({
+				kind: 'redirect',
+				location: '/auth/login?next=%2Fsessions%2F1'
+			})
+		})
+
+		it('refuses a disallowed subject exactly as it refuses anonymity', async () => {
+			const session = await readSession(await sealSession({ sub: SUBJECT }, KEY), KEY)
+			expect(gateDecision('/sessions/1', '?tab=map', session, OTHER_SUBJECT)).toEqual(
+				gateDecision('/sessions/1', '?tab=map', null, OTHER_SUBJECT)
+			)
+		})
+
+		it('applies the same exact-match rule the callback applies', async () => {
+			// No prefix, no case folding, no trimming: a revoked subject that merely
+			// resembles the allowed one is still revoked.
+			for (const allowed of [`${SUBJECT}x`, SUBJECT.toUpperCase(), ` ${SUBJECT} `]) {
+				const session = await readSession(await sealSession({ sub: SUBJECT }, KEY), KEY)
+				expect(gateDecision('/api/v1/vehicles', '', session, allowed).kind).toBe('unauthorized')
+			}
+		})
+
+		it('still serves public paths to a now-disallowed session', () => {
+			// Health probes and the vendor key path do not depend on who is asking,
+			// and gating them on a revoked subject would un-pair the vehicle.
+			expect(gateDecision('/healthz/ready', '', ME, OTHER_SUBJECT)).toEqual({ kind: 'allow' })
+			expect(
+				gateDecision('/.well-known/appspecific/com.tesla.3p.public-key.pem', '', ME, OTHER_SUBJECT)
+			).toEqual({ kind: 'allow' })
+		})
 	})
 })

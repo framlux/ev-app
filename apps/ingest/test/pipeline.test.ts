@@ -1,57 +1,90 @@
 import { describe, expect, it } from 'vitest'
-import { makeSample } from '@ev/core'
-import { Pipeline } from '../src/pipeline.js'
+import { DEFAULT_SEGMENTER_OPTIONS, makeSample, type RawMessage } from '@ev/core'
+import {
+  FieldAccumulator,
+  MAX_SAMPLE_INTERVAL_MS,
+  Pipeline,
+  QUIET_PERIOD_MS,
+  STALE_VALUE_MS,
+  VOLATILE_FIELDS,
+  VOLATILE_STALE_MS,
+  staleWindowFor,
+} from '../src/pipeline.js'
 import { FakeDb, openSessions } from './support/fake-db.js'
-import { num, str, teslaRaw } from './support/fixtures.js'
 
 const OPTS = { usableCapacityKwh: 75 }
+const VIN = '5YJ3E1EA1JF000001'
 /** 40 mph. The segmenter's moving threshold is 1 kph and Tesla streams mph. */
 const MOVING = 40
 const t = (iso: string) => new Date(iso)
 
-describe('Pipeline.handle', () => {
-  it('writes the raw message and the derived sample in one commit', async () => {
+/**
+ * One fleet-telemetry MQTT message: ONE FIELD of one vehicle, the value alone,
+ * with the field name folded in from the topic by `mqtt.ts`. There is no record
+ * envelope and no `data` array on this transport, so there is no such thing as a
+ * message that carries a whole sample.
+ */
+function field(at: Date | string, name: string, value: unknown): RawMessage {
+  return {
+    vehicleId: 'veh-1',
+    vendor: 'tesla',
+    receivedAt: typeof at === 'string' ? t(at) : at,
+    source: 'telemetry',
+    payload: { kind: 'metrics', vin: VIN, field: name, value },
+  }
+}
+
+function connectivity(at: string, status: string): RawMessage {
+  return {
+    vehicleId: 'veh-1',
+    vendor: 'tesla',
+    receivedAt: t(at),
+    source: 'telemetry',
+    payload: { kind: 'connectivity', vin: VIN, field: null, value: { status } },
+  }
+}
+
+/** A burst of fields published at the same instant, as the car does. */
+async function burst(
+  pipeline: Pipeline, at: string, fields: Record<string, unknown>,
+): Promise<void> {
+  for (const [name, value] of Object.entries(fields)) {
+    await pipeline.handle(field(at, name, value))
+  }
+}
+
+describe('Pipeline.handle: the tape', () => {
+  it('writes every field message to the tape, mappable or not', async () => {
     const db = new FakeDb()
     const pipeline = new Pipeline(db, OPTS)
 
-    await pipeline.handle(teslaRaw('2026-09-04T10:00:00.000Z', { Soc: num(80) }))
+    await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Soc', 80))
+    // An unknown field and an unreadable value: counted, taped, never a crash
+    // and never a guess.
+    const unknown = await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Gear', 'D'))
+    const invalid = await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Soc', null))
 
-    expect(db.state.raw).toHaveLength(1)
-    expect(db.state.samples).toHaveLength(1)
-    expect(db.state.samples[0]?.socPct).toBe(80)
-    // One transaction, not two: raw and sample must never be separable.
-    expect(db.log).toEqual(['commit'])
-  })
-
-  it('writes the raw message even when normalisation yields nothing', async () => {
-    const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
-
-    // A record whose only value is explicitly invalid: nothing mappable, but
-    // the tape must still keep it or a later normaliser fix has nothing to
-    // reprocess.
-    await pipeline.handle(teslaRaw('2026-09-04T10:00:00.000Z', {
-      Soc: { invalid: true, doubleValue: 0 },
-    }))
-
-    expect(db.state.raw).toHaveLength(1)
-    expect(db.state.samples).toHaveLength(0)
+    expect(db.state.raw).toHaveLength(3)
+    expect(unknown.unmapped).toBe(1)
+    expect(invalid.unmapped).toBe(1)
+    expect(unknown.fieldsApplied).toBe(0)
+    // The tape is what makes a normaliser fix reprocessable, so it keeps
+    // everything - including what this build could not read.
+    expect(db.log).toEqual(['commit', 'commit', 'commit'])
   })
 
   it('creates the month partition before inserting into a partitioned table', async () => {
     const db = new FakeDb()
     const pipeline = new Pipeline(db, OPTS)
 
-    await pipeline.handle(teslaRaw('2026-09-04T10:00:00.000Z', { Soc: num(80) }))
+    await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Soc', 80))
     expect(db.state.partitions).toContain('2026-8')
 
-    // Second message, same month: the cache means no repeated DDL.
     const before = db.state.partitions.length
-    await pipeline.handle(teslaRaw('2026-09-04T10:01:00.000Z', { Soc: num(79) }))
+    await pipeline.handle(field('2026-09-04T10:00:01.000Z', 'Soc', 79))
     expect(db.state.partitions.length).toBe(before)
 
-    // A different month must still be created.
-    await pipeline.handle(teslaRaw('2026-10-01T00:00:00.000Z', { Soc: num(79) }))
+    await pipeline.handle(field('2026-10-01T00:00:00.000Z', 'Soc', 79))
     expect(db.state.partitions).toContain('2026-9')
   })
 
@@ -59,12 +92,167 @@ describe('Pipeline.handle', () => {
     const db = new FakeDb()
     const pipeline = new Pipeline(db, OPTS)
 
-    await pipeline.handle(teslaRaw('2026-09-04T10:05:00.000Z', { Soc: num(80) }))
+    await pipeline.handle(field('2026-09-04T10:05:00.000Z', 'Soc', 80))
     expect(db.state.cursor?.toISOString()).toBe('2026-09-04T10:05:00.000Z')
 
-    // A redelivered older message must not drag the watermark backwards.
-    await pipeline.handle(teslaRaw('2026-09-04T10:00:00.000Z', { Soc: num(81) }))
+    await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Soc', 81))
     expect(db.state.cursor?.toISOString()).toBe('2026-09-04T10:05:00.000Z')
+  })
+})
+
+describe('Pipeline accumulation', () => {
+  it('emits ONE sample carrying the whole burst, not one per field', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+
+    await burst(pipeline, '2026-09-04T10:00:00.000Z',
+      { Soc: 80, VehicleSpeed: MOVING, Odometer: 1000, TpmsPressureFl: 2.8 })
+    expect(db.state.samples).toHaveLength(0)
+
+    // The quiet gap in front of this message is what proves the burst finished.
+    await pipeline.handle(field('2026-09-04T10:00:05.000Z', 'Soc', 79))
+
+    expect(db.state.samples).toHaveLength(1)
+    const sample = db.state.samples[0]
+    expect(sample?.socPct).toBe(80)
+    expect(sample?.speedKph).toBeCloseTo(64.37, 2)
+    expect(sample?.odometerKm).toBeCloseTo(1609.34, 2)
+    expect(sample?.tpms).toEqual({ fl: 2.8 })
+    // Stamped at the observation, not at the emit: the sample is what the car
+    // reported at 10:00:00.
+    expect(sample?.ts.toISOString()).toBe('2026-09-04T10:00:00.000Z')
+  })
+
+  it('leaves a field that was never reported null, never 0', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+
+    await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Soc', 80))
+    await pipeline.handle(field('2026-09-04T10:00:05.000Z', 'Soc', 79))
+
+    const sample = db.state.samples[0]
+    expect(sample?.socPct).toBe(80)
+    // A 0 here would tell the segmenter the car is parked, drawing nothing.
+    expect(sample?.speedKph).toBeNull()
+    expect(sample?.chargePowerKw).toBeNull()
+    expect(sample?.chargeEnergyAddedKwh).toBeNull()
+    expect(sample?.odometerKm).toBeNull()
+  })
+
+  it('carries the latest known value of a field into later samples', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+
+    // Odometer is published far less often than speed. Dropping it between
+    // samples would make almost every sample all-null, which is what wrecks
+    // segmentation.
+    await burst(pipeline, '2026-09-04T10:00:00.000Z', { Odometer: 1000, VehicleSpeed: MOVING })
+    await burst(pipeline, '2026-09-04T10:00:10.000Z', { VehicleSpeed: MOVING })
+    await pipeline.handle(field('2026-09-04T10:00:20.000Z', 'VehicleSpeed', MOVING))
+
+    expect(db.state.samples).toHaveLength(2)
+    expect(db.state.samples[1]?.odometerKm).toBeCloseTo(1609.34, 2)
+  })
+
+  it('stops carrying a value once it is stale', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+
+    await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'VehicleSpeed', MOVING))
+    await pipeline.handle(field('2026-09-04T10:00:05.000Z', 'Soc', 80))
+    expect(db.state.samples[0]?.speedKph).toBeCloseTo(64.37, 2)
+
+    // Sixteen minutes later the car speaks again. A speed from before the
+    // silence must not be repeated as if it were current - that is what would
+    // hold a drive open all night on a car parked in an underground garage.
+    const late = new Date(t('2026-09-04T10:00:00.000Z').getTime() + STALE_VALUE_MS + 60_000)
+    await pipeline.handle(field(late, 'Soc', 79))
+    await pipeline.handle(field(new Date(late.getTime() + 5_000), 'Soc', 78))
+
+    const last = db.state.samples[db.state.samples.length - 1]
+    expect(last?.socPct).toBe(79)
+    expect(last?.speedKph).toBeNull()
+  })
+
+  it('waits exactly QUIET_PERIOD_MS before treating a burst as finished', async () => {
+    const start = t('2026-09-04T10:00:00.000Z')
+    const at = (ms: number) => new Date(start.getTime() + ms)
+
+    const early = new FakeDb()
+    const a = new Pipeline(early, OPTS)
+    await a.handle(field(start, 'Soc', 80))
+    await a.handle(field(at(QUIET_PERIOD_MS - 1), 'VehicleSpeed', 0))
+    expect(early.state.samples).toHaveLength(0)
+
+    const onTime = new FakeDb()
+    const b = new Pipeline(onTime, OPTS)
+    await b.handle(field(start, 'Soc', 80))
+    await b.handle(field(at(QUIET_PERIOD_MS), 'VehicleSpeed', 0))
+    expect(onTime.state.samples).toHaveLength(1)
+    expect(onTime.state.samples[0]?.socPct).toBe(80)
+  })
+
+  it('emits at MAX_SAMPLE_INTERVAL_MS even if the car never goes quiet', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+    const start = t('2026-09-04T10:00:00.000Z')
+    const step = 1_000
+
+    // A car fast-charging publishes without pause, so the quiet rule never
+    // fires. Without the ceiling this accumulates forever and the worker looks
+    // healthy while writing nothing at all.
+    for (let ms = 0; ms + step <= MAX_SAMPLE_INTERVAL_MS; ms += step) {
+      await pipeline.handle(field(new Date(start.getTime() + ms), 'Soc', 80))
+      expect(db.state.samples).toHaveLength(0)
+    }
+    await pipeline.handle(
+      field(new Date(start.getTime() + MAX_SAMPLE_INTERVAL_MS), 'Soc', 80))
+
+    expect(db.state.samples).toHaveLength(1)
+  })
+
+  it('flushes what is pending on shutdown', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+
+    await burst(pipeline, '2026-09-04T10:00:00.000Z', { Soc: 80, VehicleSpeed: 0 })
+    // A restart without this drops the last burst: no further message will ever
+    // arrive to trigger the emit.
+    const result = await pipeline.flush(t('2026-09-04T10:00:00.500Z'), true)
+
+    expect(result.samples).toBe(1)
+    expect(db.state.samples).toHaveLength(1)
+    expect(db.state.samples[0]?.socPct).toBe(80)
+
+    // Nothing pending: a second flush must not write the same state again.
+    expect((await pipeline.flush(t('2026-09-04T10:01:00.000Z'), true)).samples).toBe(0)
+  })
+
+  it('takes power state from connectivity messages', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+
+    await pipeline.handle(connectivity('2026-09-04T10:00:00.000Z', 'CONNECTED'))
+    await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Soc', 80))
+    await pipeline.flush(t('2026-09-04T10:00:05.000Z'))
+
+    expect(db.state.samples[0]?.powerState).toBe('online')
+  })
+
+  it('ignores alerts and errors', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+
+    const result = await pipeline.handle({
+      vehicleId: 'veh-1', vendor: 'tesla', receivedAt: t('2026-09-04T10:00:00.000Z'),
+      source: 'telemetry',
+      payload: { kind: 'alert', vin: VIN, field: 'Charge_Cable_Fault', value: {} },
+    })
+
+    expect(result.unmapped).toBe(1)
+    expect(db.state.raw).toHaveLength(1)
+    await pipeline.flush(t('2026-09-04T10:01:00.000Z'), true)
+    expect(db.state.samples).toHaveLength(0)
   })
 })
 
@@ -73,14 +261,9 @@ describe('Pipeline session handling', () => {
     const db = new FakeDb()
     const pipeline = new Pipeline(db, OPTS)
 
-    await pipeline.handleSample(makeSample({
-      vehicleId: 'veh-1',
-      ts: t('2026-09-04T10:00:00.000Z'),
-      speedKph: 40,
-      odometerKm: 1000,
-      socPct: 80,
-      chargeState: 'disconnected',
-    }))
+    await burst(pipeline, '2026-09-04T10:00:00.000Z',
+      { VehicleSpeed: MOVING, Odometer: 1000, Soc: 80, ChargeState: 'Disconnected' })
+    await pipeline.flush(t('2026-09-04T10:00:05.000Z'))
 
     expect(openSessions(db).map((s) => s.kind)).toEqual(['drive'])
     expect(db.state.points).toHaveLength(1)
@@ -90,15 +273,16 @@ describe('Pipeline session handling', () => {
     const db = new FakeDb()
     const pipeline = new Pipeline(db, OPTS)
 
-    await pipeline.handle(teslaRaw('2026-09-04T10:00:00.000Z',
-      { VehicleSpeed: num(MOVING), Odometer: num(1000), Soc: num(80) }))
-    await pipeline.handle(teslaRaw('2026-09-04T10:05:00.000Z',
-      { VehicleSpeed: num(MOVING), Odometer: num(1010), Soc: num(75) }))
-    await pipeline.handle(teslaRaw('2026-09-04T10:10:00.000Z',
-      { VehicleSpeed: num(0), Odometer: num(1015), Soc: num(74) }))
+    await burst(pipeline, '2026-09-04T10:00:00.000Z',
+      { VehicleSpeed: MOVING, Odometer: 1000, Soc: 80 })
+    await burst(pipeline, '2026-09-04T10:05:00.000Z',
+      { VehicleSpeed: MOVING, Odometer: 1010, Soc: 75 })
+    await burst(pipeline, '2026-09-04T10:10:00.000Z',
+      { VehicleSpeed: 0, Odometer: 1015, Soc: 74 })
     // Six minutes stationary: past the five-minute drive-end threshold.
-    await pipeline.handle(teslaRaw('2026-09-04T10:16:00.000Z',
-      { VehicleSpeed: num(0), Odometer: num(1015), Soc: num(74) }))
+    await burst(pipeline, '2026-09-04T10:16:00.000Z',
+      { VehicleSpeed: 0, Odometer: 1015, Soc: 74 })
+    await pipeline.flush(t('2026-09-04T10:16:05.000Z'))
 
     expect(openSessions(db)).toHaveLength(0)
     const drive = db.state.sessions[0]
@@ -115,20 +299,18 @@ describe('Pipeline session handling', () => {
     const db = new FakeDb()
     const pipeline = new Pipeline(db, OPTS)
 
-    await pipeline.handle(teslaRaw('2026-09-04T20:00:00.000Z', {
-      DetailedChargeState: str('DetailedChargeStateCharging'),
-      Soc: num(30),
-      ACChargingEnergyIn: num(0),
-    }))
-    await pipeline.handle(teslaRaw('2026-09-04T20:45:00.000Z', {
-      DetailedChargeState: str('DetailedChargeStateCharging'),
-      Soc: num(60),
-      ACChargingEnergyIn: num(25),
-    }))
-    await pipeline.handle(teslaRaw('2026-09-04T20:50:00.000Z', {
-      DetailedChargeState: str('DetailedChargeStateDisconnected'),
-      Soc: num(60),
-    }))
+    await burst(pipeline, '2026-09-04T20:00:00.000Z', {
+      DetailedChargeState: 'DetailedChargeStateCharging',
+      Soc: 30, ACChargingPower: 7.4, ACChargingEnergyIn: 0,
+    })
+    await burst(pipeline, '2026-09-04T20:45:00.000Z', {
+      DetailedChargeState: 'DetailedChargeStateCharging',
+      Soc: 60, ACChargingPower: 7.4, ACChargingEnergyIn: 25,
+    })
+    await burst(pipeline, '2026-09-04T20:50:00.000Z', {
+      DetailedChargeState: 'DetailedChargeStateDisconnected', Soc: 60,
+    })
+    await pipeline.flush(t('2026-09-04T20:50:05.000Z'))
 
     expect(openSessions(db)).toHaveLength(0)
     expect(db.state.sessions[0]?.summary?.energyKwh).toBeCloseTo(25, 3)
@@ -136,7 +318,31 @@ describe('Pipeline session handling', () => {
     // 25 kWh over a 30-point span.
     expect(health?.estimatedCapacityKwh).toBeCloseTo(83.33, 2)
     expect(health?.sampleConfidence).toBeCloseTo(0.375, 3)
-    expect(health?.observedOn.toISOString()).toBe('2026-09-04T20:45:00.000Z')
+  })
+
+  it('measures a DC charge against the DC counter, not the stale AC one', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+
+    // The AC counter still holds 40 kWh from last night's charge at home: these
+    // fields are cumulative, so the idle rail does not read 0. Taking the larger
+    // magnitude - correct for power - would credit this charge with 40 kWh and
+    // write a fabricated capacity into battery_health.
+    await burst(pipeline, '2026-09-04T20:00:00.000Z', {
+      DetailedChargeState: 'DetailedChargeStateCharging',
+      Soc: 30, DCChargingPower: 120, DCChargingEnergyIn: 0, ACChargingEnergyIn: 40,
+    })
+    await burst(pipeline, '2026-09-04T20:20:00.000Z', {
+      DetailedChargeState: 'DetailedChargeStateCharging',
+      Soc: 60, DCChargingPower: 120, DCChargingEnergyIn: 25, ACChargingEnergyIn: 40,
+    })
+    await burst(pipeline, '2026-09-04T20:25:00.000Z', {
+      DetailedChargeState: 'DetailedChargeStateDisconnected', Soc: 60,
+    })
+    await pipeline.flush(t('2026-09-04T20:25:05.000Z'))
+
+    expect(db.state.sessions[0]?.summary?.energyKwh).toBeCloseTo(25, 3)
+    expect(db.state.battery[0]?.estimatedCapacityKwh).toBeCloseTo(83.33, 2)
   })
 
   it('does not record battery health for a drive', async () => {
@@ -151,8 +357,9 @@ describe('Pipeline session handling', () => {
       ['2026-09-04T10:10:00.000Z', 0, 60],
       ['2026-09-04T10:16:00.000Z', 0, 60],
     ] as const) {
-      await pipeline.handle(teslaRaw(at, { VehicleSpeed: num(speed), Soc: num(soc) }))
+      await burst(pipeline, at, { VehicleSpeed: speed, Soc: soc })
     }
+    await pipeline.flush(t('2026-09-04T10:16:05.000Z'))
 
     expect(db.state.sessions[0]?.isOpen).toBe(false)
     expect(db.state.battery).toHaveLength(0)
@@ -160,17 +367,21 @@ describe('Pipeline session handling', () => {
 })
 
 describe('Pipeline idempotency', () => {
-  it('leaves one row when the same message is processed twice', async () => {
+  it('leaves one row when the same messages are replayed', async () => {
     const db = new FakeDb()
     const pipeline = new Pipeline(db, OPTS)
-    const raw = teslaRaw('2026-09-04T10:00:00.000Z',
-      { VehicleSpeed: num(MOVING), Odometer: num(1000), Soc: num(80) })
+    const messages = [
+      field('2026-09-04T10:00:00.000Z', 'VehicleSpeed', MOVING),
+      field('2026-09-04T10:00:00.000Z', 'Odometer', 1000),
+      field('2026-09-04T10:00:05.000Z', 'VehicleSpeed', MOVING),
+    ]
 
-    await pipeline.handle(raw)
-    await pipeline.handle(raw)
+    for (const m of messages) await pipeline.handle(m)
+    for (const m of messages) await pipeline.handle(m)
 
     // The raw tape is append-only by design: a redelivery is a second row there
     // and reprocess handles the duplicate. Everything derived is deduplicated.
+    expect(db.state.raw).toHaveLength(6)
     expect(db.state.samples).toHaveLength(1)
     expect(db.state.sessions).toHaveLength(1)
     expect(db.state.points).toHaveLength(1)
@@ -179,14 +390,14 @@ describe('Pipeline idempotency', () => {
   it('adopts the open session instead of opening a second one', async () => {
     const db = new FakeDb()
     const first = new Pipeline(db, OPTS)
-    await first.handle(teslaRaw('2026-09-04T10:00:00.000Z',
-      { VehicleSpeed: num(MOVING), Odometer: num(1000) }))
+    await burst(first, '2026-09-04T10:00:00.000Z', { VehicleSpeed: MOVING, Odometer: 1000 })
+    await first.flush(t('2026-09-04T10:00:05.000Z'))
 
     // A worker that restarted without recovering state: fresh segmenter, same
     // database. The partial unique index must stop a duplicate open session.
     const second = new Pipeline(db, OPTS)
-    await second.handle(teslaRaw('2026-09-04T10:02:00.000Z',
-      { VehicleSpeed: num(MOVING), Odometer: num(1002) }))
+    await burst(second, '2026-09-04T10:02:00.000Z', { VehicleSpeed: MOVING, Odometer: 1002 })
+    await second.flush(t('2026-09-04T10:02:05.000Z'))
 
     expect(db.state.sessions).toHaveLength(1)
   })
@@ -196,22 +407,25 @@ describe('Pipeline transaction failure', () => {
   it('rolls the segmenter back with the transaction', async () => {
     const db = new FakeDb()
     const pipeline = new Pipeline(db, OPTS)
-    const raw = teslaRaw('2026-09-04T10:00:00.000Z',
-      { VehicleSpeed: num(MOVING), Odometer: num(1000), Soc: num(80) })
+
+    await burst(pipeline, '2026-09-04T10:00:00.000Z', { VehicleSpeed: MOVING, Odometer: 1000 })
+    const trigger = field('2026-09-04T10:00:05.000Z', 'VehicleSpeed', MOVING)
 
     db.failNextCommit = new Error('connection terminated')
-    await expect(pipeline.handle(raw)).rejects.toThrow('connection terminated')
+    await expect(pipeline.handle(trigger)).rejects.toThrow('connection terminated')
 
     // Nothing persisted, and — the part that matters — the in-memory segmenter
-    // must not be holding the id of a session that the rollback erased. If it
-    // were, the redelivery below would append a point to a session that does
-    // not exist.
-    expect(db.state.raw).toHaveLength(0)
+    // must not be holding the id of a session that the rollback erased, and the
+    // accumulator must still be holding the burst whose emit was rolled back.
+    // If it were not, that burst is gone: the redelivery below is the only copy
+    // left.
+    expect(db.state.samples).toHaveLength(0)
     expect(db.state.sessions).toHaveLength(0)
-    expect(db.log).toEqual(['rollback'])
+    expect(db.log).toEqual(['commit', 'commit', 'rollback'])
 
-    await pipeline.handle(raw)
-    expect(db.state.raw).toHaveLength(1)
+    await pipeline.handle(trigger)
+    expect(db.state.samples).toHaveLength(1)
+    expect(db.state.samples[0]?.odometerKm).toBeCloseTo(1609.34, 2)
     expect(db.state.sessions).toHaveLength(1)
     expect(db.state.points).toHaveLength(1)
   })
@@ -219,7 +433,7 @@ describe('Pipeline transaction failure', () => {
   it('re-creates the month partition after a rolled-back transaction', async () => {
     const db = new FakeDb()
     const pipeline = new Pipeline(db, OPTS)
-    const raw = teslaRaw('2026-09-04T10:00:00.000Z', { Soc: num(80) })
+    const raw = field('2026-09-04T10:00:00.000Z', 'Soc', 80)
 
     db.failNextCommit = new Error('deadlock detected')
     await expect(pipeline.handle(raw)).rejects.toThrow('deadlock detected')
@@ -282,5 +496,125 @@ describe('Pipeline.recoverOpenSession', () => {
 
     expect(openSessions(db)).toHaveLength(0)
     expect(db.state.sessions[0]?.summary?.endOdometerKm).toBe(1010)
+  })
+})
+
+
+/**
+ * The staleness windows, pinned against the intervals we actually ask the car
+ * for.
+ *
+ * These constants decide whether a parked car keeps looking like it is driving,
+ * and whether a current tyre pressure is written to the database as null. A
+ * previous version used one 15-minute window for every field and was wrong in
+ * both directions at once; nothing failed, because nothing asserted the
+ * relationship between the windows and the push intervals.
+ *
+ * The intervals below are the ones in scripts/push-telemetry-config.sh. If that
+ * file changes, these tests are the thing that should notice.
+ */
+describe('staleness windows match the telemetry configuration we push', () => {
+  const PUSHED_INTERVAL_MS = {
+    VehicleSpeed: 10_000,
+    Location: 10_000,
+    Soc: 60_000,
+    Odometer: 60_000,
+    RatedRange: 300_000,
+    Locked: 300_000,
+    DoorState: 300_000,
+    TpmsPressure: 3_600_000
+  }
+
+  it('keeps a level field alive well past the longest interval we request', () => {
+    // TPMS is requested every 3600s and only sent on change, so an unchanged
+    // pressure can legitimately go hours without being resent. A window shorter
+    // than this writes null into the sample table for a value that is current.
+    expect(STALE_VALUE_MS).toBeGreaterThan(PUSHED_INTERVAL_MS.TpmsPressure)
+  })
+
+  it('expires a volatile field long before a level one', () => {
+    expect(VOLATILE_STALE_MS).toBeLessThan(STALE_VALUE_MS)
+  })
+
+  it('keeps a volatile field alive across several of its own intervals', () => {
+    // Short enough to matter, but not so short that one missed burst blanks it.
+    expect(VOLATILE_STALE_MS).toBeGreaterThan(PUSHED_INTERVAL_MS.VehicleSpeed * 10)
+  })
+
+  it('expires a stale speed no later than the segmenter would have parked the car', () => {
+    // The upper bound, and the reason it is a relationship rather than a number.
+    //
+    // The segmenter ends a drive after driveEndParkedMs of being STATIONARY. It
+    // cannot reach that state while a stale speed keeps reporting motion, and a
+    // null speed reads as 'unknown', which does not start the parked clock
+    // either - so the drive only ends once the stale value expires AND a
+    // genuine stationary reading arrives. If this window were longer than
+    // driveEndParkedMs, the accumulator would be the thing deciding when drives
+    // end, silently overriding the segmenter's own threshold.
+    expect(VOLATILE_STALE_MS).toBeLessThanOrEqual(DEFAULT_SEGMENTER_OPTIONS.driveEndParkedMs)
+  })
+
+  it('treats speed as volatile, because a stale speed wedges a drive open', () => {
+    // The segmenter reads a null speed as 'unknown' motion, which does not start
+    // the parked clock. So a speed that persists after the car stops reporting
+    // holds the drive open indefinitely. This is the single most important
+    // entry in the set.
+    expect(VOLATILE_FIELDS.has('speedKph')).toBe(true)
+    expect(staleWindowFor('speedKph')).toBe(VOLATILE_STALE_MS)
+  })
+
+  it('treats levels as levels', () => {
+    for (const field of ['socPct', 'odometerKm', 'rangeKm', 'locked', 'tpms', 'chargeState']) {
+      expect(staleWindowFor(field)).toBe(STALE_VALUE_MS)
+    }
+  })
+})
+
+describe('FieldAccumulator staleness, at the boundaries', () => {
+  const at = (ms: number): Date => new Date(ms)
+
+  it('carries a tyre pressure that is older than the volatile window', () => {
+    // The regression the two-class split exists to prevent: under one 15-minute
+    // window this returned undefined and the sample recorded null.
+    const acc = new FieldAccumulator()
+    acc.apply({ tpms: { fl: 2.9 } }, at(0))
+    acc.apply({ socPct: 71 }, at(40 * 60_000))
+    const taken = acc.take()
+    expect(taken?.state.tpms).toEqual({ fl: 2.9 })
+  })
+
+  it('drops a speed that is older than the volatile window', () => {
+    const acc = new FieldAccumulator()
+    acc.apply({ speedKph: 96 }, at(0))
+    acc.apply({ socPct: 71 }, at(VOLATILE_STALE_MS))
+    expect(acc.take()?.state.speedKph).toBeUndefined()
+  })
+
+  it('keeps a speed one millisecond inside the window', () => {
+    const acc = new FieldAccumulator()
+    acc.apply({ speedKph: 96 }, at(0))
+    acc.apply({ socPct: 71 }, at(VOLATILE_STALE_MS - 1))
+    expect(acc.take()?.state.speedKph).toBe(96)
+  })
+
+  it('drops a level exactly at its window and keeps it one millisecond inside', () => {
+    const stale = new FieldAccumulator()
+    stale.apply({ socPct: 55 }, at(0))
+    stale.apply({ speedKph: 0 }, at(STALE_VALUE_MS))
+    expect(stale.take()?.state.socPct).toBeUndefined()
+
+    const fresh = new FieldAccumulator()
+    fresh.apply({ socPct: 55 }, at(0))
+    fresh.apply({ speedKph: 0 }, at(STALE_VALUE_MS - 1))
+    expect(fresh.take()?.state.socPct).toBe(55)
+  })
+
+  it('never invents a value for a field that was never reported', () => {
+    // Absent must stay absent so teslaStateToSample writes null, not 0.
+    const acc = new FieldAccumulator()
+    acc.apply({ socPct: 55 }, at(0))
+    const taken = acc.take()
+    expect(taken?.state.speedKph).toBeUndefined()
+    expect('speedKph' in (taken?.state ?? {})).toBe(false)
   })
 })

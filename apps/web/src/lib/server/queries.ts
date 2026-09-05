@@ -181,14 +181,42 @@ const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/
  * A bare `2026-09-01` is UTC midnight. JS already parses date-only strings as
  * UTC, but stating it explicitly means a future switch to a different parser
  * cannot quietly reinterpret every saved bookmark in the operator's timezone.
+ *
+ * A blank string is NOT a date and is rejected here. Callers where the
+ * parameter is optional must use `optionalDateParam`, which treats blank as
+ * absent; this function is for the places where a value is required and an
+ * empty one is a client bug worth naming.
  */
 export function parseDateParam(name: string, raw: string): Date {
-  const text = DATE_ONLY.test(raw) ? `${raw}T00:00:00.000Z` : raw
+  // Trimmed first: ' 2026-09-01' would otherwise miss the date-only branch and
+  // be handed to the generic parser, which is a different (implementation
+  // defined) instant for the same day the user typed.
+  const value = raw.trim()
+  const text = DATE_ONLY.test(value) ? `${value}T00:00:00.000Z` : value
   const d = new Date(text)
   if (Number.isNaN(d.getTime())) {
     throw new ApiProblem(400, `invalid ${name}: expected an ISO date or datetime`)
   }
   return d
+}
+
+/**
+ * An optional date parameter, where blank means "not filtering".
+ *
+ * `params.get('from')` returns '' — not null — for a parameter that is present
+ * but empty, which is what an unfilled `<input type="date">` submits on every
+ * GET form. Testing only for null therefore sent '' to the parser and answered
+ * the ORDINARY use of DateRangeFilter (open the drives page, press Apply
+ * without picking dates) with a 400 error page instead of the list.
+ *
+ * Absent, empty and whitespace are one case: no bound. A non-empty value that
+ * does not parse is still a 400, because a filter silently ignored is a list
+ * claiming to show a week while showing everything.
+ */
+function optionalDateParam(params: URLSearchParams, name: string): Date | undefined {
+  const raw = params.get(name)
+  if (raw === null || raw.trim() === '') return undefined
+  return parseDateParam(name, raw)
 }
 
 export interface SessionQuery {
@@ -210,17 +238,22 @@ export function parseSessionQuery(params: URLSearchParams): SessionQuery {
   const q: SessionQuery = { limit: DEFAULT_SESSION_LIMIT }
 
   const kind = params.get('kind')
-  if (kind !== null) {
+  // Blank is absent, for the same reason as the dates: an "all kinds" option in
+  // a GET form submits `kind=`, and answering that with a 400 would break the
+  // filter for the one selection that asks for no filtering.
+  if (kind !== null && kind !== '') {
     if (!SESSION_KINDS.includes(kind as SessionKind)) {
       throw new ApiProblem(400, `invalid kind: expected one of ${SESSION_KINDS.join(', ')}`)
     }
     q.kind = kind as SessionKind
   }
 
-  const from = params.get('from')
-  if (from !== null) q.from = parseDateParam('from', from)
-  const to = params.get('to')
-  if (to !== null) q.to = parseDateParam('to', to)
+  // Assigned only when present: `exactOptionalPropertyTypes` makes an explicit
+  // undefined a different thing from an absent key.
+  const from = optionalDateParam(params, 'from')
+  if (from) q.from = from
+  const to = optionalDateParam(params, 'to')
+  if (to) q.to = to
   if (q.from && q.to && q.to.getTime() < q.from.getTime()) {
     throw new ApiProblem(400, 'invalid range: to precedes from')
   }
@@ -230,6 +263,11 @@ export function parseSessionQuery(params: URLSearchParams): SessionQuery {
     const n = Number(limit)
     // Number('') is 0 and Number(' 5 ') is 5, so test the raw string too: an
     // empty `?limit=` is a client bug, not a request for the default.
+    // Deliberately unlike the dates above, which treat blank as absent: no form
+    // submits `limit`, so a blank one can only come from a hand-built URL or a
+    // client that failed to interpolate a number, and both want to hear about
+    // it. The dates are submitted blank by DateRangeFilter on every ordinary
+    // "Apply" with nothing picked.
     if (limit.trim() === '' || !Number.isInteger(n) || n < 1) {
       throw new ApiProblem(400, 'invalid limit: expected an integer of at least 1')
     }
@@ -254,7 +292,10 @@ export interface SampleQuery {
 export function parseSampleQuery(params: URLSearchParams): SampleQuery {
   const from = params.get('from')
   const to = params.get('to')
-  if (from === null || to === null) {
+  // Blank counts as missing, matching `fields` below: `?from=&to=` is a caller
+  // that forgot to fill the range in, and 'from and to are required' says that,
+  // where 'invalid from' sends them hunting for a formatting mistake.
+  if (from === null || from.trim() === '' || to === null || to.trim() === '') {
     throw new ApiProblem(400, 'from and to are required')
   }
   const fromDate = parseDateParam('from', from)
@@ -295,10 +336,10 @@ export interface RangeQuery {
 /** Validate an optional `from`/`to` pair, used by battery health and stats. */
 export function parseRangeQuery(params: URLSearchParams): RangeQuery {
   const q: RangeQuery = {}
-  const from = params.get('from')
-  if (from !== null) q.from = parseDateParam('from', from)
-  const to = params.get('to')
-  if (to !== null) q.to = parseDateParam('to', to)
+  const from = optionalDateParam(params, 'from')
+  if (from) q.from = from
+  const to = optionalDateParam(params, 'to')
+  if (to) q.to = to
   if (q.from && q.to && q.to.getTime() < q.from.getTime()) {
     throw new ApiProblem(400, 'invalid range: to precedes from')
   }
@@ -596,6 +637,19 @@ const SESSION_COLUMNS = `
  *
  * `from` is inclusive and `to` is exclusive so that consecutive windows
  * (a month at a time, say) tile without double-counting the boundary session.
+ *
+ * Kept exclusive after review, deliberately, even though it has a visible cost:
+ * DateRangeFilter submits a bare `to=2026-09-04` from a date input, that parses
+ * to UTC midnight, and so "to = today" shows none of today's drives. The fix is
+ * NOT to loosen this comparison — `<=` against a midnight instant would still
+ * miss every drive after 00:00:00 on that day, so it would swap a silent
+ * exclusion for a subtler one, and it would make consecutive windows overlap on
+ * their shared boundary for the JSON API's machine callers. What a date picker
+ * means by "to 2026-09-04" is "through the end of that day", and the only place
+ * that knows the bound came from a picker rather than from a caller tiling
+ * instants is the page load that reads the form. `getBatteryHealth` and
+ * `periodStats` both filter `< to` as well, so changing this one alone would
+ * also make the same URL mean two different windows on two pages.
  */
 export async function listSessions(
   vehicleId: string,

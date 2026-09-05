@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { makeSample, type SessionSummary } from '@ev/core'
 import { closePool, getPool } from '../src/pool.js'
-import { runMigrations } from '../src/migrate.js'
+import { runMigrationsUnderGate } from '../src/migrate.js'
 import { withTransaction } from '../src/repo/types.js'
 import { insertRaw, streamRaw } from '../src/repo/raw.js'
 import { ensurePartitions, insertSample } from '../src/repo/samples.js'
@@ -40,16 +40,44 @@ const summary = (over: Partial<SessionSummary> = {}): SessionSummary => ({
   ...over,
 })
 
+
+/**
+ * Serialises runMigrations() across test FILES, using the database itself.
+ *
+ * vitest runs this file and its sibling (migrate.test.ts) in separate worker
+ * PROCESSES, concurrently, and on a fresh CI database both of them have
+ * migrations to apply. node-pg-migrate guards itself with
+ * `pg_try_advisory_lock` — a TRY, not a wait — so the loser does not queue, it
+ * throws "Another migration is already running" straight away. That throw
+ * lands in beforeAll, and vitest reports a file whose beforeAll threw as
+ * SKIPPED tests plus a failed suite: the job goes red while the test list
+ * looks merely un-run, which is a confusing way to lose the SQL coverage.
+ *
+ * The gate below is duplicated in the sibling file on purpose. A shared
+ * TypeScript helper could not fix this: the two workers are separate
+ * processes with separate module graphs, so the only thing they can both see
+ * is the database. Hence a Postgres advisory lock.
+ *
+ * The key must NOT be node-pg-migrate's own (7241865325823964). The two locks
+ * are taken on different connections, so reusing the key would make us wait
+ * on ourselves forever. `pg_advisory_lock` BLOCKS rather than failing, so the
+ * second worker waits, then finds every migration already applied and does
+ * nothing.
+ */
+
+
 describe.skipIf(!hasDb)('repositories', () => {
+  // Generous timeout: this hook may spend most of it waiting on the gate
+  // while the sibling file migrates.
   beforeAll(async () => {
-    await runMigrations()
+    await runMigrationsUnderGate()
     await withTransaction(getPool(), async (c) => {
       await ensurePartitions(c, TS)
       await ensureVehicle(c, {
         id: VEHICLE, vendor: 'tesla', vendorVehicleId: 'VIN-REPO', displayName: 'Repo',
       })
     })
-  })
+  }, 60_000)
 
   afterAll(async () => {
     const p = getPool()
@@ -136,6 +164,42 @@ describe.skipIf(!hasDb)('repositories', () => {
     expect(rows).toHaveLength(1)
     expect(rows[0]?.kwh).toBeCloseTo(74, 3)
     expect(rows[0]?.conf).toBeCloseTo(0.75, 3)
+  })
+
+  it('files a charge under the UTC day, whatever timezone the writing process runs in', async () => {
+    // 02:30Z on the 5th is still the 4th in Honolulu (UTC-10). node-postgres
+    // serialises a Date using the NODE process's local offset
+    // ("2026-09-04T16:30:00.000-10:00"), and a bare `$2::date` parses that
+    // string as a date by keeping its leading calendar day — so the day a
+    // charge is filed under would follow the writer's TZ setting, not the
+    // charge. The same charge would land on 2026-09-04 from a machine in
+    // Honolulu and 2026-09-05 from one in UTC: a duplicated or missing point
+    // in the battery-health series at every timezone boundary.
+    const instant = new Date('2026-09-05T02:30:00.000Z')
+    const tzBefore = process.env['TZ']
+    process.env['TZ'] = 'Pacific/Honolulu'
+    try {
+      await withTransaction(getPool(), async (c) => {
+        // And the server's zone must not decide it either.
+        await c.query("SET LOCAL TimeZone = 'Pacific/Kiritimati'")
+        await upsertBatteryHealth(c, {
+          vehicleId: VEHICLE, observedOn: instant, ratedRangeAt100Km: null,
+          estimatedCapacityKwh: 71, sampleConfidence: 0.5,
+        })
+      })
+    } finally {
+      if (tzBefore === undefined) delete process.env['TZ']
+      else process.env['TZ'] = tzBefore
+    }
+    // to_char, not the driver's date parsing: pg turns a `date` into a JS Date
+    // built in the node process's local zone, which would re-introduce the very
+    // ambiguity this test is about.
+    const { rows } = await getPool().query(
+      `SELECT to_char(observed_on,'YYYY-MM-DD') AS day
+         FROM battery_health_sample
+        WHERE vehicle_id=$1 AND estimated_capacity_kwh=71`, [VEHICLE])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.day).toBe('2026-09-05')
   })
 
   it('never moves the ingest cursor backwards', async () => {

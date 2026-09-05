@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
+import { render } from 'svelte/server'
+import { isHttpError } from '@sveltejs/kit'
+import BatteryGauge from '../src/lib/components/BatteryGauge.svelte'
 import {
 	ApiProblem,
 	deriveActivity,
@@ -260,6 +263,66 @@ describe('parseRangeQuery', () => {
 		expect(() => parseRangeQuery(new URLSearchParams('from=2026-02-01&to=2026-01-01'))).toThrow(
 			ApiProblem
 		)
+	})
+})
+
+/* ------------------------------------------------------------------ *
+ * Blank parameters
+ *
+ * `params.get('from')` is '' — not null — for a parameter that is present and
+ * empty, which is what every unfilled input on a GET form submits. These are
+ * the regression tests for the bug that made the ORDINARY use of
+ * DateRangeFilter (open the page, press Apply with nothing picked) a 400 error
+ * page instead of an unfiltered list.
+ * ------------------------------------------------------------------ */
+
+describe('blank query parameters', () => {
+	it('treats an empty from and to as no filter, the way an unfilled form submits them', () => {
+		const q = parseSessionQuery(new URLSearchParams('from=&to='))
+		expect(q.from).toBeUndefined()
+		expect(q.to).toBeUndefined()
+		expect(q.limit).toBe(50)
+	})
+
+	it('treats a whitespace-only date as no filter rather than as a malformed one', () => {
+		expect(parseSessionQuery(new URLSearchParams('from=%20%20')).from).toBeUndefined()
+	})
+
+	it('keeps the bound that was filled in when only one input was used', () => {
+		const q = parseSessionQuery(new URLSearchParams('from=2026-09-01&to='))
+		expect(q.from?.toISOString()).toBe('2026-09-01T00:00:00.000Z')
+		expect(q.to).toBeUndefined()
+	})
+
+	it('still rejects a non-empty date it cannot parse', () => {
+		// The blank fix must not become "ignore anything I cannot read": a filter
+		// silently dropped shows a full list to someone who asked for one week.
+		expect(() => parseSessionQuery(new URLSearchParams('from=&to=whenever'))).toThrow(ApiProblem)
+	})
+
+	it('treats an empty kind as every kind, the way an "all" option submits it', () => {
+		expect(parseSessionQuery(new URLSearchParams('kind=')).kind).toBeUndefined()
+	})
+
+	it('treats empty range bounds as absent for the stats and battery pages too', () => {
+		expect(parseRangeQuery(new URLSearchParams('from=&to='))).toEqual({})
+		expect(parseRangeQuery(new URLSearchParams('from=2026-01-01&to=')).to).toBeUndefined()
+	})
+
+	it('reports an empty sample range as missing rather than as malformed', () => {
+		// from/to are required there, so blank is still a 400 — but the message
+		// has to name the real mistake, or the caller goes looking for a
+		// formatting error in a value they never sent.
+		expect(() => parseSampleQuery(new URLSearchParams('from=&to=&fields=socPct'))).toThrow(
+			/from and to are required/
+		)
+	})
+
+	it('parses a date with surrounding whitespace as that same UTC day', () => {
+		// ' 2026-09-01' misses the date-only branch unless it is trimmed, and the
+		// generic Date parser is free to read it as local midnight instead.
+		const q = parseSessionQuery(new URLSearchParams({ from: ' 2026-09-01 ' }))
+		expect(q.from?.toISOString()).toBe('2026-09-01T00:00:00.000Z')
 	})
 })
 
@@ -966,5 +1029,99 @@ describe('healthz/ready', () => {
 		const { GET } = await import('../src/routes/healthz/ready/+server.js')
 		await GET()
 		expect(queryMock).toHaveBeenCalledWith('SELECT 1')
+	})
+})
+
+/* ------------------------------------------------------------------ *
+ * Page loads
+ * ------------------------------------------------------------------ */
+
+describe('battery page load', () => {
+	async function load(search: string): Promise<unknown> {
+		const mod = await import('../src/routes/vehicles/[id]/battery/+page.server.js')
+		return mod.load({
+			params: { id: 'v1' },
+			url: new URL(`http://x/vehicles/v1/battery?${search}`)
+		} as never)
+	}
+
+	it('answers a malformed date with a 400 the page layer can render', async () => {
+		// parseRangeQuery has to run INSIDE run(): it throws ApiProblem, and run()
+		// is the only thing that turns one into a Kit response. Parsed outside, the
+		// ApiProblem escaped the load untranslated and SvelteKit rendered a 500
+		// for a typo in a date, while every sibling page returned a clean 400.
+		await expect(load('from=last-tuesday')).rejects.toSatisfy(
+			(e: unknown) => isHttpError(e, 400) && !(e instanceof ApiProblem)
+		)
+	})
+})
+
+/* ------------------------------------------------------------------ *
+ * BatteryGauge: the null-vs-zero rule, rendered
+ *
+ * This lives here rather than in components.test.ts because that file is a
+ * smoke test — it renders every component against nothing and asserts only
+ * that nothing throws. The rule below is the headline invariant of the whole
+ * codebase ("a missing reading must never look like a real zero") and it needs
+ * assertions about the markup, not just a render that survives.
+ *
+ * Server-rendered, the same path SvelteKit takes for the first paint, so what
+ * is asserted here is what the operator's browser is handed.
+ * ------------------------------------------------------------------ */
+
+describe('BatteryGauge null vs zero', () => {
+	function html(props: Record<string, unknown>): string {
+		return render(BatteryGauge as never, { props: props as never }).body
+	}
+
+	it('draws a hatched track and no fill when the state of charge is unknown', () => {
+		const out = html({ socPct: null, rangeKm: null })
+		expect(out).toContain('unknown-track')
+		// The fill element is what a percentage looks like. Its presence at any
+		// width — 0% included — is the failure this test exists to catch: an
+		// empty bar reads as a flat battery, which is a claim about the car.
+		expect(out).not.toMatch(/class="fill/)
+		expect(out).not.toMatch(/style="width:/)
+	})
+
+	it('does not claim a meter value the car never reported', () => {
+		// aria-valuenow="0" would tell a screen reader the battery is empty.
+		expect(html({ socPct: null })).not.toContain('aria-valuenow')
+		expect(html({ socPct: 0 })).toContain('aria-valuenow="0"')
+	})
+
+	it('says no state of charge was recorded instead of showing 0%', () => {
+		const out = html({ socPct: null, rangeKm: null })
+		expect(out).toContain('no state of charge recorded')
+		expect(out).not.toContain('0%')
+	})
+
+	it('draws a real zero as a fill at zero width, distinct from the unknown track', () => {
+		// The other half of the rule: 0% IS a reading, and must render as the
+		// same kind of thing as 42% — otherwise the fix for the null case would
+		// be to hatch everything low.
+		const out = html({ socPct: 0, rangeKm: 0 })
+		expect(out).not.toContain('unknown-track')
+		expect(out).toMatch(/class="fill[^"]*"/)
+		expect(out).toContain('width: 0%')
+		expect(out).toContain('0%')
+	})
+
+	it('renders a known charge as a fill of that width', () => {
+		const out = html({ socPct: 42.4, rangeKm: 180 })
+		expect(out).toContain('width: 42.4%')
+		expect(out).toContain('aria-valuenow="42.4"')
+		expect(out).not.toContain('unknown-track')
+	})
+
+	it('clamps a nonsense reading into the track without discarding it', () => {
+		expect(html({ socPct: 140 })).toContain('width: 100%')
+		expect(html({ socPct: -5 })).toContain('width: 0%')
+	})
+
+	it('treats a non-finite reading as unknown, not as zero', () => {
+		// NaN survives a `!= null` check and would style the fill "width: NaN%",
+		// which the browser drops — leaving a bar that looks like 0%.
+		expect(html({ socPct: Number.NaN })).toContain('unknown-track')
 	})
 })

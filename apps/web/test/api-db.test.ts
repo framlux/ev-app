@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { closePool, getPool, runMigrations } from '@ev/db'
+import { closePool, getPool, runMigrationsUnderGate } from '@ev/db'
 import {
 	getBatteryHealth,
 	getSampleSeries,
@@ -9,6 +9,7 @@ import {
 	getVehicleStats,
 	listSessions,
 	listVehicles,
+	SAMPLE_SERIES_CAP,
 	SESSION_POINT_CAP
 } from '../src/lib/server/queries.js'
 
@@ -41,6 +42,14 @@ if (!hasDb && process.env['CI']) {
 // a database in CI without either one seeing the other's rows.
 const V1 = 'web-test-v1'
 const V2 = 'web-test-v2'
+/**
+ * A third car that exists only to carry more raw samples than the series cap.
+ *
+ * It cannot be V1 (whose three samples are asserted one by one) and it cannot
+ * be V2 (which is asserted to have never reported), and the decimation has to
+ * be exercised over real rows because it is done by the SQL, not by Node.
+ */
+const V3 = 'web-test-v3'
 
 /** Start of the current UTC month: the window 002_partitions guarantees exists. */
 const BASE = (() => {
@@ -55,9 +64,19 @@ function at(minutes: number): Date {
 /** The 2500 points on the long drive, which must be decimated to fit the cap. */
 const LONG_DRIVE_POINTS = 2500
 
+/**
+ * Raw samples on V3, one per second.
+ *
+ * 5002 and not 5001: the step is ceil(total/5000) = 2 either way, but only an
+ * even count puts the LAST row at an odd index, where `rn % step = 0` misses it
+ * and the series survives solely because of the `OR rn = total - 1` clause. At
+ * 5001 that clause is dead weight and deleting it fails nothing.
+ */
+const LONG_SAMPLE_COUNT = 5002
+
 describe.skipIf(!hasDb)('read API against Postgres', () => {
 	beforeAll(async () => {
-		await runMigrations()
+		await runMigrationsUnderGate()
 		const p = getPool()
 		await cleanup()
 		await p.query(`SELECT ensure_month_partitions($1::date)`, [BASE])
@@ -65,8 +84,9 @@ describe.skipIf(!hasDb)('read API against Postgres', () => {
 		await p.query(
 			`INSERT INTO vehicle (id, vendor, vendor_vehicle_id, display_name, model, model_year)
 			 VALUES ($1,'tesla','WEBVIN1','Zulu Blue','Model Y',2023),
-			        ($2,'tesla','WEBVIN2','Alpha Amber',NULL,NULL)`,
-			[V1, V2]
+			        ($2,'tesla','WEBVIN2','Alpha Amber',NULL,NULL),
+			        ($3,'tesla','WEBVIN3','Mike Dense',NULL,NULL)`,
+			[V1, V2, V3]
 		)
 
 		// Three samples. The middle one is deliberately all-null beyond ts to
@@ -79,6 +99,16 @@ describe.skipIf(!hasDb)('read API against Postgres', () => {
 			        ($1,$3, NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
 			        ($1,$4, 62, 250, 10120, 51.6, -0.13, 45,'online','disconnected', 22.0, false, NULL)`,
 			[V1, at(0), at(30), at(60)]
+		)
+
+		// One sample a second, which is what a real ingest looks like and what
+		// the SQL-side decimation exists for. soc_pct descends by a known amount
+		// per row so a test can tell WHICH rows survived, not merely how many.
+		await p.query(
+			`INSERT INTO sample (vehicle_id, ts, soc_pct)
+			 SELECT $1, $2::timestamptz + (g || ' seconds')::interval, 90 - g::real / 1000
+			   FROM generate_series(0, $3::int - 1) AS g`,
+			[V3, at(0), LONG_SAMPLE_COUNT]
 		)
 
 		await p.query(
@@ -118,10 +148,10 @@ describe.skipIf(!hasDb)('read API against Postgres', () => {
 	async function cleanup(): Promise<void> {
 		const p = getPool()
 		await p.query(`DELETE FROM session_point WHERE session_id LIKE 'web-test-%'`)
-		await p.query(`DELETE FROM session WHERE vehicle_id = ANY($1)`, [[V1, V2]])
-		await p.query(`DELETE FROM battery_health_sample WHERE vehicle_id = ANY($1)`, [[V1, V2]])
-		await p.query(`DELETE FROM sample WHERE vehicle_id = ANY($1)`, [[V1, V2]])
-		await p.query(`DELETE FROM vehicle WHERE id = ANY($1)`, [[V1, V2]])
+		await p.query(`DELETE FROM session WHERE vehicle_id = ANY($1)`, [[V1, V2, V3]])
+		await p.query(`DELETE FROM battery_health_sample WHERE vehicle_id = ANY($1)`, [[V1, V2, V3]])
+		await p.query(`DELETE FROM sample WHERE vehicle_id = ANY($1)`, [[V1, V2, V3]])
+		await p.query(`DELETE FROM vehicle WHERE id = ANY($1)`, [[V1, V2, V3]])
 	}
 
 	it('lists vehicles ordered by display name, including one that never reported', async () => {
@@ -231,6 +261,65 @@ describe.skipIf(!hasDb)('read API against Postgres', () => {
 		// The middle sample reported nothing: null, present, and not zero.
 		expect(res.samples[1]?.socPct).toBeNull()
 		expect('speedKph' in (res.samples[0] as object)).toBe(false)
+	})
+
+	it('decimates a long sample series in SQL, keeping the first and last reading', async () => {
+		// The twin of the session-detail decimation test. The two SQL statements
+		// are byte-identical in their WHERE clause, and only one of them was
+		// covered: deleting or breaking the GREATEST(...) in getSampleSeries
+		// failed nothing, so the chart could have started streaming 5001 rows —
+		// or dropping the end of the day — without a red test.
+		const res = await getSampleSeries(V3, {
+			from: at(-1),
+			to: at(1000),
+			fields: ['socPct']
+		})
+		expect(res.downsampled).toBe(true)
+		expect(res.samples.length).toBeLessThanOrEqual(SAMPLE_SERIES_CAP)
+		expect(res.samples.length).toBeGreaterThan(1)
+		expect(res.samples[0]?.ts).toBe(at(0).toISOString())
+		// Thinned, not truncated: the window's last reading is still the last
+		// point, which is what stops a chart implying the car stopped reporting.
+		expect(res.samples.at(-1)?.ts).toBe(
+			new Date(at(0).getTime() + (LONG_SAMPLE_COUNT - 1) * 1000).toISOString()
+		)
+		const ts = res.samples.map((p) => new Date(p.ts).getTime())
+		expect(ts).toEqual([...ts].sort((a, b) => a - b))
+		// Values come from the row that survived, not from a re-derived index.
+		expect(res.samples[0]?.socPct).toBe(90)
+	})
+
+	it('reports a series that fits under the cap as not downsampled', async () => {
+		// The other side of the `total <= cap` comparison, over real rows: with a
+		// step of 1 every row is kept and nothing claims to have been thinned.
+		const res = await getSampleSeries(V3, {
+			from: at(0),
+			to: new Date(at(0).getTime() + 10_000),
+			fields: ['socPct']
+		})
+		expect(res.samples).toHaveLength(10)
+		expect(res.downsampled).toBe(false)
+	})
+
+	it('404s an unknown vehicle on the series and stats endpoints', async () => {
+		// Both go through assertVehicleExists. Without it a mistyped id answers
+		// 200 with an empty series and a stats block full of nulls, which is
+		// indistinguishable from a real car that has never reported — so the
+		// operator debugs the ingest instead of the URL.
+		await expect(
+			getSampleSeries('web-test-missing', { from: at(0), to: at(60), fields: ['socPct'] })
+		).rejects.toMatchObject({ status: 404, message: 'vehicle not found' })
+		await expect(getVehicleStats('web-test-missing', {})).rejects.toMatchObject({
+			status: 404,
+			message: 'vehicle not found'
+		})
+		await expect(getBatteryHealth('web-test-missing', {})).rejects.toMatchObject({ status: 404 })
+
+		// And a real vehicle with no rows in the window is NOT a 404: the guard
+		// must distinguish "no such car" from "no data", or the fix for one
+		// breaks the other.
+		const empty = await getSampleSeries(V2, { from: at(0), to: at(60), fields: ['socPct'] })
+		expect(empty.samples).toEqual([])
 	})
 
 	it('takes the battery baseline from the best trusted reading, not the highest', async () => {

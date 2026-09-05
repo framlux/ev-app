@@ -54,12 +54,72 @@ export function isPublicPath(pathname: string): boolean {
  *
  * The value round-trips through a cookie the user's own browser holds, so it is
  * attacker-influenced input: anything that is not a path on this origin is
- * discarded rather than sanitised. `//evil.example` and `/\evil.example` are
- * both protocol-relative URLs in browsers despite starting with a slash, which
- * is the trap this exists for.
+ * discarded rather than sanitised.
+ *
+ * Two independent checks, because string prefix tests alone have already failed
+ * here once:
+ *
+ * 1. Reject C0 controls and DEL. Browsers *strip* tab, LF and CR from a URL
+ *    before parsing it, so `/\t/evil.example` reaches the parser as
+ *    `//evil.example` — a protocol-relative URL — while any `startsWith('//')`
+ *    check upstream sees a plain path beginning `/\t`. The value survives the
+ *    JSON round trip through the flow cookie and is emitted verbatim in the
+ *    Location header, so the browser, not the server, does the redirecting
+ *    off-origin. NUL and the other C0 codes are rejected with them: none of
+ *    them belong in a path and each is handled differently by different
+ *    parsers, which is the whole failure mode.
+ * 2. Resolve what is left against a sentinel origin with the WHATWG URL parser
+ *    and require the result to still be on that origin. The parser is exactly
+ *    what the browser will apply to the Location header, so agreeing with it is
+ *    the point: it is what catches `//evil.example`, `/\evil.example` (a
+ *    backslash is a path separator for special schemes, so this is
+ *    protocol-relative too) and anything else that smuggles an authority past a
+ *    leading slash.
+ *
+ * Only pathname+search+hash is returned, so even a candidate that parses to
+ * this origin cannot carry an origin back out.
  */
+
+/** C0 controls plus DEL. See check 1 above — tab/LF/CR are the live exploit. */
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/
+
+/**
+ * An origin no real deployment can be. `.invalid` is reserved by RFC 2606, so a
+ * candidate that resolves to it did so by being a relative path, never by
+ * naming the host itself.
+ */
+const SENTINEL_ORIGIN = 'https://safe-next-path.invalid'
+
 export function safeNextPath(raw: string | null | undefined): string {
 	if (!raw || !raw.startsWith('/')) return '/'
-	if (raw.startsWith('//') || raw.startsWith('/\\')) return '/'
-	return raw
+	if (CONTROL_CHARACTERS.test(raw)) return '/'
+	let resolved: URL
+	try {
+		resolved = new URL(raw, SENTINEL_ORIGIN)
+	} catch {
+		return '/'
+	}
+	if (resolved.origin !== SENTINEL_ORIGIN) return '/'
+
+	const path = `${resolved.pathname}${resolved.search}${resolved.hash}`
+
+	// The OUTPUT is re-checked, not just the input, and this is not
+	// belt-and-braces - it closes a live hole.
+	//
+	// WHATWG dot-segment collapse can turn a path that resolves safely into one
+	// that is itself protocol-relative: '/x/..//evil.example' resolves on the
+	// sentinel origin, so the check above passes, and yields the PATHNAME
+	// '//evil.example'. Emitted as a Location header, a browser resolves that
+	// against the real origin as https://evil.example/ - the open redirect,
+	// carried by a value this function had just certified as safe. A fuzz over
+	// four path segments found 775 such inputs, including '/..//evil.example',
+	// '/.//evil.example' and the percent-encoded '/x/%2e%2e//evil.example'.
+	//
+	// Checking the input alone cannot catch these: the input is not
+	// protocol-relative, the collapse creates that property. So the invariant
+	// this function claims - never returns a value carrying an origin - has to
+	// be asserted against what it actually returns.
+	if (path.startsWith('//')) return '/'
+
+	return path
 }

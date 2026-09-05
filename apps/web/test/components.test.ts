@@ -456,3 +456,80 @@ describe('pages render real data too, so the empty-state tests are not the only 
 		assertNoBrokenValues(out.body)
 	})
 })
+
+/**
+ * The two conditionals below are invisible in a "does it render" test: both
+ * arms produce valid HTML with no NaN in it, so the render-everything suite
+ * above passes whichever arm runs. Each case here therefore pins BOTH arms —
+ * the null arm and the real-value arm — because an assertion that only ever
+ * sees one arm cannot tell the branch from a constant.
+ */
+describe('the null branches that a render-only assertion cannot see', () => {
+	it('BatteryGauge draws a hatched track for a null SoC, not a 0% fill', () => {
+		const out = render(BatteryGauge as never, {
+			props: { socPct: null, rangeKm: null } as never
+		})
+		// "not reported" and "flat" must not look the same: a fill of width 0 is
+		// the picture of an empty battery, which is a claim the data does not make.
+		expect(out.body).toContain('unknown-track')
+		expect(out.body).not.toMatch(/class="fill\b/)
+		expect(out.body).not.toContain('width: 0%')
+		expect(out.body).not.toContain('0%')
+		// A meter with no value must not announce one to a screen reader either.
+		expect(out.body).not.toContain('aria-valuenow')
+		assertNoBrokenValues(out.body)
+	})
+
+	it('BatteryGauge draws a real 0% as a fill, so the null case is a branch and not a constant', () => {
+		const out = render(BatteryGauge as never, { props: { socPct: 0, rangeKm: null } as never })
+		// A genuine zero IS a flat battery and must be drawn as one.
+		expect(out.body).toMatch(/class="fill\b/)
+		expect(out.body).toContain('width: 0%')
+		expect(out.body).toContain('aria-valuenow="0"')
+		expect(out.body).not.toContain('unknown-track')
+		assertNoBrokenValues(out.body)
+	})
+
+	it('SessionList omits the Cost column entirely when no charge carries a currency', () => {
+		const out = render(SessionList as never, {
+			props: {
+				sessions: [session({ kind: 'charge', cost: null, costCurrency: null })],
+				mode: 'charge'
+			} as never
+		})
+		// A Cost header over a column of dashes is a column claiming there is a
+		// cost to know. Nothing writes cost yet, so the header must not exist.
+		expect(out.body).not.toContain('Cost')
+		assertNoBrokenValues(out.body)
+	})
+
+	it('SessionList shows the Cost column once a charge carries a currency', () => {
+		const out = render(SessionList as never, {
+			props: {
+				sessions: [
+					session({ id: 'chg-a', kind: 'charge', cost: 12.5, costCurrency: 'GBP' }),
+					session({ id: 'chg-b', kind: 'charge', cost: null, costCurrency: null })
+				],
+				mode: 'charge'
+			} as never
+		})
+		expect(out.body).toContain('Cost')
+		expect(out.body).toContain('£12.50')
+		// The row that has no cost shows a dash, never a fabricated £0.00.
+		expect(out.body).not.toContain('£0.00')
+		assertNoBrokenValues(out.body)
+	})
+
+	it('SessionList never shows a Cost column outside charge mode', () => {
+		for (const mode of ['drive', 'mixed'] as const) {
+			const out = render(SessionList as never, {
+				props: {
+					sessions: [session({ kind: 'charge', cost: 12.5, costCurrency: 'GBP' })],
+					mode
+				} as never
+			})
+			expect(out.body).not.toContain('Cost')
+			expect(out.body).not.toContain('£12.50')
+		}
+	})
+})
