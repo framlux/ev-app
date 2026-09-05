@@ -14,11 +14,23 @@ import type { Hub, LiveSubscriber } from '$lib/server/live.js'
  * same set and nothing has to be filtered.
  */
 
+/*
+ * The exports below carry a leading underscore because SvelteKit validates the
+ * export surface of a +server.ts at BUILD time: anything that is not an HTTP
+ * verb, `prerender`, `trailingSlash`, `config`, `entries` or `fallback` fails
+ * `vite build` outright — `Invalid export 'HEARTBEAT_MS' in /api/v1/stream`.
+ * The underscore is the framework's sanctioned escape hatch for exactly this,
+ * and it is what lets the framing, the heartbeat and the database probe stay
+ * beside the handler they serve rather than being hoisted into $lib to satisfy
+ * a naming rule. Do not strip it: `pnpm test` stays green without it and the
+ * build does not.
+ */
+
 /**
  * Under a proxy's idle timeout, and under the client's own dead-connection
  * threshold, with room for one to be missed.
  */
-export const HEARTBEAT_MS = 20_000
+export const _HEARTBEAT_MS = 20_000
 
 /**
  * What the browser waits before retrying a dropped stream.
@@ -29,10 +41,10 @@ export const HEARTBEAT_MS = 20_000
  * reconnect for that reason (see lib/live.svelte.ts); this only tightens the
  * built-in retry for the ordinary case of a clean drop.
  */
-export const RETRY_MS = 2_000
+export const _RETRY_MS = 2_000
 
 /** One SSE frame. `data` is JSON, so it can never contain a raw newline. */
-export function formatEvent(event: string, data: unknown): string {
+export function _formatEvent(event: string, data: unknown): string {
 	return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 }
 
@@ -45,7 +57,7 @@ interface Timers {
  * Build the response body. Separated from the handler so the framing, the
  * heartbeat and the teardown can be tested without a SvelteKit runtime.
  */
-export function openStream(
+export function _openStream(
 	hub: Hub,
 	timers: Timers = { setInterval, clearInterval }
 ): { stream: ReadableStream<Uint8Array> } {
@@ -64,10 +76,10 @@ export function openStream(
 				}
 			}
 
-			write(`retry: ${RETRY_MS}\n\n`)
+			write(`retry: ${_RETRY_MS}\n\n`)
 
 			const subscriber: LiveSubscriber = {
-				send: (event, data) => write(formatEvent(event, data))
+				send: (event, data) => write(_formatEvent(event, data))
 			}
 			unsubscribe = hub.add(subscriber)
 
@@ -80,7 +92,7 @@ export function openStream(
 			// timing the connection out but is invisible to EventSource, so the
 			// client could not distinguish "quiet" from "dead" — which is half of
 			// what the live/stale indicator has to answer.
-			beat = timers.setInterval(() => write(formatEvent('heartbeat', { t: Date.now() })), HEARTBEAT_MS)
+			beat = timers.setInterval(() => write(_formatEvent('heartbeat', { t: Date.now() })), _HEARTBEAT_MS)
 		},
 		cancel() {
 			unsubscribe?.()
@@ -101,7 +113,7 @@ export function openStream(
  * unreachable database, and without the answer depending on whether the suite
  * happens to be running with PG* set.
  */
-export async function assertDatabaseReachable(
+export async function _assertDatabaseReachable(
 	probe: () => Promise<unknown> = () => getPool().query('SELECT 1')
 ): Promise<void> {
 	try {
@@ -117,9 +129,9 @@ export const GET: RequestHandler = async ({ locals }) => {
 	// expiring is caught on the client's next reconnect (lib/live.svelte.ts).
 	if (!locals.user) throw error(401, 'unauthorized')
 
-	await assertDatabaseReachable()
+	await _assertDatabaseReachable()
 
-	const { stream } = openStream(getLiveHub())
+	const { stream } = _openStream(getLiveHub())
 
 	return new Response(stream, {
 		headers: {

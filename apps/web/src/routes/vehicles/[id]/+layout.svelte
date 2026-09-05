@@ -1,11 +1,23 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte'
+	import { onMount } from 'svelte'
 	import type { LayoutData } from './$types.js'
 	import { page } from '$app/state'
 	import ActivityPill from '$lib/components/ActivityPill.svelte'
+	import LiveIndicator from '$lib/components/LiveIndicator.svelte'
 	import { DASH } from '$lib/format.js'
+	import { live } from '$lib/live.svelte.js'
 
 	let { data, children }: { data: LayoutData; children: Snippet } = $props()
+
+	// Browser only, and idempotent: the store is app-wide, so navigating between
+	// tabs must not open a second stream.
+	onMount(() => live.start())
+
+	// The live entry when one has arrived for this vehicle, the load-time data
+	// until then. Never a merge of the two: a half-live object could show a
+	// position from now beside an activity from page load.
+	let entry = $derived(live.get(data.entry.vehicle.id) ?? data.entry)
 
 	let v = $derived(data.entry.vehicle)
 	let base = $derived(`/vehicles/${v.id}`)
@@ -36,7 +48,10 @@
 				<span class="vin num" title="Vendor vehicle identifier">{v.vendorVehicleId}</span>
 			</p>
 		</div>
-		<ActivityPill activity={data.entry.activity} openSessionId={data.entry.openSessionId} />
+		<div class="status">
+			<ActivityPill activity={entry.activity} openSessionId={entry.openSessionId} />
+			<LiveIndicator connection={live.connection} lastEventAt={live.lastEventAt} />
+		</div>
 	</div>
 
 	<nav class="tabs">
@@ -54,6 +69,13 @@
 		align-items: flex-start;
 		justify-content: space-between;
 		gap: 16px;
+	}
+
+	.status {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
+		gap: 6px;
 	}
 
 	.back {

@@ -24,10 +24,14 @@
 	import SessionList from '$lib/components/SessionList.svelte'
 	import StatTile from '$lib/components/StatTile.svelte'
 	import TimeSeriesChart from '$lib/components/TimeSeriesChart.svelte'
+	import { live } from '$lib/live.svelte.js'
 
 	let { data }: { data: PageData } = $props()
 
-	let entry = $derived(data.entry)
+	// Same rule as the layout: the live entry wholesale, or the load-time one.
+	// The chart and the session list keep reading `data` — they are historical
+	// views and this spec deliberately does not stream them.
+	let entry = $derived(live.get(data.entry.vehicle.id) ?? data.entry)
 	let s = $derived(entry.state)
 	let charging = $derived(entry.activity === 'charging')
 	let located = $derived(s != null && hasCoords(s.lat, s.lon))

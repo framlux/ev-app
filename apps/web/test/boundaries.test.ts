@@ -119,3 +119,18 @@ describe('apps/web authentication boundaries', () => {
     expect(offenders).toEqual([])
   })
 })
+
+describe('the live stream is gated like every other API route', () => {
+  it('is not in the public allowlist', () => {
+    const src = readFileSync(
+      new URL('../src/lib/server/public-paths.ts', import.meta.url).pathname,
+      'utf8'
+    )
+    // The ALLOWLIST, not the file: the file's comments contain the word
+    // "upstream", so a bare /stream/ over the whole source is red before
+    // anything has gone wrong.
+    const allowlist = src.match(/PUBLIC_PATHS\s*=\s*\[([\s\S]*?)\]/)
+    expect(allowlist).not.toBeNull()
+    expect(allowlist![1]).not.toMatch(/stream/)
+  })
+})

@@ -15,6 +15,7 @@ import BatteryTrend from '../src/lib/components/BatteryTrend.svelte'
 import ChargeCurve from '../src/lib/components/ChargeCurve.svelte'
 import DateRangeFilter from '../src/lib/components/DateRangeFilter.svelte'
 import EmptyState from '../src/lib/components/EmptyState.svelte'
+import LiveIndicator from '../src/lib/components/LiveIndicator.svelte'
 import MapView from '../src/lib/components/Map.svelte'
 import PaginatedSessions from '../src/lib/components/PaginatedSessions.svelte'
 import SessionList from '../src/lib/components/SessionList.svelte'
@@ -533,5 +534,41 @@ describe('the null branches that a render-only assertion cannot see', () => {
 			expect(out.body).not.toContain('Cost')
 			expect(out.body).not.toContain('£12.50')
 		}
+	})
+})
+
+describe('LiveIndicator', () => {
+	it('says live when connected and something arrived recently', () => {
+		const { body } = render(LiveIndicator, {
+			props: { connection: 'open', lastEventAt: Date.now() }
+		})
+		expect(body).toContain('Live')
+	})
+
+	/**
+	 * The honesty requirement from spec §3.6: two different things can be wrong
+	 * and the indicator must not conflate them. A connected stream over a quiet
+	 * car is normal — a parked car reports nothing for hours — while a dropped
+	 * stream is a fault. Claiming "Live" over an hour-old number is worse than
+	 * saying nothing at all.
+	 */
+	it('reports a quiet car differently from a broken stream', () => {
+		const quiet = render(LiveIndicator, {
+			props: { connection: 'open', lastEventAt: Date.now() - 3_600_000 }
+		}).body
+		const broken = render(LiveIndicator, {
+			props: { connection: 'reconnecting', lastEventAt: Date.now() }
+		}).body
+		expect(quiet).not.toContain('Live')
+		expect(broken).not.toContain('Live')
+		expect(quiet).not.toBe(broken)
+		expect(broken).toContain('Reconnecting')
+	})
+
+	it('says nothing misleading before the first event', () => {
+		const { body } = render(LiveIndicator, {
+			props: { connection: 'connecting', lastEventAt: null }
+		})
+		expect(body).not.toContain('Live')
 	})
 })

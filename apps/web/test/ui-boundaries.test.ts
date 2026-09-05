@@ -61,3 +61,18 @@ describe('Svelte 5 runes, not Svelte 4 idioms', () => {
 		expect(offenders).toEqual([])
 	})
 })
+
+describe('EventSource is constructed in exactly one place', () => {
+	/**
+	 * Reconnect, backoff and the signed-out probe all live in the live store. A
+	 * second EventSource built anywhere else would be a second connection with
+	 * none of that behaviour — and it would look like it worked, right up until
+	 * the first pod restart.
+	 */
+	it('appears only in lib/live.svelte.ts', () => {
+		const offenders = sourceFiles.filter(
+			(f) => /new EventSource\(/.test(readFileSync(f, 'utf8')) && !f.endsWith('live.svelte.ts')
+		)
+		expect(offenders).toEqual([])
+	})
+})

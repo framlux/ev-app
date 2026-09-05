@@ -1,19 +1,35 @@
 <script lang="ts">
+	import { onMount } from 'svelte'
 	import type { VehicleWithState } from '$lib/api-types.js'
 	import EmptyState from '$lib/components/EmptyState.svelte'
+	import LiveIndicator from '$lib/components/LiveIndicator.svelte'
 	import VehicleCard from '$lib/components/VehicleCard.svelte'
+	import { live } from '$lib/live.svelte.js'
 
 	interface Props {
 		data: { vehicles: VehicleWithState[] }
 	}
 
 	let { data }: Props = $props()
+
+	// Browser only, and idempotent: the store is app-wide, so navigating between
+	// tabs must not open a second stream.
+	onMount(() => live.start())
+
+	// Each card independently: a vehicle with no live update yet keeps its
+	// load-time card rather than the whole list waiting for the first event.
+	let vehicles = $derived(data.vehicles.map((v) => live.get(v.vehicle.id) ?? v))
 </script>
 
 <svelte:head><title>Garage</title></svelte:head>
 
 <header class="page-head">
-	<h1>Garage</h1>
+	<div class="title">
+		<h1>Garage</h1>
+		<!-- The garage shows live data too, so it needs the same way to tell that
+		     it is live — and to say so when it is not. -->
+		<LiveIndicator connection={live.connection} lastEventAt={live.lastEventAt} />
+	</div>
 	<p class="muted">Every car this install knows about.</p>
 </header>
 
@@ -31,7 +47,7 @@
 	<!-- auto-fit rather than a fixed column count: this install has one car and
 	     may have two, and a one-car grid should not leave a hole beside it. -->
 	<div class="grid">
-		{#each data.vehicles as entry (entry.vehicle.id)}
+		{#each vehicles as entry (entry.vehicle.id)}
 			<VehicleCard {entry} />
 		{/each}
 	</div>
@@ -40,6 +56,12 @@
 <style>
 	.page-head {
 		margin-bottom: 1.5rem;
+	}
+
+	.title {
+		display: flex;
+		align-items: baseline;
+		gap: 12px;
 	}
 
 	h1 {
