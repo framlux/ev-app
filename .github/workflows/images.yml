@@ -1,5 +1,17 @@
 name: images
 
+# Main BUILDS but does not PUBLISH. Tags do both.
+#
+# Publishing every main commit produced 129 throwaway image versions in a single
+# day, each pinned by nothing and referenced by nothing, and made the deployed
+# tag a commit sha that says nothing about what is in it. Releases are tags, the
+# way the other repos in this org do it.
+#
+# Main still builds, though, and that is deliberate rather than leftover: two
+# Dockerfile breakages in this repo were invisible to both the test suite and
+# the typechecker and only appeared in a real image build. Dropping the build on
+# main would defer that discovery to release time, which is the worst moment to
+# find it.
 on:
   push:
     branches: [main]
@@ -26,11 +38,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ev-ingest's Dockerfile does not exist until plan Task 12 lands. Leaving that
-      # matrix leg to fail red would train everyone to ignore a red images run, which is
-      # exactly when a real regression slips through. Skipping silently is the opposite
-      # trap - a green tick claiming an image was published when none was. So: skip, and
-      # say so loudly in the job summary.
+      # Every matrix leg now has a Dockerfile, so this no longer skips anything.
+      # It is kept because the failure it guards against is silent: a leg whose
+      # Dockerfile is missing would otherwise either fail red (training people to
+      # ignore a red images run, which is exactly when a real regression slips
+      # through) or be quietly dropped, leaving a green tick claiming an image was
+      # published when none was. Skip, and say so loudly in the job summary.
       - id: check
         run: |
           if [ -f "${{ matrix.dockerfile }}" ]; then
@@ -46,7 +59,9 @@ jobs:
       - if: steps.check.outputs.exists == 'true'
         uses: docker/setup-buildx-action@v3
 
-      - if: steps.check.outputs.exists == 'true'
+      # Only when publishing. A main build needs no registry credential, and not
+      # taking one is the difference between "cannot push" and "did not push".
+      - if: steps.check.outputs.exists == 'true' && startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -58,17 +73,23 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/framlux/${{ matrix.name }}
+          # No type=sha. A sha tag is what made every main commit look like a
+          # release; the version tag is the only thing that should name a
+          # published image.
           tags: |
-            type=sha,format=short
             type=ref,event=tag
             type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
 
       - if: steps.check.outputs.exists == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          push: true
+          # The whole policy, in one line: build always, publish only for a tag.
+          # A main build still fails the job if the Dockerfile is broken, which is
+          # the signal worth keeping.
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
