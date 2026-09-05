@@ -11,8 +11,15 @@ async function get<T>(path: string, accessToken: string): Promise<T> {
 export const listVehicles = (t: string) =>
   get<{ vin: string; display_name: string }[]>('/vehicles', t)
 
+// vehicle_info carries firmware_version, which is the only way to check the
+// Fleet Telemetry firmware floor before pushing a config. Without it a push
+// against an under-version car looks identical to one against a sleeping car.
 export const fleetStatus = (t: string, vins: string[]) =>
-  post<{ key_paired_vins: string[] }>('/vehicles/fleet_status', t, { vins })
+  post<{
+    key_paired_vins: string[]
+    unpaired_vins?: string[]
+    vehicle_info?: Record<string, import('./telemetry-preflight.js').VehicleInfo>
+  }>('/vehicles/fleet_status', t, { vins })
 
 export const getTelemetryConfig = (t: string, vin: string) =>
   get<{ synced: boolean }>(`/vehicles/${vin}/fleet_telemetry_config`, t)
