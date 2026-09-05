@@ -14,7 +14,7 @@ import {
 } from './metrics.js'
 import { subscribe } from './mqtt.js'
 import { Pipeline, QUIET_PERIOD_MS, type PipelineResult } from './pipeline.js'
-import { pgRunner } from './store.js'
+import { pgRunner, registerVehicle } from './store.js'
 
 /**
  * The worker entrypoint.
@@ -52,6 +52,14 @@ async function main(): Promise<void> {
 
   const metricsServer = startMetricsServer(config.metricsPort)
   const pool = getPool()
+
+  // BEFORE subscribing. Every table the pipeline writes references
+  // vehicle(id), so without this row the first message fails its foreign key,
+  // is rolled back, and — never having been acked — is redelivered forever:
+  // a worker that appears healthy while recording nothing at all. Failing
+  // startup here instead is the honest outcome, and the pod restarts.
+  await registerVehicle(pool, config.vehicle)
+
   const pipeline = new Pipeline(pgRunner(pool, config.cursorSource), {
     usableCapacityKwh: config.usableCapacityKwh,
   })
