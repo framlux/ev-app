@@ -538,9 +538,12 @@ describe('the null branches that a render-only assertion cannot see', () => {
 })
 
 describe('LiveIndicator', () => {
-	it('says live when connected and something arrived recently', () => {
+	const iso = (msAgo: number) => new Date(NOW - msAgo).toISOString()
+	const NOW = 1_800_000_000_000
+
+	it('says live when connected and the car reported recently', () => {
 		const { body } = render(LiveIndicator, {
-			props: { connection: 'open', lastEventAt: Date.now() }
+			props: { connection: 'open', sampleTs: iso(10_000), clock: NOW }
 		})
 		expect(body).toContain('Live')
 	})
@@ -554,10 +557,10 @@ describe('LiveIndicator', () => {
 	 */
 	it('reports a quiet car differently from a broken stream', () => {
 		const quiet = render(LiveIndicator, {
-			props: { connection: 'open', lastEventAt: Date.now() - 3_600_000 }
+			props: { connection: 'open', sampleTs: iso(3_600_000), clock: NOW }
 		}).body
 		const broken = render(LiveIndicator, {
-			props: { connection: 'reconnecting', lastEventAt: Date.now() }
+			props: { connection: 'reconnecting', sampleTs: iso(10_000), clock: NOW }
 		}).body
 		expect(quiet).not.toContain('Live')
 		expect(broken).not.toContain('Live')
@@ -565,9 +568,33 @@ describe('LiveIndicator', () => {
 		expect(broken).toContain('Reconnecting')
 	})
 
-	it('says nothing misleading before the first event', () => {
+	/**
+	 * The defect this component shipped with, pinned.
+	 *
+	 * Freshness was computed from `Date.now()` against the ARRIVAL time of the
+	 * last frame. Neither is right: `Date.now()` inside `$derived` is not a
+	 * reactive dependency, so the answer was computed once and held forever, and
+	 * arrival time is reset by the whole-fleet snapshot the server sends on every
+	 * connect and reconnect. Between them, opening a page on a car that had been
+	 * asleep for six hours displayed "Live" over six-hour-old numbers, and a car
+	 * that parked while you watched went on saying "Live" indefinitely. Both are
+	 * ruled out by taking the SAMPLE's timestamp and an explicit clock.
+	 */
+	it('goes stale purely because the clock advanced, with no new frame', () => {
+		const ts = iso(0)
+		const atArrival = render(LiveIndicator, {
+			props: { connection: 'open', sampleTs: ts, clock: NOW }
+		}).body
+		const tenMinutesLater = render(LiveIndicator, {
+			props: { connection: 'open', sampleTs: ts, clock: NOW + 600_000 }
+		}).body
+		expect(atArrival).toContain('Live')
+		expect(tenMinutesLater).not.toContain('Live')
+	})
+
+	it('says nothing misleading before the first sample', () => {
 		const { body } = render(LiveIndicator, {
-			props: { connection: 'connecting', lastEventAt: null }
+			props: { connection: 'connecting', sampleTs: null, clock: NOW }
 		})
 		expect(body).not.toContain('Live')
 	})

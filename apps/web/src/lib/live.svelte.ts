@@ -22,6 +22,18 @@ export const STREAM_DEAD_MS = 45_000
 /** Consecutive failures before we suspect the session rather than the pod. */
 export const PROBE_AFTER_FAILURES = 3
 
+/**
+ * How often the store's clock advances.
+ *
+ * Staleness is a function of elapsed time, and nothing else in this store
+ * changes while a car sits parked: no events arrive, so no assignment happens,
+ * so no `$derived` anywhere recomputes. Without a ticking value in the reactive
+ * graph, an indicator reading `Date.now()` would compute "fresh" once and hold
+ * that answer forever — claiming Live over an hour-old number, which is exactly
+ * what the design forbids. This is that value.
+ */
+export const CLOCK_MS = 15_000
+
 const STREAM_URL = '/api/v1/stream'
 const BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000]
 
@@ -35,6 +47,9 @@ export interface LiveStoreOptions {
 	/** The watchdog's timer, separate so a test can inspect the reconnect queue alone. */
 	scheduleWatchdog?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>
 	unschedule?: (id: ReturnType<typeof setTimeout>) => void
+	/** The repeating clock tick. Separate seam so tests can drive it by hand. */
+	tick?: (fn: () => void, ms: number) => ReturnType<typeof setInterval>
+	untick?: (id: ReturnType<typeof setInterval>) => void
 	now?: () => number
 	/** Returns the status code of an authenticated probe request. */
 	probe?: () => Promise<number>
@@ -45,8 +60,16 @@ export interface LiveStore {
 	readonly vehicles: Record<string, VehicleWithState>
 	readonly connection: ConnectionState
 	/** When the last VEHICLE update landed. Heartbeats do not move this: they
-	 *  prove the stream is alive, not that the car said anything. */
+	 *  prove the stream is alive, not that the car said anything.
+	 *
+	 *  ARRIVAL time, so it answers "is the stream delivering", not "how old is
+	 *  this reading" — a snapshot on reconnect delivers a six-hour-old sample
+	 *  and moves this. Staleness of the DATA is judged from the sample's own
+	 *  `state.ts` against `clock`; see LiveIndicator. */
 	readonly lastEventAt: number | null
+	/** A value that advances on its own, so time-based derivations recompute.
+	 *  Read it in any `$derived` that compares against a timestamp. */
+	readonly clock: number
 	start(): void
 	stop(): void
 	get(id: string): VehicleWithState | undefined
@@ -57,6 +80,8 @@ export function createLiveStore(opts: LiveStoreOptions = {}): LiveStore {
 	const schedule = opts.schedule ?? ((fn, ms) => setTimeout(fn, ms))
 	const scheduleWatchdog = opts.scheduleWatchdog ?? schedule
 	const unschedule = opts.unschedule ?? ((id) => clearTimeout(id))
+	const tick = opts.tick ?? ((fn, ms) => setInterval(fn, ms))
+	const untick = opts.untick ?? ((id) => clearInterval(id))
 	const browser = opts.browser ?? typeof window !== 'undefined'
 	const now = opts.now ?? (() => Date.now())
 	const probe = opts.probe ?? (async () => (await fetch('/api/v1/vehicles')).status)
@@ -65,11 +90,13 @@ export function createLiveStore(opts: LiveStoreOptions = {}): LiveStore {
 	let vehicles = $state<Record<string, VehicleWithState>>({})
 	let connection = $state<ConnectionState>('connecting')
 	let lastEventAt = $state<number | null>(null)
+	let clock = $state(0)
 
 	let source: EventSource | null = null
 	let failures = 0
 	let stopped = false
 	let watchdog: ReturnType<typeof setTimeout> | undefined
+	let ticker: ReturnType<typeof setInterval> | undefined
 	let lastAnyAt = 0
 
 	const armWatchdog = (): void => {
@@ -87,6 +114,11 @@ export function createLiveStore(opts: LiveStoreOptions = {}): LiveStore {
 		lastAnyAt = now()
 		failures = 0
 		connection = 'open'
+		// Also advances the clock, so an arriving event refreshes a staleness
+		// derivation immediately rather than at the next tick. Note that setting
+		// `connection` alone would NOT: Svelte's `$state` compares with `===` and
+		// assigning 'open' over 'open' schedules nothing.
+		clock = now()
 	}
 
 	const connect = (): void => {
@@ -105,6 +137,21 @@ export function createLiveStore(opts: LiveStoreOptions = {}): LiveStore {
 				const entry = JSON.parse((e as MessageEvent).data) as VehicleWithState
 				const id = entry?.vehicle?.id
 				if (!id) return
+				// Never go backwards in time.
+				//
+				// The stream carries two kinds of frame and they can overtake each
+				// other: incremental updates, and the whole-fleet snapshot sent on
+				// connect and after a listener reconnect. The subscriber is
+				// registered before the snapshot's query returns, so an update can
+				// be written while that query is still in flight and then be
+				// followed by the snapshot's older row. Dropping anything older than
+				// what we already hold makes the order they arrive in irrelevant.
+				const current = vehicles[id]
+				const incomingTs = Date.parse(entry.state?.ts ?? '')
+				const currentTs = Date.parse(current?.state?.ts ?? '')
+				if (current && Number.isFinite(incomingTs) && Number.isFinite(currentTs) && incomingTs < currentTs) {
+					return
+				}
 				// Reassigned rather than mutated: $state tracks the assignment, and a
 				// deep mutation of a value that arrived as JSON would not notify.
 				vehicles = { ...vehicles, [id]: entry }
@@ -151,11 +198,14 @@ export function createLiveStore(opts: LiveStoreOptions = {}): LiveStore {
 		get vehicles() { return vehicles },
 		get connection() { return connection },
 		get lastEventAt() { return lastEventAt },
+		get clock() { return clock },
 		start(): void {
 			// Browser only. During SSR there is no EventSource, and a page that
 			// constructed one while rendering on the server would throw on every
 			// request.
 			if (!browser || source || stopped) return
+			clock = now()
+			ticker = tick(() => { clock = now() }, CLOCK_MS)
 			connect()
 		},
 		stop(): void {
@@ -163,6 +213,7 @@ export function createLiveStore(opts: LiveStoreOptions = {}): LiveStore {
 			source?.close()
 			source = null
 			if (watchdog !== undefined) unschedule(watchdog)
+			if (ticker !== undefined) untick(ticker)
 		},
 		get: (id: string) => vehicles[id]
 	}

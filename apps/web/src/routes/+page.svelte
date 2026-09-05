@@ -19,6 +19,17 @@
 	// Each card independently: a vehicle with no live update yet keeps its
 	// load-time card rather than the whole list waiting for the first event.
 	let vehicles = $derived(data.vehicles.map((v) => live.get(v.vehicle.id) ?? v))
+
+	// The garage's indicator speaks for the fleet, so it takes the NEWEST sample
+	// across it: one car reporting is enough for the stream to be demonstrably
+	// live, and a garage of asleep cars should not read as a broken connection.
+	let newestSampleTs = $derived(
+		vehicles
+			.map((v) => v.state?.ts ?? null)
+			.filter((ts): ts is string => ts !== null)
+			.sort()
+			.at(-1) ?? null
+	)
 </script>
 
 <svelte:head><title>Garage</title></svelte:head>
@@ -28,7 +39,7 @@
 		<h1>Garage</h1>
 		<!-- The garage shows live data too, so it needs the same way to tell that
 		     it is live — and to say so when it is not. -->
-		<LiveIndicator connection={live.connection} lastEventAt={live.lastEventAt} />
+		<LiveIndicator connection={live.connection} sampleTs={newestSampleTs} clock={live.clock} />
 	</div>
 	<p class="muted">Every car this install knows about.</p>
 </header>

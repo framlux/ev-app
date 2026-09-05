@@ -50,7 +50,7 @@
 		</div>
 		<div class="status">
 			<ActivityPill activity={entry.activity} openSessionId={entry.openSessionId} />
-			<LiveIndicator connection={live.connection} lastEventAt={live.lastEventAt} />
+			<LiveIndicator connection={live.connection} sampleTs={entry.state?.ts ?? null} clock={live.clock} />
 		</div>
 	</div>
 

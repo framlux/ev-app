@@ -40,6 +40,8 @@ const entry = (id: string, soc: number) =>
 function harness(over: Record<string, unknown> = {}) {
 	FakeSource.made = []
 	const scheduled: Array<{ fn: () => void; ms: number }> = []
+	const ticks: Array<() => void> = []
+	const clockNow = { value: 1_000_000 }
 	const store = createLiveStore({
 		// The web project runs in vitest's `node` environment, so `window` is
 		// undefined and the real browser guard would make start() a no-op.
@@ -51,11 +53,13 @@ function harness(over: Record<string, unknown> = {}) {
 		// first entry in the array these tests index into.
 		scheduleWatchdog: () => 0 as never,
 		unschedule: () => undefined,
-		now: () => 1_000_000,
+		tick: (fn: () => void) => { ticks.push(fn); return 0 as never },
+		untick: () => undefined,
+		now: () => clockNow.value,
 		probe: async () => 200,
 		...over
 	})
-	return { store, scheduled }
+	return { store, scheduled, ticks, clockNow }
 }
 
 describe('createLiveStore', () => {
@@ -139,6 +143,52 @@ describe('createLiveStore', () => {
 		expect(FakeSource.made[0]!.closed).toBe(true)
 		FakeSource.made[0]!.fail()
 		expect(FakeSource.made).toHaveLength(1)
+	})
+
+	/**
+	 * The store must carry time in its reactive graph, because nothing else does.
+	 * A parked car produces no events at all, so an indicator deriving freshness
+	 * from a bare Date.now() would compute its answer once and hold it forever —
+	 * which is how "Live" ended up frozen over an hour-old reading.
+	 */
+	it('advances a clock on its own so time-based derivations recompute', () => {
+		const h = harness()
+		h.store.start()
+		const before = h.store.clock
+		h.clockNow.value += 60_000
+		h.ticks[0]!()
+		expect(h.store.clock).toBe(before + 60_000)
+	})
+
+	it('advances the clock on an arriving event too, not only on the tick', () => {
+		const h = harness()
+		h.store.start()
+		h.clockNow.value += 5_000
+		FakeSource.made[0]!.emit('heartbeat', {})
+		expect(h.store.clock).toBe(1_005_000)
+	})
+
+	/**
+	 * The snapshot the server sends on connect and after a listener reconnect can
+	 * overtake an incremental update, because the subscriber is registered before
+	 * the snapshot's query returns. Dropping anything older than what is already
+	 * held makes arrival order irrelevant.
+	 */
+	it('never replaces a sample with an older one', () => {
+		const h = harness()
+		h.store.start()
+		const newer = { vehicle: { id: 'v1' }, state: { vehicleId: 'v1', ts: '2026-09-05T10:00:10.000Z', socPct: 61 }, activity: 'driving', openSessionId: null }
+		const older = { vehicle: { id: 'v1' }, state: { vehicleId: 'v1', ts: '2026-09-05T10:00:00.000Z', socPct: 60 }, activity: 'driving', openSessionId: null }
+		FakeSource.made[0]!.emit('vehicle', newer)
+		FakeSource.made[0]!.emit('vehicle', older)
+		expect(h.store.get('v1')?.state?.socPct).toBe(61)
+	})
+
+	it('still accepts an update for a vehicle it has never seen', () => {
+		const h = harness()
+		h.store.start()
+		FakeSource.made[0]!.emit('vehicle', { vehicle: { id: 'v2' }, state: { vehicleId: 'v2', ts: '2026-09-05T09:00:00.000Z', socPct: 30 }, activity: 'parked', openSessionId: null })
+		expect(h.store.get('v2')?.state?.socPct).toBe(30)
 	})
 
 	it('declares a silent connection dead well inside two heartbeats', () => {
