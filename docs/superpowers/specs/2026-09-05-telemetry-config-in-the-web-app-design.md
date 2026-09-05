@@ -53,7 +53,7 @@ browser (already signed in via Pocket-ID)
   ▼
 ev-web ── reads telemetry_status ──► shows last known result + its age
   │
-  │  "Connect to Tesla"  →  state nonce in a short-lived signed cookie
+  │  "Connect to Tesla"  →  state nonce in a short-lived cookie (sameSite: lax)
   ▼
 auth.tesla.com  (consent)
   │  ?code&state
@@ -68,6 +68,8 @@ ev-web  /settings/telemetry/callback
 Tesla Fleet API ──► telemetry_status updated on every check and push
 ```
 
+**The state cookie must be `sameSite: 'lax'`, not `'strict'`.** Tesla returns the browser by top-level GET, and a Strict cookie is withheld on exactly that navigation — every consent would die with "state missing", intermittently enough to look like a Tesla problem. `auth/login/+server.ts` already sets `FLOW_COOKIE` this way with the reasoning attached; the Tesla flow reuses that shape (`FLOW_TTL_SECONDS`, a parsed-and-validated state, delete-on-use) rather than hand-rolling a second one.
+
 ### 3.2 The token's life
 
 Held in a module-level `Map` in `apps/web/src/lib/server/tesla-session.ts`, keyed by the app session's **subject**, holding `{accessToken, expiresAt}`. Nothing else. It is dropped when the token expires, when the operator disconnects, and when the pod restarts — which is on every deploy.
@@ -80,33 +82,64 @@ This is per-process state in a stateful-looking place, which is normally a smell
 
 ### 3.3 The client
 
-`packages/tesla/src/fleet-api.ts` currently hard-codes `BASE` at Tesla's public host and uses global `fetch`. It gains an options argument — `{ baseUrl, fetch }` — defaulting to today's behaviour, so existing callers are untouched. The web app passes the proxy's URL and a `fetch` bound to an undici `Agent` carrying the proxy CA, because the proxy presents a certificate from the cluster's internal issuer that no public trust store knows.
+`packages/tesla/src/fleet-api.ts` currently hard-codes `BASE` at Tesla's public host and uses global `fetch`. It gains an options argument — **`{ baseUrl }` only** — defaulting to today's behaviour, so existing callers are untouched.
 
-`apps/web/src/lib/server/tesla-client.ts` owns that construction and reads three values from the environment: `TESLAPROXY_URL`, the CA path, and `TESLA_REDIRECT_URI`.
+**Trust, without a fetch injection.** The proxy presents a certificate from the cluster's internal CA issuer, which no public trust store knows. The obvious route — an undici `Agent` carrying the CA — is rejected: `undici` is not a dependency of `apps/web` (or of anything in this repo), and whether an `Agent` from a separately-installed undici is honoured as a `dispatcher` by Node 22's built-in `fetch` is exactly the kind of thing that works in a test and not in the image.
+
+Instead `NODE_EXTRA_CA_CERTS=/etc/tesla/proxy-ca.crt` is set on the web Deployment. Node applies it to the process trust store, so global `fetch` trusts the proxy with no dependency, no injection seam, and nothing for the implementation to get subtly wrong. It also keeps the injectable surface to `baseUrl`, which is all the tests need.
+
+`apps/web/src/lib/server/tesla-client.ts` owns the client and reads `TESLAPROXY_URL` and `TESLA_REDIRECT_URI` from the environment. The CA is not read by the application at all — it is a mount and an env var on the pod.
 
 ### 3.4 The one write, and what still holds the line
 
 `fleet-api.ts` gains `setTelemetryConfig(token, config, opts)`. That **breaks `packages/tesla/test/fleet-api.test.ts` on purpose** — the test pins the module's export list precisely so that adding a write is a decision rather than a slip. The test is updated to the new list, and its comment gains a paragraph: a telemetry-config write is sanctioned; a vehicle-data helper (metered, wakes the car) and any command helper are still not.
 
+**Three things about `authorizeUrl` this design has to name, because its defaults are wrong for this flow.** It hard-codes `prompt: 'login'`, which forces a full Tesla re-authentication — password and MFA — not a click-through consent. Combined with §3.2's "a restart costs one re-consent", that means **every deploy costs a full Tesla login**, which is a real cost to accept knowingly rather than discover. It also hard-codes `prompt_missing_scopes` and `require_requested_scopes`, both added to *widen* an existing grant; their behaviour when the request is a strict *subset* is undocumented by that comment and unverified here, so the first consent is the test. And its default `SCOPES` includes `offline_access` and both command scopes, so the web flow passes an explicit narrower constant — `WEB_SCOPES = ['openid', 'vehicle_device_data']` — pinned by a test beside the export-surface one, because a flow that silently used the default would mint exactly the standing credential this design exists to avoid.
+
+**`TokenSet.refreshToken` becomes optional.** `exchangeCode` reads `j.refresh_token` into a `string`, and without `offline_access` Tesla returns none — so the field would be `undefined` behind a type that says otherwise, which is the same silent-shape trap `oauth.ts`'s own header documents in the other direction. It becomes `refreshToken?: string`, and the callback **asserts it is absent**. That assertion is the executable form of "this flow cannot create a long-lived credential", which is otherwise only prose in §2.
+
 That test is now doing more work than before. Previously the refresh token was the only vehicle-capable credential and it lived outside the cluster. Now a consented access token exists inside `ev-web` for hours at a time, and `ev-web` can reach the signing proxy. The Tesla grant is recorded per (account, application) and already includes `vehicle_cmds`, so — per the hard-won comment in `oauth.ts` — a fresh authorize may return a token carrying the original grant's scopes regardless of what we ask for. **Requesting narrow scopes is therefore a best-effort reduction, not a guarantee.** The guarantee is that this codebase has no function that sends a command, and one test fails if that changes.
+
+### 3.4a The authentication boundary this feature runs into
+
+`apps/web/test/boundaries.test.ts` carries a whole `describe` block whose comment states the invariant plainly: *"Tesla tokens grant vehicle access. They must never grant app access."* It exists because the registered Tesla redirect is named `/tesla_login`, which reads like a sign-in option and is not one. Three tests, and this feature meets all three head-on:
+
+1. **No Tesla path in `PUBLIC_PATHS`.** We comply unchanged — the callback stays behind the gate (§3.1), which works because the session cookie is `sameSite: 'lax'` and Tesla returns the browser by top-level GET.
+2. **"Never issues an app session from a Tesla credential"**, implemented as `touchesTesla && /sealSession|ev_session|cookies\.set\(/`. Our connect route *must* set a state cookie in a file that mentions Tesla, so **this test goes red on a correct implementation**. It is narrowed to the invariant it is actually defending — `/sealSession|SESSION_COOKIE\b|ev_session/` — and its comment gains a line recording that `cookies.set(` was a proxy for "mints a credential" and stopped being a usable one when a Tesla flow legitimately needed a state nonce. Narrowing a guard is exactly the move that should be suspicious, so it is called out here rather than done quietly in a commit.
+3. **"Offers no Tesla sign-in affordance in the UI"**, matching `/sign in with tesla|log in with tesla|tesla login/i` in `.svelte` files. This test **stays exactly as it is**, and it constrains our wording: the button says **"Connect to Tesla"**, never "Sign in with Tesla". That is not a workaround — the distinction is the whole invariant. Connecting authorises *this app to reach the car*; signing in would mean a Tesla account granting access to *the app*, which nothing here does and nothing ever should.
 
 ### 3.5 One config builder
 
 `scripts/telemetry-fields.mjs` currently prints the catalogue in Tesla's shape for the shell script. That logic moves into `packages/tesla/src/telemetry-config.ts` as a pure function:
 
 ```ts
-buildTelemetryConfig(input: {
-  vin: string; hostname: string; port: number; ca: string
-}): TelemetryConfig
+buildTelemetryConfig(input: { vin: string; ca: string }): TelemetryConfig
 ```
 
-It reads the field catalogue for names, intervals and `minimum_delta`, and sets `prefer_typed: true`. The script keeps working by calling it through a thin `.mjs` shim; the website calls it directly. Neither can push a field set the other would not.
+It reads the field catalogue for names, intervals and `minimum_delta`, sets `prefer_typed: true`, and takes the **hostname and port from constants in `packages/tesla`** rather than from its caller — they are `ev-telemetry.framlux.io` and `443` today, hard-coded in the script, and a value both callers must agree on is exactly what this module exists to hold.
+
+**Two guards from the script move into the builder**, because they are the reason it is not a one-liner:
+
+- **An empty field set is refused.** The script has `[ "$COUNT" -gt 0 ] || fail` with the comment that a config with no fields is *accepted* and stops the car streaming anything. That is the highest-consequence failure in the whole flow — a successful push that silently ends ingestion — and it must throw from the builder, where both callers get it.
+- **The CA must look like a certificate.** The script greps for `BEGIN CERTIFICATE`. A mis-mounted or empty CA yields a config the car accepts and then fails every connection against, which is indistinguishable from a car that never wakes.
+
+**The shim keeps its current shape.** `packages/tesla/test/push-config.test.ts` pins the script's literal text — the `telemetry-fields.mjs` invocation, `"fields": fields`, `"prefer_typed": True`, and the `-gt 0` guard. So `scripts/telemetry-fields.mjs` goes on printing **the fields map only**, now sourced from the builder's field-map half, and the script's python assembly is untouched. Those four assertions stay green, and the drift they guard stays guarded.
 
 ### 3.6 Preflight, and not pushing when there is nothing to push
 
 The push runs `fleetStatus` first and **refuses** on any blocker — virtual key not paired, firmware below the floor — because Tesla accepts a configuration it cannot apply, reports no error, and leaves `synced: false` indefinitely, which looks exactly like a sleeping car. A disabled "Allow Third-Party App Data Streaming" toggle is surfaced as a warning, matching the script.
 
-Before pushing it fetches the applied configuration and compares it to what the catalogue would produce. If they match, it reports "already applied" and pushes nothing. A push is not free and is not instant, and re-pushing an identical config resets nothing usefully.
+Before pushing it fetches the applied configuration and compares it to what the catalogue would produce. If they match, it reports "already applied" and pushes nothing.
+
+**What "match" means has to be defined here rather than left to the implementation**, because both ways of getting it wrong are silent. Too strict — a deep equality over whatever Tesla echoes — and a whitespace difference in the PEM or an omitted defaulted `minimum_delta` means it never matches, which merely wastes a push. Too loose, and the page refuses to push a genuinely changed configuration and says everything is fine. The rule is:
+
+- the **set of field names**, and for each, `interval_seconds` and `minimum_delta`;
+- `hostname` and `port`;
+- `ca` compared **on presence only**, not on bytes.
+
+Anything else Tesla echoes is ignored. This is pinned by a test against a captured response fixture, not asserted against the live API.
+
+**`getTelemetryConfig`'s return type is too narrow for any of this.** It is typed `{ synced: boolean }`, but §3.6's comparison and §3.7's `field_count`/`ca_present` both need the applied config itself. It gains `config?: { hostname, port, ca, prefer_typed, fields }` — a shape already known, because `check-telemetry-synced.sh` reads exactly those keys today.
 
 ### 3.7 Cached status
 
@@ -135,7 +168,7 @@ Nothing about this page belongs on the vehicle pages; it is operations, not driv
 What `ev-web` gains:
 
 - `CLIENT_ID` and `CLIENT_SECRET` — an application credential. On its own it grants nothing about any vehicle; vehicle access needs a user's consent.
-- Read access to the telemetry CA certificate, which is public information by nature.
+- Read access to the telemetry CA **certificate** — `tls.crt` only, projected by name (§7). Not the Secret, which also holds `tls.key`.
 - A network path to `ev-teslaproxy`, which the NetworkPolicy already allowed.
 - For hours at a time, after an interactive consent, an access token that Tesla may issue with the account's full existing grant — including command scopes.
 
@@ -165,8 +198,12 @@ The remaining exposure is a compromise of `ev-web` *while an operator is consent
 
 - **Builder** (`packages/tesla`): `buildTelemetryConfig` output equals what the script's shim produces for the same inputs — one test that makes the two callers provably identical; every catalogued field appears with its tier's interval and its delta; `prefer_typed` is set.
 - **Export surface** (`packages/tesla`): the updated pin lists exactly `fleetStatus`, `getTelemetryConfig`, `listVehicles`, `setTelemetryConfig` — no vehicle-data helper, no command helper.
-- **Client** (`packages/tesla`): `baseUrl`/`fetch` injection is honoured, so the web can route through the proxy and the default stays Tesla's host.
-- **Token store** (`apps/web`): a token expires and is then absent rather than stale; disconnect clears it; a request carrying no session reads nothing; a consent is keyed by subject, so the same subject in a second browser shares it — pinned as the documented behaviour, not left to be discovered.
+- **Scopes** (`packages/tesla`): `WEB_SCOPES` is exactly `['openid', 'vehicle_device_data']` — no `offline_access`, no command scope — pinned like the export surface, because the failure of using the default constant is silent and creates the credential this design exists to avoid.
+- **Guards in the builder** (`packages/tesla`): an empty field set throws; a CA that is not a certificate throws; `scripts/telemetry-fields.mjs` still prints only the fields map, so `push-config.test.ts`'s four text assertions stay green.
+- **Comparison rule** (`packages/tesla`): the §3.6 equality is tested against a captured `fleet_telemetry_config` fixture — an identical config matches, a changed interval does not, a `ca` differing only in whitespace still matches, and an omitted defaulted `minimum_delta` does not cause a spurious mismatch.
+- **Boundaries** (`apps/web`): the narrowed session test still catches the thing it defends — a file that calls `sealSession` or writes `ev_session` alongside Tesla OAuth is still an offender — proven by a fixture string, not by inspection. The UI-affordance test is unchanged and the settings page passes it.
+- **Client** (`packages/tesla`): `baseUrl` injection is honoured, so the web routes through the proxy while the default stays Tesla's host. There is no `fetch` seam to test — trust comes from `NODE_EXTRA_CA_CERTS` on the pod (§3.3).
+- **Token store** (`apps/web`): the callback refuses a token set that carries a refresh token, which is the executable form of §2's promise; a token expires and is then absent rather than stale; disconnect clears it; a request carrying no session reads nothing; a consent is keyed by subject, so the same subject in a second browser shares it — pinned as the documented behaviour, not left to be discovered.
 - **Routes** (`apps/web`): unauthenticated → 401 (the gate); authenticated with no Tesla session → 409; callback with a bad `state` → refused, no exchange attempted; push with a preflight blocker → refused and no write issued; push with an identical applied config → "already applied", no write; every one of these asserted against a fake Fleet API rather than the real one.
 - **Status row** (`packages/db`, real Postgres): upsert round-trips; the page renders from a row with a stale `checked_at` and says how old it is.
 - **Page** (`apps/web`): renders with no status row at all (day one), with a stale row and no Tesla session, and with a connected session — the three states that actually occur.
@@ -177,10 +214,11 @@ The remaining exposure is a compromise of `ev-web` *while an operator is consent
 
 **`framlux/stack`:**
 - Mount `ev-tesla-oauth`'s `CLIENT_ID` and `CLIENT_SECRET` into `ev-web` — **not** `REFRESH_TOKEN`, which is the point of the design and should be called out in the manifest comment.
-- Mount the telemetry CA (`ev-telemetry-ca`, `tls.crt`) and the proxy CA (`ev-teslaproxy-tls`, `ca.crt`) read-only.
-- Add `TESLAPROXY_URL` and `TESLA_REDIRECT_URI` to `ev-config`.
+- Mount the telemetry CA (`ev-telemetry-ca`, `tls.crt`) and the proxy CA (`ev-teslaproxy-tls`, `ca.crt`) read-only, **each with an explicit `items:` projection** — never a bare `secret:` volume. Both Secrets are cert-manager CA secrets and therefore also contain `tls.key`: `ev-telemetry-ca` holds the private key of the ten-year root **the car pins**, carrying `rotationPolicy: Never` precisely because rotating it means re-pushing config to a physical vehicle. Projecting the whole Secret into the one internet-facing pod in the namespace would be strictly worse than the refresh-token exposure this design removes. `deployment-teslaproxy.yaml` already does exactly this projection for the signing key, with the reasoning attached; copy that shape.
+- Add `TESLAPROXY_URL`, `TESLA_REDIRECT_URI` and `NODE_EXTRA_CA_CERTS` (pointing at the projected proxy CA) to the web Deployment.
 - No NetworkPolicy change: `ev-web` is already admitted to `ev-teslaproxy:4443`, and the comment there anticipated this.
 - `SECRETS.md` §7 gains a note that `REFRESH_TOKEN` is now used only by the break-glass scripts.
 
 **Tesla developer portal**, and nothing in either repo can do it:
 - Register `https://ev.framlux.io/settings/telemetry/callback` as an allowed redirect URI. Until it is, consent fails at Tesla with a redirect-mismatch error before ever reaching us.
+- This is an **addition, not a replacement**. `SECRETS.md` records `https://ev.framlux.io/tesla_login` as the already-registered redirect — a path that deliberately does not exist, used once by hand to mint the refresh token. It stays registered for the break-glass flow, and `boundaries.test.ts` guards its name against ever becoming a sign-in (§3.4a). The `SECRETS.md` edit says both things: the second URI, and that `REFRESH_TOKEN` is now used only by the scripts.
