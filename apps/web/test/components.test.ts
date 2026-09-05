@@ -31,6 +31,8 @@ import BatteryPage from '../src/routes/vehicles/[id]/battery/+page.svelte'
 import DriveDetailPage from '../src/routes/drives/[id]/+page.svelte'
 import ChargeDetailPage from '../src/routes/charges/[id]/+page.svelte'
 
+import { nullState } from './support/state.js'
+
 /**
  * Empty and null are the EXPECTED inputs on this site, not edge cases.
  *
@@ -67,25 +69,9 @@ const NO_STATE: VehicleWithState = {
 /** A car that reported a sample in which every optional field was missing. */
 const ALL_NULL_STATE: VehicleWithState = {
 	vehicle: VEHICLE,
-	state: {
-		vehicleId: VEHICLE.id,
-		ts: '2026-09-04T07:31:00.000Z',
-		socPct: null,
-		rangeKm: null,
-		odometerKm: null,
-		lat: null,
-		lon: null,
-		speedKph: null,
-		powerState: null,
-		chargeState: null,
-		chargePowerKw: null,
-		chargeEnergyAddedKwh: null,
-		insideTempC: null,
-		outsideTempC: null,
-		locked: null,
-		doorsOpen: null,
-		tpms: null
-	},
+	// Built from the catalogue: two hundred columns, all null, which is what a
+	// real row looks like until the car starts reporting each signal.
+	state: nullState({ vehicleId: VEHICLE.id, ts: '2026-09-04T07:31:00.000Z' }),
 	activity: 'parked',
 	openSessionId: null
 }
@@ -154,7 +140,10 @@ const EMPTY_HEALTH: BatteryHealthResponse = {
 	samples: [],
 	baselineCapacityKwh: null,
 	latest: null,
-	degradationPct: null
+	degradationPct: null,
+	measuredBaselineCapacityKwh: null,
+	latestMeasured: null,
+	measuredDegradationPct: null
 }
 
 /** A drive with a complete series and no coordinates anywhere in it. */
@@ -175,20 +164,24 @@ const DRIVE_WITHOUT_LOCATION: SessionDetail = {
 		{ ts: '2026-09-04T07:46:00.000Z', lat: null, lon: null, socPct: 67, speedKph: 48, powerKw: 12 },
 		{ ts: '2026-09-04T08:01:00.000Z', lat: null, lon: null, socPct: 63, speedKph: 0, powerKw: 0 }
 	],
-	downsampled: false
+	downsampled: false,
+	chargeSetup: null
 }
 
 /** A session that produced no points at all — an ingest gap, or an idle. */
 const SESSION_WITHOUT_POINTS: SessionDetail = {
 	session: session({ id: 'drv-2', kind: 'drive' }),
 	points: [],
-	downsampled: false
+	downsampled: false,
+	chargeSetup: null
 }
 
+/** The charge every charge looks like until the car reports a charger. */
 const CHARGE_WITHOUT_POINTS: SessionDetail = {
 	session: session({ id: 'chg-1', kind: 'charge' }),
 	points: [],
-	downsampled: false
+	downsampled: false,
+	chargeSetup: null
 }
 
 /**
@@ -448,7 +441,8 @@ describe('pages render real data too, so the empty-state tests are not the only 
 				// A taper that reaches exactly zero: the row a truthiness filter eats.
 				{ ts: '2026-09-04T09:00:00.000Z', lat: null, lon: null, socPct: 80, speedKph: null, powerKw: 0 }
 			],
-			downsampled: false
+			downsampled: false,
+			chargeSetup: null
 		}
 		const out = render(ChargeDetailPage as never, {
 			props: { data: { detail, vehicle: VEHICLE } } as never
@@ -457,6 +451,177 @@ describe('pages render real data too, so the empty-state tests are not the only 
 		expect(out.body).toContain('peak 150.2 kW')
 		expect(out.body).toMatch(/<path d="M[\d.]+ [\d.]+ L/)
 		assertNoBrokenValues(out.body)
+	})
+})
+
+/**
+ * Spec §3.8's tiles.
+ *
+ * Every signal behind them is null on the day the columns ship and stays null
+ * until the car is asked for it and answers, so both arms are pinned: the null
+ * arm, which is what the page renders for its first weeks, and the value arm,
+ * which is the only thing that proves the tile is reading the field it claims.
+ */
+describe('the tiles spec §3.8 added', () => {
+	const REPORTING = nullState({
+		vehicleId: VEHICLE.id,
+		ts: '2026-09-04T07:31:00.000Z',
+		socPct: 62,
+		gear: 'P',
+		sentryMode: 'Off',
+		chargeLimitSoc: 80,
+		chargePortDoorOpen: false,
+		chargePortLatch: 'Engaged',
+		hvacPower: 'On',
+		hvacAcEnabled: true,
+		cabinOverheatProtectionMode: 'FanOnly',
+		version: '2026.20.1',
+		softwareUpdateAvailable: true,
+		softwareUpdateVersion: '2026.24.3',
+		energyRemaining: 41.25,
+		moduleTempMin: 18.5,
+		moduleTempMax: 22,
+		brickVoltageMin: 3.901,
+		brickVoltageMax: 3.924
+	})
+
+	function vehiclePage(state: typeof REPORTING | null): string {
+		return render(VehiclePage as never, {
+			props: {
+				data: {
+					entry: {
+						vehicle: VEHICLE,
+						state,
+						activity: state ? 'parked' : 'unknown',
+						openSessionId: null
+					},
+					stats: EMPTY_STATS,
+					samples: EMPTY_SAMPLES,
+					recent: [],
+					chartDays: 7
+				}
+			} as never
+		}).body
+	}
+
+	function batteryPage(state: typeof REPORTING | null, health = EMPTY_HEALTH): string {
+		return render(BatteryPage as never, {
+			props: {
+				data: {
+					entry: { vehicle: VEHICLE, state, activity: 'parked', openSessionId: null },
+					health,
+					stats: EMPTY_STATS
+				}
+			} as never
+		}).body
+	}
+
+	it('the overview shows software, charge limit, port, climate, sentry and gear', () => {
+		const body = vehiclePage(REPORTING)
+		expect(body).toContain('2026.20.1')
+		expect(body).toContain('2026.24.3')
+		expect(body).toContain('80%')
+		expect(body).toContain('Engaged')
+		expect(body).toContain('FanOnly')
+		expect(body).toContain('Sentry')
+		expect(body).toContain('Gear')
+		expect(body).toContain('>P<')
+		assertNoBrokenValues(body)
+	})
+
+	it('the overview dashes every one of them when the car has not reported', () => {
+		const body = vehiclePage(ALL_NULL_STATE.state)
+		// The labels are drawn either way — an absent tile would read as a
+		// feature that is missing rather than a value that has not arrived.
+		expect(body).toContain('Software')
+		expect(body).toContain('Sentry')
+		expect(body).toContain('Gear')
+		// And nothing invents an answer: no "Off" for an unreported sentry, no
+		// 0% charge limit.
+		expect(body).not.toContain('Off')
+		expect(body).not.toContain('0%')
+		assertNoBrokenValues(body)
+	})
+
+	it('the battery page shows the measurement, the pack energy and both pack ranges', () => {
+		const health: BatteryHealthResponse = {
+			...EMPTY_HEALTH,
+			samples: [
+				{
+					observedOn: '2026-09-04',
+					estimatedCapacityKwh: null,
+					measuredCapacityKwh: 72.5,
+					ratedRangeAt100Km: 430,
+					sampleConfidence: null
+				}
+			],
+			measuredBaselineCapacityKwh: 75,
+			latestMeasured: {
+				observedOn: '2026-09-04',
+				estimatedCapacityKwh: null,
+				measuredCapacityKwh: 72.5,
+				ratedRangeAt100Km: 430,
+				sampleConfidence: null
+			},
+			measuredDegradationPct: 3.3
+		}
+		const body = batteryPage(REPORTING, health)
+		expect(body).toContain('72.50 kWh')
+		expect(body).toContain('3.3%')
+		expect(body).toContain('41.25 kWh')
+		// Module temperatures in Fahrenheit, like every other temperature here.
+		expect(body).toContain('65°F')
+		expect(body).toContain('72°F')
+		// The spread is what matters about the bricks; the endpoints are the hint.
+		expect(body).toContain('23 mV')
+		assertNoBrokenValues(body)
+	})
+
+	it('the battery page renders its new tiles against a car that reports nothing', () => {
+		const body = batteryPage(ALL_NULL_STATE.state)
+		expect(body).toContain('Measured capacity')
+		expect(body).toContain('Energy remaining')
+		expect(body).toContain('Brick voltage spread')
+		// A pack with no readings is not a pack at 0 kWh or 0 mV.
+		expect(body).not.toContain('0.00 kWh')
+		expect(body).not.toContain('0 mV')
+		assertNoBrokenValues(body)
+	})
+
+	it('the battery page renders its new tiles for a car with no sample at all', () => {
+		// The layout serves `state: null` for a vehicle that has never reported,
+		// and the battery page is reachable for it.
+		expect(batteryPage(null)).toContain('Measured capacity')
+	})
+
+	it('the charge page shows the charging equipment when the car reported it', () => {
+		const detail: SessionDetail = {
+			...CHARGE_WITHOUT_POINTS,
+			chargeSetup: {
+				chargerVoltage: 232,
+				chargerPhases: 1,
+				fastChargerType: 'ACSingleWireCAN',
+				chargingCableType: 'IEC'
+			}
+		}
+		const body = render(ChargeDetailPage as never, {
+			props: { data: { detail, vehicle: VEHICLE } } as never
+		}).body
+		expect(body).toContain('232 V')
+		expect(body).toContain('ACSingleWireCAN')
+		expect(body).toContain('IEC')
+		expect(body).toContain('1-phase')
+		assertNoBrokenValues(body)
+	})
+
+	it('the charge page says nothing about a charger the car never described', () => {
+		const body = render(ChargeDetailPage as never, {
+			props: { data: { detail: CHARGE_WITHOUT_POINTS, vehicle: VEHICLE } } as never
+		}).body
+		// Four em dashes under a "Charging equipment" heading reads as broken
+		// rather than as not-yet-reported, so the panel is absent instead.
+		expect(body).not.toContain('Charging equipment')
+		assertNoBrokenValues(body)
 	})
 })
 

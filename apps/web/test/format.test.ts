@@ -14,11 +14,14 @@ import {
 	formatKwh,
 	formatNumber,
 	formatOdometer,
+	formatOnOff,
 	formatPct,
 	formatPressure,
 	formatRelative,
 	formatSpeed,
 	formatTemp,
+	formatText,
+	formatVolts,
 	hasCoords,
 	kmToMi,
 	whPerKmToWhPerMi
@@ -268,5 +271,42 @@ describe('coordinates', () => {
 	it('formats a pair to four decimals, and a missing pair to a dash', () => {
 		expect(formatCoords(51.50123456, -0.12654321)).toBe('51.5012, -0.1265')
 		expect(formatCoords(null, null)).toBe(DASH)
+	})
+})
+
+/**
+ * The formatters spec §3.8's tiles needed.
+ *
+ * Every one of the signals behind them is null until the car reports it, which
+ * is the state on the day the columns ship — so the null case is the one that
+ * renders first and the one worth pinning.
+ */
+describe('the new tiles\' formatters', () => {
+	it('renders whole volts, and a dash for no reading', () => {
+		expect(formatVolts(232.4)).toBe('232 V')
+		// A supply genuinely reading zero is not a supply we know nothing about.
+		expect(formatVolts(0)).toBe('0 V')
+		expect(formatVolts(null)).toBe(DASH)
+	})
+
+	it('renders an enum name verbatim rather than guessing at it', () => {
+		// Stored as the vendor's own string (spec §2), and we have not observed
+		// most of these payloads: prettifying 'ACSingleWireCAN' into something
+		// friendlier would be inventing a mapping we cannot check.
+		expect(formatText('ACSingleWireCAN')).toBe('ACSingleWireCAN')
+		expect(formatText(null)).toBe(DASH)
+		// A blank string is a column that was written with nothing in it, which
+		// is "not recorded" rather than a value whose name is empty.
+		expect(formatText('   ')).toBe(DASH)
+	})
+
+	it('renders a tri-state boolean without turning unknown into off', () => {
+		expect(formatOnOff(true)).toBe('On')
+		expect(formatOnOff(false)).toBe('Off')
+		// The whole point: a car that has not said whether sentry is on is not
+		// a car with sentry off.
+		expect(formatOnOff(null)).toBe(DASH)
+		expect(formatOnOff(true, 'Open', 'Closed')).toBe('Open')
+		expect(formatOnOff(false, 'Open', 'Closed')).toBe('Closed')
 	})
 })

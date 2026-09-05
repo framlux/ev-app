@@ -12,21 +12,28 @@ import {
 	getSampleSeries,
 	getSessionDetail,
 	getVehicle,
+	getVehicleLive,
 	getVehicleState,
 	getVehicleStats,
 	listSessions,
 	listVehicles,
+	listVehiclesLive,
 	parseRangeQuery,
 	parseSampleQuery,
 	parseSessionQuery,
 	planDecimation,
 	round,
+	measuredDegradationPct,
 	selectBaseline,
+	selectMeasuredBaseline,
 	SAMPLE_SERIES_CAP,
 	SESSION_POINT_CAP,
 	type Queryable
 } from '../src/lib/server/queries.js'
 import type { BatteryHealthPoint, VehicleState } from '../src/lib/api-types.js'
+import { LIVE_STATE_FIELDS } from '../src/lib/api-types.js'
+import { SAMPLE_COLUMNS } from '@ev/core'
+import { nullState } from './support/state.js'
 
 type Row = Record<string, unknown>
 
@@ -86,35 +93,33 @@ const VEHICLE_ROW: Row = {
 
 const EXISTS: [RegExp, Row[]] = [/SELECT 1 FROM vehicle/, [{ '?column?': 1 }]]
 
+/**
+ * Delegated to the shared builder now that `VehicleState` is two hundred
+ * columns wide: the fields this file's tests care about are still passed in as
+ * overrides, everything else is the null a car that has not reported yet sends.
+ */
 function state(overrides: Partial<VehicleState> = {}): VehicleState {
-	return {
-		vehicleId: 'v1',
-		ts: '2026-09-04T00:00:00.000Z',
-		socPct: null,
-		rangeKm: null,
-		odometerKm: null,
-		lat: null,
-		lon: null,
-		speedKph: null,
-		powerState: null,
-		chargeState: null,
-		chargePowerKw: null,
-		chargeEnergyAddedKwh: null,
-		insideTempC: null,
-		outsideTempC: null,
-		locked: null,
-		doorsOpen: null,
-		tpms: null,
-		...overrides
-	}
+	return nullState(overrides)
 }
 
 function bhp(capacity: number, confidence: number, day = '2026-01-01'): BatteryHealthPoint {
 	return {
 		observedOn: day,
 		estimatedCapacityKwh: capacity,
+		measuredCapacityKwh: null,
 		ratedRangeAt100Km: null,
 		sampleConfidence: confidence
+	}
+}
+
+/** A day the car reported its own pack energy and no charge qualified. */
+function measured(capacity: number, day = '2026-01-01'): BatteryHealthPoint {
+	return {
+		observedOn: day,
+		estimatedCapacityKwh: null,
+		measuredCapacityKwh: capacity,
+		ratedRangeAt100Km: null,
+		sampleConfidence: null
 	}
 }
 
@@ -477,6 +482,31 @@ describe('selectBaseline', () => {
 	it('is null for an empty history', () => {
 		expect(selectBaseline([])).toBeNull()
 	})
+
+	it('ignores a day that carries only the car\'s own measurement', () => {
+		// Since spec §3.7 a row can exist with a measurement and no estimate,
+		// and a null estimate compared with `>` is neither larger nor smaller —
+		// it would silently never win, which is the right answer for the wrong
+		// reason. Stated as a test so the guard cannot be dropped.
+		expect(selectBaseline([measured(78), bhp(70, 0.9)])).toBe(70)
+		expect(selectBaseline([measured(78)])).toBeNull()
+	})
+})
+
+describe('selectMeasuredBaseline', () => {
+	// No confidence floor: the car's own pack energy is a measurement, not an
+	// inference from a charge window, so there is no span to be sceptical of.
+	it('takes the best measurement ever recorded', () => {
+		expect(selectMeasuredBaseline([measured(70), measured(74), measured(72)])).toBe(74)
+	})
+
+	it('ignores estimate-only days', () => {
+		expect(selectMeasuredBaseline([bhp(99, 0.9)])).toBeNull()
+	})
+
+	it('is null for an empty history', () => {
+		expect(selectMeasuredBaseline([])).toBeNull()
+	})
 })
 
 describe('degradationPct', () => {
@@ -498,6 +528,24 @@ describe('degradationPct', () => {
 
 	it('is null rather than Infinity when the baseline is not a usable divisor', () => {
 		expect(degradationPct(0, bhp(70, 0.9))).toBeNull()
+	})
+
+	it('is null when the latest day has no estimate to compare', () => {
+		expect(degradationPct(75, measured(70))).toBeNull()
+	})
+})
+
+describe('measuredDegradationPct', () => {
+	it('reports the loss of the latest measurement against the best one', () => {
+		expect(measuredDegradationPct(75, measured(70))).toBe(6.7)
+	})
+
+	it('is null when the latest day carries no measurement', () => {
+		expect(measuredDegradationPct(75, bhp(70, 0.9))).toBeNull()
+	})
+
+	it('clamps at zero rather than reporting a battery that grew', () => {
+		expect(measuredDegradationPct(70, measured(72))).toBe(0)
 	})
 })
 
@@ -551,7 +599,10 @@ describe('empty database', () => {
 			samples: [],
 			baselineCapacityKwh: null,
 			latest: null,
-			degradationPct: null
+			degradationPct: null,
+			measuredBaselineCapacityKwh: null,
+			latestMeasured: null,
+			measuredDegradationPct: null
 		})
 	})
 
@@ -617,6 +668,91 @@ describe('empty database', () => {
 /* ------------------------------------------------------------------ *
  * Mapping: nulls, activity, pagination
  * ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ *
+ * The live projection (spec §3.8)
+ * ------------------------------------------------------------------ */
+
+describe('the stream path projects, the REST path does not', () => {
+	const REPORTED: Row = {
+		...VEHICLE_ROW,
+		ts: new Date('2026-09-04T07:31:00Z'),
+		power_state: 'online',
+		soc_pct: 62,
+		// One projected column of each shape the readers dispatch on...
+		gear: 'P',
+		sentry_mode: 'Off',
+		charge_limit_soc: 80,
+		charge_port_door_open: false,
+		software_update_available: true,
+		// ...and one that is deliberately NOT projected: a pack internal the
+		// battery page reads from its own load, not from the stream.
+		module_temp_min: 12.5,
+		energy_remaining: 41.25
+	}
+
+	it('maps every catalogued column, not only the seventeen the UI started with', async () => {
+		const res = await listVehicles(fakeDb([[/FROM vehicle v/, [REPORTED]]]))
+		const s = res.vehicles[0]?.state
+		expect(Object.keys(s ?? {}).sort()).toEqual(
+			['vehicleId', 'ts', ...SAMPLE_COLUMNS.map((c) => c.key)].sort()
+		)
+		// Each SQL type goes through its own reader: TEXT stays a string, INT
+		// and REAL become numbers, BOOLEAN stays tri-state.
+		expect(s?.gear).toBe('P')
+		expect(s?.chargeLimitSoc).toBe(80)
+		expect(s?.chargePortDoorOpen).toBe(false)
+		expect(s?.softwareUpdateAvailable).toBe(true)
+		expect(s?.moduleTempMin).toBe(12.5)
+		// A column the row did not carry is null, never undefined: undefined
+		// disappears through JSON.stringify and the field would be absent
+		// rather than "not recorded".
+		expect(s?.packVoltage).toBeNull()
+	})
+
+	it('asks the database only for the projected columns on the stream path', async () => {
+		const conn = fakeDb([[/FROM vehicle v/, [REPORTED]]])
+		await listVehiclesLive(conn)
+		const sql = conn.calls[0]?.sql ?? ''
+		expect(sql).toContain('st.gear')
+		// The whole point: two hundred columns are not read, transferred and
+		// serialised to tell a parked car's tab that nothing changed.
+		expect(sql).not.toContain('st.module_temp_min')
+		expect(sql).not.toContain('st.energy_remaining')
+	})
+
+	it('sends exactly the projected fields and nothing else', async () => {
+		const entries = await listVehiclesLive(fakeDb([[/FROM vehicle v/, [REPORTED]]]))
+		expect(Object.keys(entries[0]?.state ?? {}).sort()).toEqual([...LIVE_STATE_FIELDS].sort())
+		expect(entries[0]?.state?.gear).toBe('P')
+	})
+
+	it('still derives the pill from a projected state', async () => {
+		const row: Row = { ...REPORTED, charge_state: 'charging' }
+		const entries = await listVehiclesLive(fakeDb([[/FROM vehicle v/, [row]]]))
+		expect(entries[0]?.activity).toBe('charging')
+	})
+
+	it('keeps a car that has never reported out of the stream as a null state', async () => {
+		const entries = await listVehiclesLive(fakeDb([[/FROM vehicle v/, [VEHICLE_ROW]]]))
+		expect(entries[0]?.state).toBeNull()
+		expect(entries[0]?.activity).toBe('unknown')
+	})
+
+	it('404s an unknown vehicle on the stream path too, rather than sending an empty car', async () => {
+		await expect(getVehicleLive('nope', fakeDb([]))).rejects.toMatchObject({ status: 404 })
+	})
+
+	it('serves the full row on the REST state endpoint', async () => {
+		const conn = fakeDb([EXISTS, [/FROM sample WHERE vehicle_id/, [REPORTED]]])
+		const s = await getVehicleState('v1', conn)
+		// The projection is a stream concern only: a client asking for state
+		// gets everything the row holds.
+		expect(s.energyRemaining).toBe(41.25)
+		expect(s.moduleTempMin).toBe(12.5)
+		expect(Object.keys(s)).toHaveLength(SAMPLE_COLUMNS.length + 2)
+	})
+})
 
 describe('vehicle mapping', () => {
 	it('lists a vehicle that has never reported rather than hiding it', async () => {
@@ -854,10 +990,95 @@ describe('session detail', () => {
 		cost_currency: null
 	}
 
+	const CHARGE: Row = { ...SESSION, kind: 'charge' }
+
 	it('treats a session with no points as a valid answer, not a 404', async () => {
 		const res = await getSessionDetail('s1', fakeDb([[/FROM session WHERE id/, [SESSION]]]))
 		expect(res.points).toEqual([])
 		expect(res.downsampled).toBe(false)
+	})
+
+	it('asks nothing about charging equipment for a drive or an idle', async () => {
+		const conn = fakeDb([[/FROM session WHERE id/, [SESSION]]])
+		const res = await getSessionDetail('s1', conn)
+		expect(res.chargeSetup).toBeNull()
+		// One query for the session, one for its points, and no third.
+		expect(conn.calls.filter((c) => /charger_voltage/.test(c.sql))).toEqual([])
+	})
+
+	it('reports the charging equipment for a charge', async () => {
+		const conn = fakeDb([
+			[/FROM session WHERE id/, [CHARGE]],
+			[
+				/charger_voltage/,
+				[
+					{
+						charger_voltage: 232.4,
+						charger_phases: 1,
+						fast_charger_type: 'ACSingleWireCAN',
+						charging_cable_type: 'IEC'
+					}
+				]
+			]
+		])
+		const res = await getSessionDetail('s1', conn)
+		expect(res.chargeSetup).toEqual({
+			// Whole volts: the tenth of a volt on a mains supply is noise, and
+			// the contract rounds server-side so the page never has to.
+			chargerVoltage: 232,
+			chargerPhases: 1,
+			fastChargerType: 'ACSingleWireCAN',
+			chargingCableType: 'IEC'
+		})
+		// Bounded by the session's own window, not by a scan of the partition.
+		const call = conn.calls.find((c) => /charger_voltage/.test(c.sql))
+		expect(call?.values).toEqual(['v1', CHARGE['started_at'], CHARGE['ended_at']])
+	})
+
+	it('reports null rather than a panel of dashes when the car said nothing about the charger', async () => {
+		// The normal case until the config push lands: the columns exist, the
+		// car has never filled them, and a "charging equipment" panel of four
+		// em dashes reads as broken rather than as not-yet-reported.
+		const conn = fakeDb([
+			[/FROM session WHERE id/, [CHARGE]],
+			[
+				/charger_voltage/,
+				[
+					{
+						charger_voltage: null,
+						charger_phases: null,
+						fast_charger_type: null,
+						charging_cable_type: null
+					}
+				]
+			]
+		])
+		expect((await getSessionDetail('s1', conn)).chargeSetup).toBeNull()
+	})
+
+	it('keeps a partially reported charger rather than discarding it', async () => {
+		const conn = fakeDb([
+			[/FROM session WHERE id/, [CHARGE]],
+			[/charger_voltage/, [{ charging_cable_type: 'IEC' }]]
+		])
+		expect((await getSessionDetail('s1', conn)).chargeSetup).toEqual({
+			chargerVoltage: null,
+			chargerPhases: null,
+			fastChargerType: null,
+			chargingCableType: 'IEC'
+		})
+	})
+
+	it('bounds an open charge at the current instant rather than at null', async () => {
+		const conn = fakeDb([
+			[/FROM session WHERE id/, [{ ...CHARGE, ended_at: null, is_open: true }]],
+			[/charger_voltage/, [{ charger_voltage: 232.4 }]]
+		])
+		await getSessionDetail('s1', conn)
+		const call = conn.calls.find((c) => /charger_voltage/.test(c.sql))
+		// A null upper bound would compare as unknown and match no rows, so an
+		// in-progress charge would show nothing about the charger it is on.
+		expect(call?.values[2]).toBeInstanceOf(Date)
 	})
 
 	it('reports downsampled from the pre-decimation total, not the rows served', async () => {
@@ -977,6 +1198,68 @@ describe('battery health', () => {
 		expect(res.samples).toHaveLength(1)
 		expect(res.baselineCapacityKwh).toBeNull()
 		expect(res.degradationPct).toBeNull()
+	})
+
+	it('carries the days that have a measurement and no estimate', async () => {
+		// The normal shape from the day ingest starts writing measurements: one
+		// row per day with `measured_capacity_kwh` set, and an estimate only
+		// after a charge wide enough to infer from. Dropping them would hide the
+		// series spec §3.7 exists to record.
+		const res = await getBatteryHealth(
+			'v1',
+			{},
+			fakeDb([
+				EXISTS,
+				[
+					/FROM battery_health_sample/,
+					[
+						{ ...row('2026-01-01', 70, 0.9), measured_capacity_kwh: 74 },
+						{
+							observed_on: '2026-01-02',
+							estimated_capacity_kwh: null,
+							measured_capacity_kwh: 72.5,
+							rated_range_at_100_km: 430,
+							sample_confidence: null
+						}
+					]
+				]
+			])
+		)
+		expect(res.samples).toHaveLength(2)
+		expect(res.samples[1]?.estimatedCapacityKwh).toBeNull()
+		expect(res.samples[1]?.measuredCapacityKwh).toBe(72.5)
+
+		// The estimate series is unmoved by the measurement-only day: `latest`
+		// is still the newest day that HAS an estimate, so the existing tile
+		// keeps saying what it said instead of blanking on a day the car simply
+		// reported its pack energy.
+		expect(res.baselineCapacityKwh).toBe(70)
+		expect(res.latest?.observedOn).toBe('2026-01-01')
+		expect(res.degradationPct).toBe(0)
+
+		expect(res.measuredBaselineCapacityKwh).toBe(74)
+		expect(res.latestMeasured?.observedOn).toBe('2026-01-02')
+		expect(res.measuredDegradationPct).toBe(2)
+	})
+
+	it('takes the measured baseline from all history too, so panning cannot move it', async () => {
+		const res = await getBatteryHealth(
+			'v1',
+			{ from: new Date('2026-06-01T00:00:00Z') },
+			fakeDb([
+				EXISTS,
+				[
+					/FROM battery_health_sample/,
+					[
+						{ ...row('2026-01-01', 75, 0.9), measured_capacity_kwh: 78 },
+						{ ...row('2026-07-01', 70, 0.9), measured_capacity_kwh: 74.1 }
+					]
+				]
+			])
+		)
+		expect(res.samples).toHaveLength(1)
+		expect(res.measuredBaselineCapacityKwh).toBe(78)
+		expect(res.measuredDegradationPct).toBe(5)
 	})
 
 	it('excludes the to bound and includes the from bound', async () => {

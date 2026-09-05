@@ -23,12 +23,25 @@
  *     null, not 0: "no data recorded" and "the car did not move" are different
  *     claims and only the second is a fact about the car.
  */
+/**
+ * A VALUE import from @ev/core, which the rest of apps/web deliberately avoids.
+ *
+ * `SAMPLE_COLUMNS` is the column catalogue, not the engine: it is the same list
+ * the migration, `insertSample` and the normaliser are generated from, and this
+ * module is server-only, so nothing about it reaches the browser bundle. The
+ * boundary that matters (rule 4, and test/boundaries.test.ts) is about the
+ * segmentation logic — recomputing on read what ingest computed on write — and
+ * a list of column names is the opposite of that: it is what stops the API and
+ * the schema drifting apart.
+ */
+import { SAMPLE_COLUMNS, type SampleColumn } from '@ev/core'
 import type {
   BatteryHealthPoint,
   BatteryHealthResponse,
-  ChargeState,
+  ChargeSetup,
+  LiveVehicleState,
+  LiveVehicleWithState,
   PeriodStats,
-  PowerState,
   SampleField,
   SampleSeriesPoint,
   SampleSeriesResponse,
@@ -45,7 +58,7 @@ import type {
   VehicleWithState,
   Vendor,
 } from '../api-types.js'
-import { SAMPLE_FIELDS } from '../api-types.js'
+import { LIVE_STATE_FIELDS, SAMPLE_FIELDS } from '../api-types.js'
 import { getPool } from './db.js'
 
 /* ------------------------------------------------------------------ *
@@ -411,33 +424,122 @@ function mapVehicle(r: Row): Vehicle {
   }
 }
 
-/**
- * The latest `sample` row, camel-cased.
+/* ------------------------------------------------------------------ *
+ * The sample row
  *
- * `tpms` is passed through as whatever JSONB held: a vendor that reports two
- * wheels yields a two-key object, and filling the missing wheels with zeros
- * would render as two flat tyres.
+ * `sample` has two hundred columns and @ev/core's catalogue is what the
+ * migration, `insertSample` and the normaliser are all generated from. The
+ * SELECT list and the mapper below are generated from the same list, so a
+ * column that exists is read, and a column that is dropped stops being read,
+ * with no edit here. A hand-written mapper would instead give a silent null
+ * for every column somebody forgot to add to it — which is indistinguishable
+ * from a car that never reported the signal.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Decimal places per column, defaulting to `DEFAULT_STATE_DP`.
+ *
+ * The rounding is not cosmetic: a `real` widens to a double with noise
+ * attached (see `round`), so 12.2 comes back as 12.199999809265137. The
+ * entries below are the ten columns whose precision the API contract states,
+ * and they are pinned here so that growing the column set cannot quietly
+ * change what /api/v1 has always returned.
+ */
+const STATE_DP: Record<string, number> = {
+  soc_pct: 1,
+  range_km: 1,
+  odometer_km: 1,
+  lat: 6,
+  lon: 6,
+  speed_kph: 1,
+  charge_power_kw: 1,
+  charge_energy_added_kwh: 2,
+  inside_temp_c: 1,
+  outside_temp_c: 1,
+}
+
+/**
+ * Three, not one, for the columns the contract says nothing about.
+ *
+ * A brick voltage is ~3.9 V and the whole point of `BrickVoltageMin`/`Max` is
+ * the millivolts between them, so one decimal place would round the signal
+ * away entirely. Three keeps every column added by this spec meaningful while
+ * still erasing float4 noise.
+ */
+const DEFAULT_STATE_DP = 3
+
+/**
+ * One catalogued column, read out of a row into its contract value.
+ *
+ * Dispatching on the DECLARED SQL type rather than on what the value looks
+ * like at runtime is what makes this safe to generate: a `TEXT` column holding
+ * a numeric-looking enum name stays a string, and a `REAL` that pg hands back
+ * as a string still becomes a number.
+ */
+function readStateColumn(c: SampleColumn, r: Row): unknown {
+  const v = r[c.column]
+  switch (c.sql) {
+    case 'REAL':
+    case 'DOUBLE PRECISION':
+      return round(num(v), STATE_DP[c.column] ?? DEFAULT_STATE_DP)
+    case 'INT':
+      return round(num(v), 0)
+    case 'BOOLEAN':
+      return bool(v)
+    case 'TEXT':
+    // A `time` has no date and no zone, so it crosses the wire as the
+    // 'HH:MM:SS' pg hands back rather than being invented into an instant.
+    case 'TIME':
+      return str(v)
+    case 'TIMESTAMPTZ':
+      return iso(v)
+    case 'JSONB':
+      // Passed through as whatever JSONB held: a vendor that reports two
+      // wheels yields a two-key object, and filling in the missing wheels
+      // with zeros would render as two flat tyres.
+      return (v as Record<string, number> | null) ?? null
+    default: {
+      // A new SqlType in the catalogue with no reader here would otherwise
+      // become `undefined`, which vanishes through JSON.stringify.
+      const unhandled: never = c.sql
+      throw new Error(`no state reader for SQL type ${String(unhandled)}`)
+    }
+  }
+}
+
+/** The projected subset, resolved once: `LIVE_STATE_FIELDS` minus the key. */
+const LIVE_STATE_COLUMNS: readonly SampleColumn[] = SAMPLE_COLUMNS.filter((c) =>
+  (LIVE_STATE_FIELDS as readonly string[]).includes(c.key),
+)
+
+/** `st.ts, st.soc_pct, …` — the sample columns a vehicle query reads. */
+function stateSelect(prefix: string, columns: readonly SampleColumn[]): string {
+  return ['ts', ...columns.map((c) => c.column)].map((c) => `${prefix}${c}`).join(', ')
+}
+
+function mapColumns(vehicleId: string, r: Row, columns: readonly SampleColumn[]): Row {
+  const out: Row = { vehicleId, ts: isoRequired(r['ts']) }
+  for (const c of columns) out[c.key] = readStateColumn(c, r)
+  return out
+}
+
+/**
+ * The latest `sample` row, camel-cased. Every catalogued column, for the REST
+ * endpoints, which are not paying for the payload per notification.
  */
 function mapState(vehicleId: string, r: Row): VehicleState {
-  return {
-    vehicleId,
-    ts: isoRequired(r['ts']),
-    socPct: round(num(r['soc_pct']), 1),
-    rangeKm: round(num(r['range_km']), 1),
-    odometerKm: round(num(r['odometer_km']), 1),
-    lat: round(num(r['lat']), 6),
-    lon: round(num(r['lon']), 6),
-    speedKph: round(num(r['speed_kph']), 1),
-    powerState: str(r['power_state']) as PowerState | null,
-    chargeState: str(r['charge_state']) as ChargeState | null,
-    chargePowerKw: round(num(r['charge_power_kw']), 1),
-    chargeEnergyAddedKwh: round(num(r['charge_energy_added_kwh']), 2),
-    insideTempC: round(num(r['inside_temp_c']), 1),
-    outsideTempC: round(num(r['outside_temp_c']), 1),
-    locked: bool(r['locked']),
-    doorsOpen: bool(r['doors_open']),
-    tpms: (r['tpms'] as Record<string, number> | null) ?? null,
-  }
+  return mapColumns(vehicleId, r, SAMPLE_COLUMNS) as unknown as VehicleState
+}
+
+/**
+ * The same row projected to `LIVE_STATE_FIELDS`, for the SSE stream (§3.8).
+ *
+ * Built by omission rather than by nulling: an unprojected field must be
+ * ABSENT, not null, or the frame is the same size it was and the client cannot
+ * tell "not streamed" from "not recorded".
+ */
+function mapLiveState(vehicleId: string, r: Row): LiveVehicleState {
+  return mapColumns(vehicleId, r, LIVE_STATE_COLUMNS) as unknown as LiveVehicleState
 }
 
 /**
@@ -450,7 +552,9 @@ function mapState(vehicleId: string, r: Row): VehicleState {
  * the driver pulls away) and "driving" is the true one.
  */
 export function deriveActivity(
-  state: VehicleState | null,
+  // The two fields it actually reads, so it works on a projected state as well
+  // as a full one — the pill on a streamed entry has to be the same pill.
+  state: Pick<VehicleState, 'chargeState' | 'powerState'> | null,
   openDriveId: string | null,
   openChargeId: string | null,
 ): { activity: VehicleActivity; openSessionId: string | null } {
@@ -514,14 +618,21 @@ function mapPoint(r: Row): SessionPointDto {
   }
 }
 
+/**
+ * One `battery_health_sample` row.
+ *
+ * Both capacities are nullable since migration 005: a day can carry the car's
+ * own measurement with no qualifying charge to estimate from, and (for every
+ * day before this feature shipped) an estimate with no measurement. Neither is
+ * coerced to 0 — a 0 kWh battery would plot as total failure.
+ */
 export function mapBatteryPoint(r: Row): BatteryHealthPoint {
   return {
     observedOn: String(r['observed_on']),
-    // NOT NULL in the schema; a null here means the query changed, and a 0 kWh
-    // battery would plot as total failure rather than as a bug.
-    estimatedCapacityKwh: round(num(r['estimated_capacity_kwh']), 2) as number,
+    estimatedCapacityKwh: round(num(r['estimated_capacity_kwh']), 2),
+    measuredCapacityKwh: round(num(r['measured_capacity_kwh']), 2),
     ratedRangeAt100Km: round(num(r['rated_range_at_100_km']), 1),
-    sampleConfidence: round(num(r['sample_confidence']), 2) as number,
+    sampleConfidence: round(num(r['sample_confidence']), 2),
   }
 }
 
@@ -529,7 +640,18 @@ export function mapBatteryPoint(r: Row): BatteryHealthPoint {
  * Vehicles
  * ------------------------------------------------------------------ */
 
-const VEHICLE_WITH_STATE_SQL = `
+/**
+ * The garage query, over whichever slice of the sample row the caller needs.
+ *
+ * Two callers, two column sets: the REST endpoints read everything, the live
+ * stream reads only `LIVE_STATE_COLUMNS`. One template rather than two SQL
+ * strings, because the laterals below are the part that is easy to get subtly
+ * wrong and impossible to notice — a vehicle that stops being listed because
+ * a join was written as an inner one looks exactly like a vehicle that was
+ * deleted.
+ */
+function vehicleWithStateSql(columns: readonly SampleColumn[]): string {
+  return `
   SELECT
     v.id                AS vehicle_id,
     v.vendor            AS vendor,
@@ -538,10 +660,7 @@ const VEHICLE_WITH_STATE_SQL = `
     v.model             AS model,
     v.model_year        AS model_year,
     v.created_at        AS created_at,
-    st.ts, st.soc_pct, st.range_km, st.odometer_km, st.lat, st.lon,
-    st.speed_kph, st.power_state, st.charge_state, st.charge_power_kw,
-    st.charge_energy_added_kwh, st.inside_temp_c, st.outside_temp_c,
-    st.locked, st.doors_open, st.tpms,
+    ${stateSelect('st.', columns)},
     od.id AS open_drive_id,
     oc.id AS open_charge_id
   FROM vehicle v
@@ -560,18 +679,38 @@ const VEHICLE_WITH_STATE_SQL = `
     WHERE vehicle_id = v.id AND is_open AND kind = 'charge' LIMIT 1
   ) oc ON true
 `
+}
 
-function mapVehicleWithState(r: Row): VehicleWithState {
+const VEHICLE_WITH_STATE_SQL = vehicleWithStateSql(SAMPLE_COLUMNS)
+const LIVE_VEHICLE_SQL = vehicleWithStateSql(LIVE_STATE_COLUMNS)
+
+/**
+ * One garage row into an entry, with the state mapped by whichever mapper the
+ * caller's column set matches. The activity is derived HERE for both, so the
+ * pill on a streamed card and the pill on a loaded page cannot disagree.
+ */
+function mapEntry<S extends Pick<VehicleState, 'chargeState' | 'powerState'>>(
+  r: Row,
+  mapper: (vehicleId: string, r: Row) => S,
+): { vehicle: Vehicle; state: S | null; activity: VehicleActivity; openSessionId: string | null } {
   const vehicle = mapVehicle(r)
   // `ts` is NOT NULL in `sample`, so a null here is the LEFT JOIN missing, not
   // a row with an unknown timestamp.
-  const state = r['ts'] === null || r['ts'] === undefined ? null : mapState(vehicle.id, r)
+  const state = r['ts'] === null || r['ts'] === undefined ? null : mapper(vehicle.id, r)
   const { activity, openSessionId } = deriveActivity(
     state,
     str(r['open_drive_id']),
     str(r['open_charge_id']),
   )
   return { vehicle, state, activity, openSessionId }
+}
+
+function mapVehicleWithState(r: Row): VehicleWithState {
+  return mapEntry(r, mapState)
+}
+
+function mapLiveVehicle(r: Row): LiveVehicleWithState {
+  return mapEntry(r, mapLiveState)
 }
 
 /**
@@ -593,8 +732,40 @@ export async function getVehicle(id: string, conn?: Queryable): Promise<VehicleW
   return mapVehicleWithState(row)
 }
 
+/* ------------------------------------------------------------------ *
+ * The live stream's pair of the two above (spec §3.8)
+ *
+ * Same rows, same activity derivation, projected state. These exist because
+ * the stream sends a state object per notification AND one per vehicle in
+ * every snapshot, to every open tab: at two hundred columns that is a few
+ * kilobytes every couple of seconds to tell a parked car's tab that nothing
+ * changed. Nothing but `notify-listener.ts` should call them — a page load
+ * wants the full row.
+ * ------------------------------------------------------------------ */
+
+export async function listVehiclesLive(conn?: Queryable): Promise<LiveVehicleWithState[]> {
+  const { rows } = await db(conn).query(
+    `${LIVE_VEHICLE_SQL} ORDER BY v.display_name ASC, v.id ASC`,
+  )
+  return rows.map(mapLiveVehicle)
+}
+
+export async function getVehicleLive(
+  id: string,
+  conn?: Queryable,
+): Promise<LiveVehicleWithState> {
+  const { rows } = await db(conn).query(`${LIVE_VEHICLE_SQL} WHERE v.id = $1`, [id])
+  const row = rows[0]
+  if (!row) throw new ApiProblem(404, 'vehicle not found')
+  return mapLiveVehicle(row)
+}
+
 /**
  * The latest sample and nothing else — the cheap target for a card that polls.
+ *
+ * Every catalogued column, deliberately: this is the REST contract, and a
+ * client asking "what is the car doing" pays for one response rather than one
+ * per notification.
  *
  * The two 404s are deliberately different. An unknown id is a bad URL; a known
  * vehicle with no samples is an ingestion problem, and collapsing them would
@@ -604,9 +775,7 @@ export async function getVehicleState(id: string, conn?: Queryable): Promise<Veh
   const c = db(conn)
   await assertVehicleExists(id, c)
   const { rows } = await c.query(
-    `SELECT ts, soc_pct, range_km, odometer_km, lat, lon, speed_kph,
-            power_state, charge_state, charge_power_kw, charge_energy_added_kwh,
-            inside_temp_c, outside_temp_c, locked, doors_open, tpms
+    `SELECT ${stateSelect('', SAMPLE_COLUMNS)}
        FROM sample WHERE vehicle_id = $1 ORDER BY ts DESC LIMIT 1`,
     [id],
   )
@@ -733,11 +902,64 @@ export async function getSessionDetail(id: string, conn?: Queryable): Promise<Se
   )
 
   const total = points.rows[0] ? count(points.rows[0]['total']) : 0
+  const session = mapSession(row)
   return {
-    session: mapSession(row),
+    session,
     points: points.rows.map(mapPoint),
     downsampled: planDecimation(total, SESSION_POINT_CAP).downsampled,
+    chargeSetup: session.kind === 'charge' ? await readChargeSetup(c, session) : null,
   }
+}
+
+/**
+ * What the car was plugged into during one charge (spec §3.8).
+ *
+ * These live on `sample`, not on `session` — the segmenter has no reason to
+ * summarise them — so they are read back from the session's own window. That
+ * window is what bounds the query: `sample` is partitioned and a scan without
+ * one would read the archive.
+ *
+ * The voltage and the phase count are taken as the MAXIMUM over the session
+ * rather than as the last reading. The last sample of a charge is usually the
+ * one taken after the car stopped drawing, where the supply reads zero; "this
+ * charge ran at 0 V" is a wrong answer that looks like a right one. The two
+ * enum names are taken as the last non-null instead, because they are labels
+ * rather than measurements and `max` over a string would be alphabetical.
+ */
+async function readChargeSetup(
+  c: Queryable,
+  session: SessionListItem,
+): Promise<ChargeSetup | null> {
+  const { rows } = await c.query(
+    `SELECT max(charger_voltage) AS charger_voltage,
+            max(charger_phases)  AS charger_phases,
+            (array_agg(fast_charger_type ORDER BY ts DESC)
+               FILTER (WHERE fast_charger_type IS NOT NULL))[1]   AS fast_charger_type,
+            (array_agg(charging_cable_type ORDER BY ts DESC)
+               FILTER (WHERE charging_cable_type IS NOT NULL))[1] AS charging_cable_type
+       FROM sample
+      WHERE vehicle_id = $1 AND ts >= $2 AND ts <= $3`,
+    [
+      session.vehicleId,
+      new Date(session.startedAt),
+      // An open charge has no end. A null upper bound compares as unknown and
+      // would match no rows at all, so the car currently plugged in would show
+      // nothing about the charger it is plugged into.
+      session.endedAt === null ? new Date() : new Date(session.endedAt),
+    ],
+  )
+  const r = rows[0]
+  if (!r) return null
+  const setup: ChargeSetup = {
+    chargerVoltage: round(num(r['charger_voltage']), 0),
+    chargerPhases: round(num(r['charger_phases']), 0),
+    fastChargerType: str(r['fast_charger_type']),
+    chargingCableType: str(r['charging_cable_type']),
+  }
+  // Nothing reported at all is null, not four nulls: a "charging equipment"
+  // panel of four em dashes reads as broken rather than as not-yet-reported,
+  // and that is the state of every charge until the config push lands.
+  return Object.values(setup).some((v) => v !== null) ? setup : null
 }
 
 /* ------------------------------------------------------------------ *
@@ -758,10 +980,65 @@ export const BASELINE_CONFIDENCE_FLOOR = 0.5
 export function selectBaseline(samples: readonly BatteryHealthPoint[]): number | null {
   let best: number | null = null
   for (const s of samples) {
+    // Both null checks are load-bearing since migration 005: a measurement-only
+    // day has neither, and `null < 0.5` is false while `null > best` is also
+    // false — so it would be skipped for the right reason by accident, and
+    // would stop being skipped the moment either comparison was rewritten.
+    if (s.estimatedCapacityKwh === null || s.sampleConfidence === null) continue
     if (s.sampleConfidence < BASELINE_CONFIDENCE_FLOOR) continue
     if (best === null || s.estimatedCapacityKwh > best) best = s.estimatedCapacityKwh
   }
   return best
+}
+
+/**
+ * The same, for the car's own measurement — with no confidence floor.
+ *
+ * `NominalFullPackEnergyKwh` is the BMS's own figure for a full pack, not an
+ * inference from a charge window, so there is no span to be sceptical of and
+ * nothing to weigh readings against each other with. Kept as a separate series
+ * from the estimate because they are different quantities: charting them as one
+ * line would show a step wherever the estimator happened to run.
+ */
+export function selectMeasuredBaseline(
+  samples: readonly BatteryHealthPoint[],
+): number | null {
+  let best: number | null = null
+  for (const s of samples) {
+    if (s.measuredCapacityKwh === null) continue
+    if (best === null || s.measuredCapacityKwh > best) best = s.measuredCapacityKwh
+  }
+  return best
+}
+
+/**
+ * The most recent point that actually carries the reading named by `has`.
+ *
+ * Not simply the last row in the window. Since migration 005 a row can exist
+ * for a day that has only the other kind of reading, and "the latest estimate"
+ * has to mean the latest ESTIMATE — otherwise the tile blanks on every day the
+ * car reported its pack energy and no charge happened, which is most days.
+ */
+function latestWith(
+  samples: readonly BatteryHealthPoint[],
+  has: (s: BatteryHealthPoint) => number | null,
+): BatteryHealthPoint | null {
+  for (let i = samples.length - 1; i >= 0; i--) {
+    const s = samples[i]
+    if (s && has(s) !== null) return s
+  }
+  return null
+}
+
+/**
+ * Percentage lost against a baseline, or null when that is not a claim we can
+ * make. Shared by both series so they cannot round or clamp differently.
+ */
+function lossPct(baseline: number | null, value: number | null): number | null {
+  if (baseline === null || value === null || baseline <= 0) return null
+  // Clamped at zero: a low-confidence estimate can exceed the baseline, and
+  // negative degradation is noise, not a battery that grew.
+  return round(Math.max(0, ((baseline - value) / baseline) * 100), 1)
 }
 
 /**
@@ -774,11 +1051,15 @@ export function degradationPct(
   baseline: number | null,
   latest: BatteryHealthPoint | null,
 ): number | null {
-  if (baseline === null || latest === null || baseline <= 0) return null
-  // Clamped at zero: a low-confidence estimate can exceed the baseline, and
-  // negative degradation is noise, not a battery that grew.
-  const pct = Math.max(0, ((baseline - latest.estimatedCapacityKwh) / baseline) * 100)
-  return round(pct, 1)
+  return lossPct(baseline, latest?.estimatedCapacityKwh ?? null)
+}
+
+/** The measured series' equivalent: latest measurement against the best one. */
+export function measuredDegradationPct(
+  baseline: number | null,
+  latest: BatteryHealthPoint | null,
+): number | null {
+  return lossPct(baseline, latest?.measuredCapacityKwh ?? null)
 }
 
 /**
@@ -789,14 +1070,13 @@ export function degradationPct(
  * the baseline is defined as the best ever seen — computing it from the window
  * would make the degradation figure change as the user pans the chart.
  *
- * ESTIMATES ONLY, for now. The same row now also carries the car's own
- * `measured_capacity_kwh`, written daily by ingest, and most days have that and
- * no estimate at all (an estimate needs a charge spanning 20 points of SoC).
- * Those rows would arrive here as points whose `estimatedCapacityKwh` is null
- * while `BatteryHealthPoint` says it is a number — the latest sample would blank
- * the capacity tile and turn the degradation figure into a NaN. Filtering them
- * out keeps this endpoint saying exactly what it said before; surfacing the
- * measurement is spec §3.8's job, and this WHERE is where that work starts.
+ * BOTH SERIES, since spec §3.8. Most rows now carry the car's own
+ * `measured_capacity_kwh` and no estimate at all — an estimate needs a charge
+ * spanning roughly twenty points of SoC — so the two are summarised separately
+ * (baseline, latest, degradation each twice) rather than merged into one line.
+ * Merging them would put a step in the chart wherever the estimator happened to
+ * run, and would make "degradation" mean two different measurements on two
+ * different days.
  */
 export async function getBatteryHealth(
   vehicleId: string,
@@ -807,10 +1087,10 @@ export async function getBatteryHealth(
   await assertVehicleExists(vehicleId, c)
   const { rows } = await c.query(
     `SELECT to_char(observed_on, 'YYYY-MM-DD') AS observed_on,
-            estimated_capacity_kwh, rated_range_at_100_km, sample_confidence
+            estimated_capacity_kwh, measured_capacity_kwh,
+            rated_range_at_100_km, sample_confidence
        FROM battery_health_sample
       WHERE vehicle_id = $1
-        AND estimated_capacity_kwh IS NOT NULL
       ORDER BY observed_on ASC`,
     [vehicleId],
   )
@@ -826,14 +1106,22 @@ export async function getBatteryHealth(
       (toKey === null || s.observedOn < toKey),
   )
 
+  // Both baselines come from `all`, not from the window: the reference is the
+  // best reading ever taken, and computing it from the window would make the
+  // degradation figure move as the user pans the chart.
   const baseline = selectBaseline(all)
-  const latest = samples[samples.length - 1] ?? null
+  const measuredBaseline = selectMeasuredBaseline(all)
+  const latest = latestWith(samples, (s) => s.estimatedCapacityKwh)
+  const lastMeasured = latestWith(samples, (s) => s.measuredCapacityKwh)
   return {
     vehicleId,
     samples,
     baselineCapacityKwh: baseline,
     latest,
     degradationPct: degradationPct(baseline, latest),
+    measuredBaselineCapacityKwh: measuredBaseline,
+    latestMeasured: lastMeasured,
+    measuredDegradationPct: measuredDegradationPct(measuredBaseline, lastMeasured),
   }
 }
 

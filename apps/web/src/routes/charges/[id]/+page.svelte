@@ -8,7 +8,9 @@
 		formatKw,
 		formatKwh,
 		formatPct,
+		formatText,
 		formatTime,
+		formatVolts,
 		hasCoords
 	} from '$lib/format.js'
 	import ChargeCurve from '$lib/components/ChargeCurve.svelte'
@@ -29,6 +31,23 @@
 	let showCost = $derived(s.costCurrency != null)
 
 	let located = $derived(hasCoords(s.startLat, s.startLon))
+
+	/**
+	 * What the car was plugged into (spec §3.8), read back from the samples
+	 * inside the session.
+	 *
+	 * null — not four dashes — when the car said nothing about the charger,
+	 * which is every charge recorded before the telemetry config asking for
+	 * these fields was accepted. A panel of em dashes reads as a broken page
+	 * rather than as a signal that has not arrived yet.
+	 */
+	let setup = $derived(data.detail.chargeSetup)
+
+	// 1-phase or 3-phase on AC; a DC charger reports no phases at all, which is
+	// a dash rather than "0-phase".
+	let phases = $derived(
+		setup?.chargerPhases == null ? DASH : `${setup.chargerPhases}-phase`
+	)
 </script>
 
 <svelte:head>
@@ -67,6 +86,26 @@
 			<StatTile label="Cost" value={formatCost(s.cost, s.costCurrency)} />
 		{/if}
 	</div>
+
+	{#if setup}
+		<section>
+			<div class="section-title">
+				<h2>Charging equipment</h2>
+				<span class="faint">as reported during this charge</span>
+			</div>
+			<div class="card pad">
+				<div class="tiles equipment">
+					<StatTile label="Supply voltage" value={formatVolts(setup.chargerVoltage)} />
+					<StatTile label="Phases" value={phases} />
+					<!-- The vendor's own enum names, verbatim: we have not observed
+					     most of these payloads, so a friendlier label would be a
+					     translation nothing can check. -->
+					<StatTile label="Charger" value={formatText(setup.fastChargerType)} />
+					<StatTile label="Cable" value={formatText(setup.chargingCableType)} />
+				</div>
+			</div>
+		</section>
+	{/if}
 
 	<section>
 		<div class="section-title">
@@ -120,6 +159,12 @@
 		grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
 		gap: 10px;
 		margin-bottom: 26px;
+	}
+
+	/* Inside a card, so the bottom margin the header tiles need would show as
+	   a gap under the last row. */
+	.tiles.equipment {
+		margin-bottom: 0;
 	}
 
 	section {

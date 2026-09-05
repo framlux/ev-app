@@ -1,5 +1,5 @@
 import type { VehicleChange } from '@ev/db'
-import type { VehicleWithState } from '$lib/api-types.js'
+import type { LiveVehicleWithState } from '$lib/api-types.js'
 
 /**
  * The fan-out: notifications in, rendered vehicle state out to open streams.
@@ -14,9 +14,19 @@ export interface LiveSubscriber {
 	send(event: string, data: unknown): void
 }
 
+/**
+ * The two reads, typed on the PROJECTED entry (spec §3.8).
+ *
+ * Not `VehicleWithState`: a full state is two hundred fields and every one of
+ * them would be serialised per notification and per snapshot. A full entry
+ * still satisfies this type, so the direction that matters — accidentally
+ * feeding the hub the unprojected query — is caught by the wiring test rather
+ * than by the compiler; what the compiler does enforce is that nothing
+ * downstream of the hub can read a field the stream does not carry.
+ */
 export interface HubDeps {
-	getVehicle(id: string): Promise<VehicleWithState>
-	listVehicles(): Promise<VehicleWithState[]>
+	getVehicle(id: string): Promise<LiveVehicleWithState>
+	listVehicles(): Promise<LiveVehicleWithState[]>
 	onError?(err: unknown): void
 }
 
@@ -69,7 +79,7 @@ export function createHub(deps: HubDeps): Hub {
 		deps.onError?.(err)
 	}
 
-	const broadcast = (entry: VehicleWithState): void => {
+	const broadcast = (entry: LiveVehicleWithState): void => {
 		if (subscribers.size > 0) stats.sent++
 		for (const sub of subscribers) {
 			try {

@@ -93,6 +93,38 @@ export const formatPressure = (v: Maybe): string =>
 export const formatKwh = (v: Maybe, dp = 2): string => unit(formatNumber(v, dp), 'kWh')
 export const formatKw = (v: Maybe, dp = 1): string => unit(formatNumber(v, dp), 'kW')
 
+/** Volts, likewise identical everywhere. Whole volts: the tenth is noise. */
+export const formatVolts = (v: Maybe, dp = 0): string => unit(formatNumber(v, dp), 'V')
+
+/**
+ * A vendor enum name, exactly as the car sent it.
+ *
+ * Enums are stored as the vendor's own string (design §2) and most of these
+ * payloads have never been observed, so mapping 'ACSingleWireCAN' onto
+ * something friendlier would be inventing a translation nothing can check —
+ * and a wrong one would be indistinguishable from a right one on screen. A
+ * blank string is a column written with nothing in it: not recorded.
+ */
+export function formatText(value: string | null | undefined): string {
+  if (value == null) return DASH
+  const trimmed = value.trim()
+  return trimmed === '' ? DASH : trimmed
+}
+
+/**
+ * A tri-state boolean. The third state is the reason this exists: a car that
+ * has not said whether Sentry is on is not a car with Sentry off, and
+ * `value ? on : off` would render every unreported flag as its negative.
+ */
+export function formatOnOff(
+  value: boolean | null | undefined,
+  on = 'On',
+  off = 'Off',
+): string {
+  if (value == null) return DASH
+  return value ? on : off
+}
+
 /** Percent. The value is already 0-100 in the contract, not 0-1. */
 export function formatPct(value: Maybe, dp = 0): string {
   const n = formatNumber(value, dp)

@@ -50,6 +50,16 @@ const V2 = 'web-test-v2'
  * be exercised over real rows because it is done by the SQL, not by Node.
  */
 const V3 = 'web-test-v3'
+/**
+ * A fourth car, for the columns spec §3.8 added: the charging equipment read
+ * back out of the samples inside a charge, and a battery day carrying only the
+ * car's own measurement.
+ *
+ * Separate from V1 because both need rows the existing assertions pin: a sample
+ * inside V1's charge window would become V1's latest sample, and a fourth
+ * battery day would break the baseline test's exact list.
+ */
+const V4 = 'web-test-v4'
 
 /** Start of the current UTC month: the window 002_partitions guarantees exists. */
 const BASE = (() => {
@@ -85,8 +95,9 @@ describe.skipIf(!hasDb)('read API against Postgres', () => {
 			`INSERT INTO vehicle (id, vendor, vendor_vehicle_id, display_name, model, model_year)
 			 VALUES ($1,'tesla','WEBVIN1','Zulu Blue','Model Y',2023),
 			        ($2,'tesla','WEBVIN2','Alpha Amber',NULL,NULL),
-			        ($3,'tesla','WEBVIN3','Mike Dense',NULL,NULL)`,
-			[V1, V2, V3]
+			        ($3,'tesla','WEBVIN3','Mike Dense',NULL,NULL),
+			        ($4,'tesla','WEBVIN4','Yankee Plug',NULL,NULL)`,
+			[V1, V2, V3, V4]
 		)
 
 		// Three samples. The middle one is deliberately all-null beyond ts to
@@ -138,6 +149,33 @@ describe.skipIf(!hasDb)('read API against Postgres', () => {
 			        ($1,'2026-03-01', 70.0, 450, 0.8)`,
 			[V1]
 		)
+
+		// V4: one charge, samples inside it carrying the charger columns, and
+		// two battery days of the kind ingest writes daily — a measurement with
+		// no qualifying charge to estimate from.
+		await p.query(
+			`INSERT INTO session (id, vehicle_id, kind, started_at, ended_at, is_open,
+			                      start_soc_pct, end_soc_pct, energy_kwh)
+			 VALUES ('web-test-c4',$1,'charge',$2,$3,false, 20, 80, 30.0)`,
+			[V4, at(0), at(60)]
+		)
+		await p.query(
+			`INSERT INTO sample (vehicle_id, ts, soc_pct, charger_voltage, charger_phases,
+			                     fast_charger_type, charging_cable_type)
+			 VALUES ($1,$2, 22, 232.4, 1, 'ACSingleWireCAN', 'IEC'),
+			        ($1,$3, 78, 231.9, 1, NULL, NULL),
+			        -- The sample after the car stopped drawing: the supply reads
+			        -- zero here, which is why the voltage is a max and not a last.
+			        ($1,$4, 80, 0, NULL, NULL, NULL)`,
+			[V4, at(5), at(40), at(59)]
+		)
+		await p.query(
+			`INSERT INTO battery_health_sample
+			   (vehicle_id, observed_on, measured_capacity_kwh, rated_range_at_100_km)
+			 VALUES ($1,'2026-01-01', 74.5, 460),
+			        ($1,'2026-02-01', 72.0, 450)`,
+			[V4]
+		)
 	})
 
 	afterAll(async () => {
@@ -148,10 +186,12 @@ describe.skipIf(!hasDb)('read API against Postgres', () => {
 	async function cleanup(): Promise<void> {
 		const p = getPool()
 		await p.query(`DELETE FROM session_point WHERE session_id LIKE 'web-test-%'`)
-		await p.query(`DELETE FROM session WHERE vehicle_id = ANY($1)`, [[V1, V2, V3]])
-		await p.query(`DELETE FROM battery_health_sample WHERE vehicle_id = ANY($1)`, [[V1, V2, V3]])
-		await p.query(`DELETE FROM sample WHERE vehicle_id = ANY($1)`, [[V1, V2, V3]])
-		await p.query(`DELETE FROM vehicle WHERE id = ANY($1)`, [[V1, V2, V3]])
+		await p.query(`DELETE FROM session WHERE vehicle_id = ANY($1)`, [[V1, V2, V3, V4]])
+		await p.query(`DELETE FROM battery_health_sample WHERE vehicle_id = ANY($1)`, [
+			[V1, V2, V3, V4]
+		])
+		await p.query(`DELETE FROM sample WHERE vehicle_id = ANY($1)`, [[V1, V2, V3, V4]])
+		await p.query(`DELETE FROM vehicle WHERE id = ANY($1)`, [[V1, V2, V3, V4]])
 	}
 
 	it('lists vehicles ordered by display name, including one that never reported', async () => {
@@ -333,6 +373,41 @@ describe.skipIf(!hasDb)('read API against Postgres', () => {
 		expect(res.baselineCapacityKwh).toBe(75)
 		expect(res.latest?.observedOn).toBe('2026-03-01')
 		expect(res.degradationPct).toBe(6.7)
+	})
+
+	it('reads back the charging equipment from the samples inside a charge', async () => {
+		// The SQL half only a real database answers: array_agg ... FILTER, and
+		// whether the four column names exist at all.
+		const detail = await getSessionDetail('web-test-c4')
+		expect(detail.chargeSetup).toEqual({
+			// 232, not 0: the last sample of the charge reads zero volts because
+			// the car has stopped drawing, and reporting that would say the
+			// charge ran at no voltage.
+			chargerVoltage: 232,
+			chargerPhases: 1,
+			fastChargerType: 'ACSingleWireCAN',
+			chargingCableType: 'IEC'
+		})
+	})
+
+	it('leaves a drive with no charging equipment at all', async () => {
+		expect((await getSessionDetail('web-test-d1')).chargeSetup).toBeNull()
+	})
+
+	it('serves a battery day that carries only the measurement', async () => {
+		// Every column of migration 005, through the real query: the two dropped
+		// NOT NULLs and `measured_capacity_kwh`.
+		const res = await getBatteryHealth(V4, {})
+		expect(res.samples.map((s) => s.observedOn)).toEqual(['2026-01-01', '2026-02-01'])
+		expect(res.samples[0]?.estimatedCapacityKwh).toBeNull()
+		expect(res.samples[0]?.sampleConfidence).toBeNull()
+		// No estimate anywhere, so the estimate series stays empty rather than
+		// borrowing the measurement.
+		expect(res.baselineCapacityKwh).toBeNull()
+		expect(res.latest).toBeNull()
+		expect(res.measuredBaselineCapacityKwh).toBe(74.5)
+		expect(res.latestMeasured?.observedOn).toBe('2026-02-01')
+		expect(res.measuredDegradationPct).toBe(3.4)
 	})
 
 	it('reports a known vehicle with no estimates as an empty trend', async () => {

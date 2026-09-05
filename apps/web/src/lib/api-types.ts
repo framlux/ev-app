@@ -26,6 +26,7 @@ import type {
   ChargeState,
   PowerState,
   SessionKind,
+  VehicleSample,
   Vendor,
 } from '@ev/core'
 
@@ -57,34 +58,105 @@ export interface Vehicle {
 }
 
 /**
+ * A contract value for a `VehicleSample` value.
+ *
+ * The sample model is the vendor-neutral truth; this is what survives
+ * `JSON.stringify` on the way to a browser. Only `Date` differs — JSON has no
+ * date type, and the server/client boundary would turn one into a string
+ * anyway, so the contract says so out loud (rule 1 at the top of this file).
+ */
+type Wire<T> = T extends Date ? string : T
+
+/**
+ * Every catalogued column of `sample`, camel-cased, minus the primary key —
+ * which `VehicleState` restates with `ts` as an ISO string.
+ *
+ * DERIVED, not written out. There are two hundred columns and @ev/core's
+ * catalogue is what the migration, the insert and the normaliser are all built
+ * from; a hand-maintained copy here would be free to disagree with the row it
+ * is describing, and the disagreement would surface as a field that is silently
+ * always null. Adding a column to the catalogue adds it here for free.
+ */
+type SampleFields = {
+  [K in Exclude<keyof VehicleSample, 'vehicleId' | 'ts'>]: Wire<VehicleSample[K]>
+}
+
+/**
  * The latest `sample` row for a vehicle, camel-cased.
  *
  * This is a snapshot of one row, not a merge of the most recent non-null value
  * per field: merging would let the map show a position from yesterday beside a
  * SoC from now, with nothing in the payload saying so. `ts` therefore dates
  * every field in the object at once.
+ *
+ * Every field but `vehicleId` and `ts` is nullable and most of them ARE null:
+ * the car reports a signal only once it has something to say about it, and a
+ * column exists from the day the migration ran rather than from the day the
+ * value first arrived. Rendering null as 0 here would invent readings.
  */
-export interface VehicleState {
+export interface VehicleState extends SampleFields {
   vehicleId: string
   ts: string
-  socPct: number | null
-  rangeKm: number | null
-  odometerKm: number | null
-  lat: number | null
-  lon: number | null
-  speedKph: number | null
-  powerState: PowerState | null
-  chargeState: ChargeState | null
-  chargePowerKw: number | null
-  chargeEnergyAddedKwh: number | null
-  insideTempC: number | null
-  outsideTempC: number | null
-  locked: boolean | null
-  doorsOpen: boolean | null
-  /** Keys are wheel positions 'fl' | 'fr' | 'rl' | 'rr'; values are bar. A
-   *  vendor that reports only some wheels yields a partial object, not zeros. */
-  tpms: Record<string, number> | null
 }
+
+/**
+ * What the SSE stream sends instead of the whole row.
+ *
+ * `VehicleState` is ~204 fields. The stream sends one per notification and one
+ * per vehicle in every snapshot, to every open tab — so a parked car with a
+ * page open would push a few kilobytes every couple of seconds to render a
+ * dozen numbers, and none of that cost would show up in a test. This list is
+ * what the pages that render a LIVE entry actually read: the garage card, the
+ * vehicle overview's tiles, and the fields `deriveActivity` decides the pill
+ * from. The REST endpoints keep returning everything.
+ *
+ * The rule for adding one: put a field here when a page renders it from the
+ * live entry, and NOT because it might be interesting. Anything else stays
+ * reachable through /api/v1/vehicles/[id]/samples?fields=… and the state
+ * endpoint. `test/live-projection.test.ts` fails if a live page reads a field
+ * this list does not carry — the failure mode being a tile that paints once on
+ * load and then blanks the moment the car reports.
+ */
+export const LIVE_STATE_FIELDS = [
+  // Identity and age. The client store dedupes on the first and orders on the
+  // second, so neither is optional.
+  'vehicleId',
+  'ts',
+  // The 17 the stream carried before this list existed: the garage card, the
+  // gauge, the map marker and the pill.
+  'socPct',
+  'rangeKm',
+  'odometerKm',
+  'lat',
+  'lon',
+  'speedKph',
+  'powerState',
+  'chargeState',
+  'chargePowerKw',
+  'chargeEnergyAddedKwh',
+  'insideTempC',
+  'outsideTempC',
+  'locked',
+  'doorsOpen',
+  'tpms',
+  // Spec §3.8's overview tiles.
+  'gear',
+  'chargeLimitSoc',
+  'chargePortDoorOpen',
+  'chargePortLatch',
+  'hvacPower',
+  'hvacAcEnabled',
+  'cabinOverheatProtectionMode',
+  'sentryMode',
+  'version',
+  'softwareUpdateAvailable',
+  'softwareUpdateVersion',
+] as const satisfies readonly (keyof VehicleState)[]
+
+export type LiveStateField = (typeof LIVE_STATE_FIELDS)[number]
+
+/** A `VehicleState` narrowed to `LIVE_STATE_FIELDS`. */
+export type LiveVehicleState = Pick<VehicleState, LiveStateField>
 
 /**
  * What the garage renders per car: the status pill, not just a word.
@@ -114,6 +186,23 @@ export interface VehicleWithState {
   activity: VehicleActivity
   /** The id of the currently open drive/charge session, for deep-linking the
    *  status pill. null whenever `activity` is not 'driving' or 'charging'. */
+  openSessionId: string | null
+}
+
+/**
+ * A garage entry as the LIVE STREAM sends it: everything but the state, which
+ * is projected (`LIVE_STATE_FIELDS`).
+ *
+ * Note the direction of assignability, which is what makes this workable: a
+ * full `VehicleWithState` satisfies this type, so a component typed on it
+ * renders both the load-time entry and the streamed one. The reverse does not
+ * hold, which is exactly the compile error we want when a page reads a field
+ * the stream does not carry.
+ */
+export interface LiveVehicleWithState {
+  vehicle: Vehicle
+  state: LiveVehicleState | null
+  activity: VehicleActivity
   openSessionId: string | null
 }
 
@@ -194,6 +283,27 @@ export interface SessionPointDto {
   powerKw: number | null
 }
 
+/**
+ * What the car was plugged into, for a charge session (spec §3.8).
+ *
+ * Read from the samples inside the session's own window rather than stored on
+ * the session row: these are `sample` columns, and the segmenter does not
+ * summarise them. Every field is independently nullable — the car reports the
+ * cable type long before it reports a voltage on a slow AC charge — and the
+ * whole object is null when it said nothing at all, which is the normal case
+ * until the telemetry config asking for these fields is accepted.
+ */
+export interface ChargeSetup {
+  /** Supply voltage, the highest seen during the session. 0 dp. */
+  chargerVoltage: number | null
+  /** 1 or 3 on AC; absent on DC. */
+  chargerPhases: number | null
+  /** Tesla's own name for the charger, verbatim (e.g. 'Supercharger'). */
+  fastChargerType: string | null
+  /** Tesla's own name for the cable, verbatim. */
+  chargingCableType: string | null
+}
+
 export interface SessionDetail {
   session: SessionListItem
   /** Ascending by ts. Empty for an idle, and possibly empty for a session
@@ -205,6 +315,9 @@ export interface SessionDetail {
    * should say so rather than implying the car stopped reporting.
    */
   downsampled: boolean
+  /** Charges only, and null unless the car reported something about the
+   *  charger. Always null for a drive or an idle — there was no charger. */
+  chargeSetup: ChargeSetup | null
 }
 
 /**
@@ -222,18 +335,32 @@ export interface SessionListResponse {
  * Battery health
  * ------------------------------------------------------------------ */
 
+/**
+ * One day of battery health, carrying up to two independent readings.
+ *
+ * The estimate is INFERRED from a charge session; the measurement is the car's
+ * own `NominalFullPackEnergyKwh`, written once a day (spec §3.7). Most days
+ * have the measurement and no estimate — an estimate needs a charge spanning
+ * roughly twenty points of state of charge — so both are nullable and a
+ * consumer must handle a point that carries only one of them. Which value is
+ * present is what says which kind of reading it is; there is no `source` field.
+ */
 export interface BatteryHealthPoint {
   /** Calendar date, 'YYYY-MM-DD'. One row per day at most. */
   observedOn: string
-  /** 2 dp. */
-  estimatedCapacityKwh: number
+  /** Inferred from a charge session. 2 dp. null on a day no charge qualified. */
+  estimatedCapacityKwh: number | null
+  /** The car's own figure for a full pack. 2 dp. null before ingest recorded
+   *  one for that day, which is every day before this feature shipped. */
+  measuredCapacityKwh: number | null
   ratedRangeAt100Km: number | null
   /**
    * 0..1, from the SoC span the estimate was drawn from. A narrow charge is a
    * weaker data point; charts carry this as point opacity so the trend does
-   * not present every estimate as equally trustworthy.
+   * not present every estimate as equally trustworthy. null exactly when
+   * `estimatedCapacityKwh` is: a measurement has no span to be confident about.
    */
-  sampleConfidence: number
+  sampleConfidence: number | null
 }
 
 export interface BatteryHealthResponse {
@@ -247,7 +374,9 @@ export interface BatteryHealthResponse {
    * figure. null when no sample clears the confidence floor.
    */
   baselineCapacityKwh: number | null
-  /** The most recent point, or null when there are none. */
+  /** The most recent point that carries an ESTIMATE, or null when there are
+   *  none. Not simply the last row: a day can carry only a measurement, and
+   *  "the latest estimate" would otherwise blank on most days. */
   latest: BatteryHealthPoint | null
   /**
    * Percentage lost against `baselineCapacityKwh`, 1 dp, never negative
@@ -255,6 +384,21 @@ export interface BatteryHealthResponse {
    * a latest sample exist — a single measurement is not a trend.
    */
   degradationPct: number | null
+  /**
+   * The same three, for the car's own measurement (spec §3.7/§3.8).
+   *
+   * Kept as a separate series rather than merged with the estimate: they are
+   * different quantities measured different ways, and a chart that mixed them
+   * would show a step every time the estimator happened to run. There is still
+   * no manufacturer figure in this database, so "new" is again the best
+   * reading ever taken and not a nameplate capacity.
+   */
+  measuredBaselineCapacityKwh: number | null
+  /** The most recent point that carries a measurement, or null. */
+  latestMeasured: BatteryHealthPoint | null
+  /** 1 dp, never negative. null unless both a measured baseline and a latest
+   *  measurement exist. */
+  measuredDegradationPct: number | null
 }
 
 /* ------------------------------------------------------------------ *

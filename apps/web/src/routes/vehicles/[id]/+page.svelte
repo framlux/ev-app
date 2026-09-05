@@ -11,11 +11,13 @@
 		formatKw,
 		formatKwh,
 		formatOdometer,
+		formatOnOff,
 		formatPct,
 		formatPressure,
 		formatRelative,
 		formatSpeed,
 		formatTemp,
+		formatText,
 		hasCoords
 	} from '$lib/format.js'
 	import BatteryGauge from '$lib/components/BatteryGauge.svelte'
@@ -48,6 +50,35 @@
 	let tyres = $derived(
 		s?.tpms ? WHEELS.filter(([k]) => typeof s!.tpms![k] === 'number') : []
 	)
+
+	/* ---------------------------------------------------------------- *
+	 * The tiles spec §3.8 added.
+	 *
+	 * Every one of these is null until the car is asked for the signal and
+	 * answers, which is the state for the first weeks after this ships — so
+	 * each hint is null rather than a sentence about a value we do not have,
+	 * and each value goes through a formatter that dashes rather than
+	 * inventing a default. `false` and "not reported" are different facts
+	 * about a car and the difference is the whole point of the tri-state
+	 * formatters.
+	 * ---------------------------------------------------------------- */
+
+	let softwareHint = $derived.by(() => {
+		if (s?.softwareUpdateAvailable == null) return null
+		if (!s.softwareUpdateAvailable) return 'up to date'
+		return s.softwareUpdateVersion ? `${s.softwareUpdateVersion} available` : 'update available'
+	})
+
+	let portHint = $derived(s?.chargePortLatch ? `latch ${s.chargePortLatch}` : null)
+
+	// The AC state and cabin overheat protection ride along with the climate
+	// tile: three tiles for one subsystem would crowd out everything else.
+	let climateHint = $derived.by(() => {
+		const parts: string[] = []
+		if (s?.hvacAcEnabled != null) parts.push(s.hvacAcEnabled ? 'A/C on' : 'A/C off')
+		if (s?.cabinOverheatProtectionMode) parts.push(`overheat ${s.cabinOverheatProtectionMode}`)
+		return parts.length > 0 ? parts.join(' · ') : null
+	})
 
 	// The chart is decimated a second time on the way in: the API caps a series
 	// at 5000 rows, which is far more vertices than a 720-unit-wide SVG needs.
@@ -137,6 +168,19 @@
 					value={s.locked == null ? DASH : s.locked ? 'Locked' : 'Unlocked'}
 					hint={s.doorsOpen == null ? null : s.doorsOpen ? 'A door is open' : 'Doors closed'}
 				/>
+			</div>
+
+			<div class="tiles">
+				<StatTile label="Gear" value={formatText(s.gear)} />
+				<StatTile label="Charge limit" value={formatPct(s.chargeLimitSoc)} />
+				<StatTile
+					label="Charge port"
+					value={formatOnOff(s.chargePortDoorOpen, 'Open', 'Closed')}
+					hint={portHint}
+				/>
+				<StatTile label="Climate" value={formatText(s.hvacPower)} hint={climateHint} />
+				<StatTile label="Sentry" value={formatText(s.sentryMode)} />
+				<StatTile label="Software" value={formatText(s.version)} hint={softwareHint} />
 			</div>
 
 			{#if tyres.length > 0}

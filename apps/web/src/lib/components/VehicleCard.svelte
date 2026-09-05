@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { VehicleWithState } from '$lib/api-types.js'
+	import type { LiveVehicleWithState } from '$lib/api-types.js'
 	import { DASH, formatOdometer, formatRelative, formatTemp } from '$lib/format.js'
 	import { hasCoords } from '$lib/format.js'
 	import ActivityPill from './ActivityPill.svelte'
@@ -7,7 +7,11 @@
 	import Map from './Map.svelte'
 
 	interface Props {
-		entry: VehicleWithState
+		/** The PROJECTED entry, because the garage renders a streamed one and a
+		 *  loaded one through the same component. A full `VehicleWithState`
+		 *  satisfies this; reading a field outside `LIVE_STATE_FIELDS` here does
+		 *  not compile, which is the point. */
+		entry: LiveVehicleWithState
 	}
 
 	let { entry }: Props = $props()

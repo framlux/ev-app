@@ -5,7 +5,7 @@ import {
 	type ChangeListener
 } from '@ev/db'
 import { createHub, type Hub } from './live.js'
-import { getVehicle, listVehicles } from './queries.js'
+import { getVehicleLive, listVehiclesLive } from './queries.js'
 
 /**
  * The process-wide bridge from Postgres notifications to open streams.
@@ -25,9 +25,14 @@ let listener: ChangeListener | undefined
 export function getLiveHub(): Hub {
 	if (hub) return hub
 
+	// The PROJECTED queries, not the REST ones (spec §3.8). A full VehicleState
+	// is ~204 fields and this hub sends one per notification and one per vehicle
+	// per snapshot, to every open tab; the pages that render a streamed entry
+	// read about thirty of them. Swapping these back for getVehicle/listVehicles
+	// would still pass every test about what the pages show.
 	hub = createHub({
-		getVehicle: (id) => getVehicle(id),
-		listVehicles: async () => (await listVehicles()).vehicles,
+		getVehicle: (id) => getVehicleLive(id),
+		listVehicles: () => listVehiclesLive(),
 		onError: (err) => console.error('live hub', err)
 	})
 

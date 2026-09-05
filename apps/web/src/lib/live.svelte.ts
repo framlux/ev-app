@@ -1,4 +1,4 @@
-import type { VehicleWithState } from '$lib/api-types.js'
+import type { LiveVehicleWithState } from '$lib/api-types.js'
 
 /**
  * The browser's end of the live stream. One EventSource for the whole app.
@@ -57,7 +57,11 @@ export interface LiveStoreOptions {
 }
 
 export interface LiveStore {
-	readonly vehicles: Record<string, VehicleWithState>
+	/** PROJECTED entries (spec §3.8): the stream carries `LIVE_STATE_FIELDS`,
+	 *  not the whole sample row. A component that renders one of these and a
+	 *  loaded `VehicleWithState` interchangeably — which is every one of them —
+	 *  must be typed on this, the weaker of the two. */
+	readonly vehicles: Record<string, LiveVehicleWithState>
 	readonly connection: ConnectionState
 	/** When the last VEHICLE update landed. Heartbeats do not move this: they
 	 *  prove the stream is alive, not that the car said anything.
@@ -72,7 +76,7 @@ export interface LiveStore {
 	readonly clock: number
 	start(): void
 	stop(): void
-	get(id: string): VehicleWithState | undefined
+	get(id: string): LiveVehicleWithState | undefined
 }
 
 export function createLiveStore(opts: LiveStoreOptions = {}): LiveStore {
@@ -87,7 +91,7 @@ export function createLiveStore(opts: LiveStoreOptions = {}): LiveStore {
 	const probe = opts.probe ?? (async () => (await fetch('/api/v1/vehicles')).status)
 	const redirect = opts.redirect ?? ((to: string) => { window.location.href = to })
 
-	let vehicles = $state<Record<string, VehicleWithState>>({})
+	let vehicles = $state<Record<string, LiveVehicleWithState>>({})
 	let connection = $state<ConnectionState>('connecting')
 	let lastEventAt = $state<number | null>(null)
 	let clock = $state(0)
@@ -134,7 +138,7 @@ export function createLiveStore(opts: LiveStoreOptions = {}): LiveStore {
 		next.addEventListener('vehicle', (e) => {
 			alive()
 			try {
-				const entry = JSON.parse((e as MessageEvent).data) as VehicleWithState
+				const entry = JSON.parse((e as MessageEvent).data) as LiveVehicleWithState
 				const id = entry?.vehicle?.id
 				if (!id) return
 				// Never go backwards in time.
