@@ -135,4 +135,45 @@ describe.skipIf(!hasDb)('migrations', () => {
       `SELECT to_regclass('sample_' || to_char(CURRENT_DATE,'YYYY_MM')) AS t`)
     expect(rows[0]?.t).not.toBeNull()
   })
+
+  /**
+   * Spec §3.7's cached status. Asserted here rather than against `006`'s text
+   * for the reason at the top of migration-004.test.ts: a migration is applied
+   * history, and what matters is the schema that came out of it.
+   *
+   * Two things are load-bearing and neither fails loudly if it is missing. The
+   * FK is what stops a status row outliving the vehicle it describes — the
+   * page reads this table with no Tesla session at all, so an orphan would
+   * render as telemetry facts about a car nobody owns rather than as an error.
+   * And every column but the key is nullable BECAUSE either half of the flow
+   * can create the row first: a push on day one knows `pushed_at` and nothing
+   * about what the car has applied, and a `synced` defaulted to false there
+   * would report "the car says no" when the truth is "nobody has asked yet".
+   */
+  it('creates telemetry_status, one nullable row per vehicle', async () => {
+    const p = getPool()
+    const { rows } = await p.query<{
+      column_name: string, data_type: string, is_nullable: string,
+    }>(
+      `SELECT column_name, data_type, is_nullable FROM information_schema.columns
+       WHERE table_name = 'telemetry_status' ORDER BY ordinal_position`)
+
+    expect(rows.map((r) => `${r.column_name}: ${r.data_type}`)).toEqual([
+      'vehicle_id: text',
+      'synced: boolean',
+      'field_count: integer',
+      'ca_present: boolean',
+      'firmware: text',
+      'key_paired: boolean',
+      'streaming_enabled: boolean',
+      'checked_at: timestamp with time zone',
+      'pushed_at: timestamp with time zone',
+    ])
+    expect(rows.filter((r) => r.is_nullable === 'NO').map((r) => r.column_name))
+      .toEqual(['vehicle_id'])
+
+    await expect(
+      p.query(`INSERT INTO telemetry_status (vehicle_id) VALUES ('no-such-vehicle')`),
+    ).rejects.toThrow(/foreign key/)
+  })
 })

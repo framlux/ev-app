@@ -15,6 +15,10 @@ import {
 import { recordMeasuredCapacity, upsertBatteryHealth } from '../src/repo/battery.js'
 import { advanceCursor, readCursor } from '../src/repo/cursor.js'
 import { notifyVehicleChanged, VEHICLE_CHANGED_CHANNEL } from '../src/repo/notify.js'
+import {
+  readTelemetryStatus, recordTelemetryCheck, recordTelemetryPush,
+  type TelemetryCheck,
+} from '../src/repo/telemetry-status.js'
 
 /**
  * The repository layer against a real Postgres. These exist because the ingest
@@ -53,6 +57,13 @@ function sampleValue(c: SampleColumn): unknown {
 }
 
 const VEHICLE = 'repo-test-v1'
+/**
+ * A second car that never gets checked, only pushed to. It exists because the
+ * telemetry-status tests below must not depend on the order vitest happens to
+ * run them in: "a push creates the row" is only a test of anything on a
+ * vehicle whose row does not already exist.
+ */
+const VEHICLE_UNCHECKED = 'repo-test-v2'
 const TS = new Date('2026-09-04T10:00:00.000Z')
 
 const summary = (over: Partial<SessionSummary> = {}): SessionSummary => ({
@@ -100,6 +111,10 @@ describe.skipIf(!hasDb)('repositories', () => {
       await ensureVehicle(c, {
         id: VEHICLE, vendor: 'tesla', vendorVehicleId: 'VIN-REPO', displayName: 'Repo',
       })
+      await ensureVehicle(c, {
+        id: VEHICLE_UNCHECKED, vendor: 'tesla',
+        vendorVehicleId: 'VIN-REPO-2', displayName: 'Repo 2',
+      })
     })
   }, 60_000)
 
@@ -110,7 +125,9 @@ describe.skipIf(!hasDb)('repositories', () => {
     await p.query('DELETE FROM raw_message WHERE vehicle_id=$1', [VEHICLE])
     await p.query('DELETE FROM battery_health_sample WHERE vehicle_id=$1', [VEHICLE])
     await p.query('DELETE FROM ingest_cursor WHERE source=$1', ['repo-test'])
-    await p.query('DELETE FROM vehicle WHERE id=$1', [VEHICLE])
+    await p.query('DELETE FROM telemetry_status WHERE vehicle_id = ANY($1)',
+      [[VEHICLE, VEHICLE_UNCHECKED]])
+    await p.query('DELETE FROM vehicle WHERE id = ANY($1)', [[VEHICLE, VEHICLE_UNCHECKED]])
     await closePool()
   })
 
@@ -488,5 +505,102 @@ describe.skipIf(!hasDb)('repositories', () => {
     // that followed it back would deliver into a later test's client.
     await listener.query('UNLISTEN *')
     listener.release()
+  })
+
+  /**
+   * Spec §3.7's cached status. It is written by two different callers with two
+   * different sets of facts — a check knows what the car has applied, a push
+   * knows only that it sent something — and read by a page that runs with no
+   * Tesla session at all. So the three things worth proving against a real
+   * Postgres are that a write survives the round trip, that the two writers do
+   * not erase each other, and that day one reads as "nothing known" rather
+   * than throwing.
+   */
+  describe('the cached telemetry status', () => {
+    const CHECKED = new Date('2026-09-05T12:00:00.000Z')
+    const LATER = new Date('2026-09-05T13:00:00.000Z')
+    const PUSHED = new Date('2026-09-05T12:30:00.000Z')
+
+    const check = (over: Partial<TelemetryCheck> = {}): TelemetryCheck => ({
+      vehicleId: VEHICLE, synced: false, fieldCount: 7, caPresent: true,
+      firmware: '2026.8.1', keyPaired: true, streamingEnabled: true,
+      checkedAt: CHECKED, ...over,
+    })
+
+    // Day one, and every day after a `vehicle` row is created by ingestion
+    // before anyone opens the settings page. The page renders "never checked"
+    // from this; a throw here would be an error page instead.
+    it('reads null for a vehicle that has never been checked', async () => {
+      const row = await withTransaction(getPool(), (c) =>
+        readTelemetryStatus(c, 'repo-test-never-checked'))
+      expect(row).toBeNull()
+    })
+
+    it('round-trips a check and overwrites it with the next one', async () => {
+      await withTransaction(getPool(), (c) => recordTelemetryCheck(c, check()))
+      const first = await withTransaction(getPool(), (c) =>
+        readTelemetryStatus(c, VEHICLE))
+      expect(first).toEqual({
+        vehicleId: VEHICLE, synced: false, fieldCount: 7, caPresent: true,
+        firmware: '2026.8.1', keyPaired: true, streamingEnabled: true,
+        checkedAt: CHECKED, pushedAt: null,
+      })
+
+      // The car applied the config an hour later. One row per vehicle, so the
+      // second check must replace the first rather than accumulate: the page
+      // shows "the" status and its age, not a history.
+      await withTransaction(getPool(), (c) => recordTelemetryCheck(c, check({
+        synced: true, fieldCount: 9, firmware: '2026.8.2', checkedAt: LATER,
+      })))
+      const { rows } = await getPool().query(
+        'SELECT * FROM telemetry_status WHERE vehicle_id=$1', [VEHICLE])
+      expect(rows).toHaveLength(1)
+      const second = await withTransaction(getPool(), (c) =>
+        readTelemetryStatus(c, VEHICLE))
+      expect(second?.synced).toBe(true)
+      expect(second?.fieldCount).toBe(9)
+      expect(second?.firmware).toBe('2026.8.2')
+      expect(second?.checkedAt?.toISOString()).toBe(LATER.toISOString())
+    })
+
+    // The two writers, interleaved. `synced` staying false after a push is the
+    // normal case (§5: the car applies on its own schedule), and the page can
+    // only say so if `pushed_at` and the check facts survive each other.
+    it('keeps the check facts and the push time out of each other\'s way', async () => {
+      await withTransaction(getPool(), async (c) => {
+        await recordTelemetryCheck(c, check())
+        await recordTelemetryPush(c, VEHICLE, PUSHED)
+      })
+      const afterPush = await withTransaction(getPool(), (c) =>
+        readTelemetryStatus(c, VEHICLE))
+      expect(afterPush?.pushedAt?.toISOString()).toBe(PUSHED.toISOString())
+      expect(afterPush?.fieldCount).toBe(7)
+      expect(afterPush?.checkedAt?.toISOString()).toBe(CHECKED.toISOString())
+
+      // And the check that follows a push must not forget that a push happened
+      // — losing `pushed_at` here would make the page offer the same push again.
+      await withTransaction(getPool(), (c) => recordTelemetryCheck(c, check({
+        synced: true, checkedAt: LATER,
+      })))
+      const afterCheck = await withTransaction(getPool(), (c) =>
+        readTelemetryStatus(c, VEHICLE))
+      expect(afterCheck?.pushedAt?.toISOString()).toBe(PUSHED.toISOString())
+      expect(afterCheck?.synced).toBe(true)
+    })
+
+    // Push first, check never: the row has to come into existence from the
+    // push alone, with everything it cannot know left null rather than
+    // defaulted into a claim about the car.
+    it('creates the row from a push alone, with the unobserved facts null', async () => {
+      await withTransaction(getPool(), (c) =>
+        recordTelemetryPush(c, VEHICLE_UNCHECKED, PUSHED))
+      const row = await withTransaction(getPool(), (c) =>
+        readTelemetryStatus(c, VEHICLE_UNCHECKED))
+      expect(row).toEqual({
+        vehicleId: VEHICLE_UNCHECKED, synced: null, fieldCount: null,
+        caPresent: null, firmware: null, keyPaired: null,
+        streamingEnabled: null, checkedAt: null, pushedAt: PUSHED,
+      })
+    })
   })
 })
