@@ -8,8 +8,17 @@ COPY pnpm-workspace.yaml package.json pnpm-lock.yaml tsconfig.base.json .npmrc .
 COPY packages/ packages/
 COPY apps/web/ apps/web/
 RUN pnpm install --frozen-lockfile
-RUN pnpm --filter @ev/core build
-RUN pnpm --filter @ev/web build
+# `@ev/web...` means "this package AND its workspace dependencies", which is the
+# whole point: naming @ev/core alone was correct only while the web app imported
+# nothing else. It now queries Postgres through @ev/db, and a workspace package
+# resolves to its dist/, so an unbuilt dependency fails at BUNDLE time with
+# "Cannot find package '/app/apps/web/node_modules/@ev/db/dist/index.js'" - a
+# message that reads like a broken install rather than a missing build step.
+#
+# The dependency-aware form does not need editing again the next time the web app
+# takes on another workspace package, which is the failure this actually is: the
+# build worked for months and broke when an import was added somewhere else.
+RUN pnpm --filter @ev/web... build
 
 FROM node:22-alpine AS runtime
 WORKDIR /app
