@@ -26,6 +26,25 @@ pass()  { printf '   \033[32mPASS\033[0m %s\n' "$1"; }
 fail()  { printf '   \033[31mFAIL\033[0m %s\n' "$1"; FAILED=1; }
 info()  { printf '        %s\n' "$1"; }
 
+# Dependency preflight. This is likely to run on a k3s host rather than a
+# workstation, where python3 in particular is not a safe assumption. Checked up
+# front so a missing tool is reported as a missing tool, rather than as an
+# empty variable four steps later.
+for bin in kubectl curl base64; do
+  command -v "$bin" >/dev/null || { echo "required command not found: $bin" >&2; exit 2; }
+done
+
+# Extracts a top-level string field from compact JSON. Tesla's token endpoint
+# returns exactly that shape, so the grep fallback is safe here - it is not a
+# general JSON parser and should not be reused as one.
+jsonstr() { # $1 = field, stdin = json
+  if command -v python3 >/dev/null; then
+    python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1],""))' "$1"
+  else
+    grep -o "\"$1\":\"[^\"]*\"" | head -1 | cut -d'"' -f4
+  fi
+}
+
 TMP=$(mktemp -d)
 cleanup() {
   rm -rf "$TMP"
@@ -83,18 +102,44 @@ if ! curl -sS -X POST https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token 
       -d refresh_token="$REFRESH_TOKEN" -o "$TMP/tok.json"; then
   fail "token refresh request failed"; exit 1
 fi
-if ! ACCESS=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["access_token"])' "$TMP/tok.json" 2>/dev/null); then
+ACCESS=$(jsonstr access_token < "$TMP/tok.json")
+if [ -z "$ACCESS" ]; then
   fail "no access_token in refresh response"
   sed 's/^/        /' "$TMP/tok.json"; exit 1
 fi
+# Absence of a refresh_token here would mean offline_access was never granted -
+# the integration would work today and stop overnight.
+[ -n "$(jsonstr refresh_token < "$TMP/tok.json")" ] \
+  || info "WARNING: no refresh_token in response - offline_access may not be granted"
 printf '%s' "$ACCESS" > "$TMP/token"
 pass "minted an access token from the sealed refresh token"
-python3 - "$TMP/tok.json" <<'EOF' || true
-import base64, json, sys
-d = json.load(open(sys.argv[1]))
-c = json.loads(base64.urlsafe_b64decode(d["access_token"].split(".")[1] + "=="))
-print("        scopes:", " ".join(sorted(c.get("scp", []))) or "(none)")
-EOF
+# Decode the JWT payload to show the granted scopes.
+#
+# base64url differs from base64 in two characters and in dropping padding, so
+# both are restored before decoding; without that, base64 -d fails on most
+# tokens rather than on none, which would look intermittent.
+CLAIMS=$(printf '%s' "$ACCESS" | cut -d. -f2 | tr '_-' '/+')
+case $(( ${#CLAIMS} % 4 )) in 2) CLAIMS="$CLAIMS==" ;; 3) CLAIMS="$CLAIMS=" ;; esac
+CLAIMS_JSON=$(printf '%s' "$CLAIMS" | base64 -d 2>/dev/null || true)
+
+if command -v python3 >/dev/null; then
+  SCOPES=$(printf '%s' "$CLAIMS_JSON" \
+    | python3 -c 'import json,sys; print(" ".join(sorted(json.load(sys.stdin).get("scp",[]))))' 2>/dev/null || true)
+else
+  # Deliberately does NOT split on commas first: the scp array is itself
+  # comma-separated, so doing that destroys the thing being matched. That was
+  # the bug in the first version of this - it silently produced an empty result
+  # and reported the scopes as undecodable on a perfectly good token.
+  SCOPES=$(printf '%s' "$CLAIMS_JSON" \
+    | sed -n 's/.*"scp":[[:space:]]*\[\([^]]*\)\].*/\1/p' | tr -d '" ' | tr ',' ' ')
+fi
+
+info "scopes: ${SCOPES:-(could not decode)}"
+case " $SCOPES " in
+  *" vehicle_cmds "*) info "vehicle_cmds present - commands can be added without reconsent" ;;
+  "  ")               info "scopes not decodable; not treating that as a scope failure" ;;
+  *)                  fail "vehicle_cmds NOT granted - not fixable without redoing consent" ;;
+esac
 
 # ------------------------------------------------------------- 5. end to end
 step "5. Reaching the proxy and Tesla through it"
