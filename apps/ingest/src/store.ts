@@ -8,6 +8,7 @@ import {
   insertSample,
   notifyVehicleChanged,
   openSession,
+  recordMeasuredCapacity,
   upsertBatteryHealth,
   withTransaction,
   type DbClient,
@@ -59,6 +60,7 @@ export function storeOn(client: DbClient, cursorSource: string): Store {
     appendPoint: (sessionId, s) => appendPoint(client, sessionId, s),
     closeSession: (sessionId, summary) => closeSession(client, sessionId, summary),
     recordBatteryHealth: (row) => upsertBatteryHealth(client, row),
+    recordMeasuredCapacity: (row) => recordMeasuredCapacity(client, row),
     advanceCursor: (at) => advanceCursor(client, cursorSource, at),
   }
 }

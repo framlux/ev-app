@@ -788,6 +788,15 @@ export function degradationPct(
  * most one row per vehicle per day, so a decade is a few thousand rows, and
  * the baseline is defined as the best ever seen — computing it from the window
  * would make the degradation figure change as the user pans the chart.
+ *
+ * ESTIMATES ONLY, for now. The same row now also carries the car's own
+ * `measured_capacity_kwh`, written daily by ingest, and most days have that and
+ * no estimate at all (an estimate needs a charge spanning 20 points of SoC).
+ * Those rows would arrive here as points whose `estimatedCapacityKwh` is null
+ * while `BatteryHealthPoint` says it is a number — the latest sample would blank
+ * the capacity tile and turn the degradation figure into a NaN. Filtering them
+ * out keeps this endpoint saying exactly what it said before; surfacing the
+ * measurement is spec §3.8's job, and this WHERE is where that work starts.
  */
 export async function getBatteryHealth(
   vehicleId: string,
@@ -801,6 +810,7 @@ export async function getBatteryHealth(
             estimated_capacity_kwh, rated_range_at_100_km, sample_confidence
        FROM battery_health_sample
       WHERE vehicle_id = $1
+        AND estimated_capacity_kwh IS NOT NULL
       ORDER BY observed_on ASC`,
     [vehicleId],
   )

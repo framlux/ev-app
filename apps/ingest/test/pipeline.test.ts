@@ -370,6 +370,99 @@ describe('Pipeline session handling', () => {
   })
 })
 
+/**
+ * The car's own pack energy, written from the sample path (spec §3.7).
+ *
+ * Not from the session path, which is where the estimate comes from: a
+ * measurement has no session behind it, it is a field on a sample. The two
+ * series share a daily row and neither may overwrite the other.
+ */
+describe('Pipeline: measured battery capacity', () => {
+  it("records the car's measured pack energy once per UTC day", async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+
+    await burst(pipeline, '2026-09-04T22:00:00.000Z',
+      { NominalFullPackEnergyKwh: 72.4, Soc: 60 })
+    await pipeline.flush(t('2026-09-04T22:00:05.000Z'))
+    // Same day, and the accumulator still carries the pack energy: one write a
+    // day, not one per sample, or a daily row becomes a per-sample UPDATE.
+    await burst(pipeline, '2026-09-04T23:00:00.000Z', { Soc: 61 })
+    await pipeline.flush(t('2026-09-04T23:00:05.000Z'))
+    // Past midnight UTC: a new day, so a new measurement.
+    await burst(pipeline, '2026-09-05T00:10:00.000Z', { Soc: 62 })
+    await pipeline.flush(t('2026-09-05T00:10:05.000Z'))
+
+    expect(db.state.measured.map((m) => m.observedOn.toISOString())).toEqual([
+      '2026-09-04T22:00:00.000Z',
+      '2026-09-05T00:10:00.000Z',
+    ])
+    expect(db.state.measured[0]?.measuredCapacityKwh).toBeCloseTo(72.4, 3)
+    // Nothing here went through the estimator, which needs a charge session.
+    expect(db.state.battery).toHaveLength(0)
+  })
+
+  it('records nothing on a day the car never reported its pack energy', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+
+    await burst(pipeline, '2026-09-04T10:00:00.000Z', { Soc: 60, VehicleSpeed: 0 })
+    await pipeline.flush(t('2026-09-04T10:00:05.000Z'))
+
+    expect(db.state.measured).toHaveLength(0)
+  })
+
+  it('derives rated range at 100% when the pack is full enough to extrapolate', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+
+    // 200 miles of rated range on 50 of 72.4 kWh: 69% of the pack, so the
+    // extrapolation to 100% is a short one. Tesla streams miles.
+    await burst(pipeline, '2026-09-04T22:00:00.000Z', {
+      NominalFullPackEnergyKwh: 72.4, EnergyRemaining: 50, RatedRange: 200, Soc: 69,
+    })
+    await pipeline.flush(t('2026-09-04T22:00:05.000Z'))
+
+    expect(db.state.measured).toHaveLength(1)
+    // 200 mi -> 321.87 km, divided by 50/72.4.
+    expect(db.state.measured[0]?.ratedRangeAt100Km).toBeCloseTo(466.1, 1)
+  })
+
+  it('leaves rated range null when the pack is too empty to extrapolate from', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+
+    // 15 of 72.4 kWh. Multiplying a near-empty pack's rated range by five
+    // invents precision the car never claimed - no row beats a bad row, and
+    // the measurement itself is still written.
+    await burst(pipeline, '2026-09-04T22:00:00.000Z', {
+      NominalFullPackEnergyKwh: 72.4, EnergyRemaining: 15, RatedRange: 60, Soc: 21,
+    })
+    await pipeline.flush(t('2026-09-04T22:00:05.000Z'))
+
+    expect(db.state.measured).toHaveLength(1)
+    expect(db.state.measured[0]?.measuredCapacityKwh).toBeCloseTo(72.4, 3)
+    expect(db.state.measured[0]?.ratedRangeAt100Km).toBeNull()
+  })
+
+  it('unwrites the measurement when its transaction rolls back', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+
+    // The day-written memory lives in the pipeline, not in the database, so a
+    // rollback that keeps it would skip the retry's write and lose the day's
+    // measurement entirely - the same reasoning as `ensuredMonths`.
+    await burst(pipeline, '2026-09-04T22:00:00.000Z',
+      { NominalFullPackEnergyKwh: 72.4, Soc: 60 })
+    db.failNextCommit = new Error('deadlock detected')
+    await expect(pipeline.flush(t('2026-09-04T22:00:05.000Z'))).rejects.toThrow('deadlock')
+    expect(db.state.measured).toHaveLength(0)
+
+    await pipeline.flush(t('2026-09-04T22:00:06.000Z'), true)
+    expect(db.state.measured).toHaveLength(1)
+  })
+})
+
 describe('Pipeline idempotency', () => {
   it('leaves one row when the same messages are replayed', async () => {
     const db = new FakeDb()

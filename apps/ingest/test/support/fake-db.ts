@@ -1,5 +1,7 @@
 import type { RawMessage, SessionKind, SessionSummary, VehicleSample } from '@ev/core'
-import type { BatteryHealthWrite, Store, StoreRunner } from '../../src/pipeline.js'
+import type {
+  BatteryHealthWrite, MeasuredCapacityWrite, Store, StoreRunner,
+} from '../../src/pipeline.js'
 
 /**
  * An in-memory stand-in for the Postgres side of the worker.
@@ -31,12 +33,16 @@ export interface FakeState {
   sessions: FakeSession[]
   points: { sessionId: string; ts: Date }[]
   battery: BatteryHealthWrite[]
+  measured: MeasuredCapacityWrite[]
   partitions: string[]
   cursor: Date | null
 }
 
 function emptyState(): FakeState {
-  return { raw: [], samples: [], sessions: [], points: [], battery: [], partitions: [], cursor: null }
+  return {
+    raw: [], samples: [], sessions: [], points: [],
+    battery: [], measured: [], partitions: [], cursor: null,
+  }
 }
 
 export class FakeDb implements StoreRunner {
@@ -105,6 +111,7 @@ export class FakeDb implements StoreRunner {
         session.summary = summary
       },
       recordBatteryHealth: async (row) => { s.battery.push(row) },
+      recordMeasuredCapacity: async (row) => { s.measured.push(row) },
       advanceCursor: async (at) => {
         if (!s.cursor || at.getTime() > s.cursor.getTime()) s.cursor = at
       },

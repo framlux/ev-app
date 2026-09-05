@@ -10,7 +10,7 @@ import { insertRaw, streamRaw } from '../src/repo/raw.js'
 import { ensurePartitions, insertSample } from '../src/repo/samples.js'
 import { ensureVehicle } from '../src/repo/vehicles.js'
 import { appendPoint, closeSession, findOpenSession, openSession } from '../src/repo/sessions.js'
-import { upsertBatteryHealth } from '../src/repo/battery.js'
+import { recordMeasuredCapacity, upsertBatteryHealth } from '../src/repo/battery.js'
 import { advanceCursor, readCursor } from '../src/repo/cursor.js'
 import { notifyVehicleChanged, VEHICLE_CHANGED_CHANNEL } from '../src/repo/notify.js'
 
@@ -258,6 +258,90 @@ describe.skipIf(!hasDb)('repositories', () => {
         WHERE vehicle_id=$1 AND estimated_capacity_kwh=71`, [VEHICLE])
     expect(rows).toHaveLength(1)
     expect(rows[0]?.day).toBe('2026-09-05')
+  })
+
+  /**
+   * The measurement and the estimate share a row and must not shout each other
+   * down. Both directions are silent when they go wrong — a losing
+   * `DO UPDATE … WHERE` writes nothing and raises nothing — so both are
+   * checked here against a real Postgres rather than reasoned about.
+   */
+  it('records a measured capacity on a day an estimate already holds', async () => {
+    const day = new Date('2026-09-06T12:00:00.000Z')
+    await withTransaction(getPool(), async (c) => {
+      await upsertBatteryHealth(c, {
+        vehicleId: VEHICLE, observedOn: day, estimatedCapacityKwh: 74,
+        ratedRangeAt100Km: null, sampleConfidence: 0.9,
+      })
+      // A measurement has no confidence on the estimator's scale, so routing it
+      // through upsertBatteryHealth would lose to that 0.9 and vanish.
+      await recordMeasuredCapacity(c, {
+        vehicleId: VEHICLE, observedOn: day,
+        measuredCapacityKwh: 71.2, ratedRangeAt100Km: 402.5,
+      })
+    })
+    const { rows } = await getPool().query(
+      `SELECT measured_capacity_kwh AS measured, estimated_capacity_kwh AS estimated,
+              rated_range_at_100_km AS rated, sample_confidence AS conf
+         FROM battery_health_sample
+        WHERE vehicle_id=$1 AND observed_on='2026-09-06'`, [VEHICLE])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.measured).toBeCloseTo(71.2, 3)
+    expect(rows[0]?.rated).toBeCloseTo(402.5, 1)
+    // And it left the estimate alone: they are two different claims.
+    expect(rows[0]?.estimated).toBeCloseTo(74, 3)
+    expect(rows[0]?.conf).toBeCloseTo(0.9, 3)
+  })
+
+  it('files a day that has a measurement and no qualifying charge', async () => {
+    // 23:30Z: the day is counted in UTC, not in the writer's zone.
+    const day = new Date('2026-09-07T23:30:00.000Z')
+    await withTransaction(getPool(), (c) => recordMeasuredCapacity(c, {
+      vehicleId: VEHICLE, observedOn: day,
+      measuredCapacityKwh: 70.5, ratedRangeAt100Km: null,
+    }))
+    const { rows } = await getPool().query(
+      `SELECT to_char(observed_on,'YYYY-MM-DD') AS day,
+              measured_capacity_kwh AS measured, estimated_capacity_kwh AS estimated,
+              sample_confidence AS conf
+         FROM battery_health_sample
+        WHERE vehicle_id=$1 AND measured_capacity_kwh=70.5`, [VEHICLE])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.day).toBe('2026-09-07')
+    // The whole point of dropping the two NOT NULLs: most days have a
+    // measurement and no charge wide enough to estimate from.
+    expect(rows[0]?.estimated).toBeNull()
+    expect(rows[0]?.conf).toBeNull()
+  })
+
+  it('lets the estimator write onto a day the measurement created', async () => {
+    const day = new Date('2026-09-08T01:00:00.000Z')
+    await withTransaction(getPool(), async (c) => {
+      await recordMeasuredCapacity(c, {
+        vehicleId: VEHICLE, observedOn: day,
+        measuredCapacityKwh: 71, ratedRangeAt100Km: 405,
+      })
+      // The mirror of the case above, and the one the spec does not mention:
+      // `NULL < 0.4` is NULL rather than true, so an unguarded confidence
+      // comparison makes every estimate a no-op once a measurement exists —
+      // which, written daily, is every day.
+      await upsertBatteryHealth(c, {
+        vehicleId: VEHICLE, observedOn: day, estimatedCapacityKwh: 73,
+        ratedRangeAt100Km: null, sampleConfidence: 0.4,
+      })
+    })
+    const { rows } = await getPool().query(
+      `SELECT measured_capacity_kwh AS measured, estimated_capacity_kwh AS estimated,
+              rated_range_at_100_km AS rated, sample_confidence AS conf
+         FROM battery_health_sample
+        WHERE vehicle_id=$1 AND observed_on='2026-09-08'`, [VEHICLE])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.estimated).toBeCloseTo(73, 3)
+    expect(rows[0]?.conf).toBeCloseTo(0.4, 3)
+    expect(rows[0]?.measured).toBeCloseTo(71, 3)
+    // The estimator has nothing to say about rated range and passes null; that
+    // must not erase the measurement's.
+    expect(rows[0]?.rated).toBeCloseTo(405, 1)
   })
 
   it('never moves the ingest cursor backwards', async () => {

@@ -36,6 +36,7 @@ export interface Store {
   appendPoint(sessionId: string, s: VehicleSample): Promise<void>
   closeSession(sessionId: string, summary: SessionSummary): Promise<void>
   recordBatteryHealth(row: BatteryHealthWrite): Promise<void>
+  recordMeasuredCapacity(row: MeasuredCapacityWrite): Promise<void>
   advanceCursor(at: Date): Promise<void>
 }
 
@@ -45,6 +46,13 @@ export interface BatteryHealthWrite {
   estimatedCapacityKwh: number
   ratedRangeAt100Km: number | null
   sampleConfidence: number
+}
+
+export interface MeasuredCapacityWrite {
+  vehicleId: string
+  observedOn: Date
+  measuredCapacityKwh: number
+  ratedRangeAt100Km: number | null
 }
 
 /**
@@ -321,6 +329,7 @@ interface Snapshot {
   openPoints: VehicleSample[]
   ensuredMonths: Set<string>
   accumulators: Map<string, FieldAccumulator>
+  measuredDays: Map<string, string>
 }
 
 export class Pipeline {
@@ -341,6 +350,21 @@ export class Pipeline {
    * sample - which would be undetectable afterwards.
    */
   private accumulators = new Map<string, FieldAccumulator>()
+  /**
+   * The UTC day each vehicle's pack measurement was last written for.
+   *
+   * The last day rather than a set of them, because it is only ever compared
+   * with the day of the sample in hand and a set would grow for the life of the
+   * process. Replaying out of order (`reprocess` walking a window) can
+   * therefore write the same day twice; `recordMeasuredCapacity` is an upsert
+   * of the same value, so that costs a statement and changes nothing.
+   *
+   * It is memory, not truth: a restart forgets it and the first sample after
+   * rewrites the day. That is deliberate - the alternative is a SELECT per
+   * sample to ask the database a question whose wrong answer is one redundant
+   * UPDATE a day.
+   */
+  private measuredDays = new Map<string, string>()
 
   constructor(private runner: StoreRunner, private opts: MetricsOptions) {}
 
@@ -486,6 +510,7 @@ export class Pipeline {
   private async applySample(store: Store, sample: VehicleSample): Promise<PipelineResult> {
     await this.ensureMonth(store, sample.ts)
     await store.insertSample(sample)
+    await this.measurePack(store, sample)
 
     const { state, events } = step(this.state, sample)
     this.state = state
@@ -550,6 +575,41 @@ export class Pipeline {
     })
   }
 
+  /**
+   * The car's own measurement of its pack, at most once per UTC day.
+   *
+   * The estimate above is inferred from a charge session, which is why it is
+   * written when one closes. This is not inferred from anything: the car
+   * publishes `NominalFullPackEnergyKwh` as a field, so it arrives on a sample
+   * and has no session to hang off. Hence the sample path, and hence a daily
+   * gate rather than an event - the value moves by a few tenths of a kWh over
+   * months, so one reading a day is already more resolution than the quantity
+   * has, and writing it per sample would turn a daily row into an UPDATE
+   * roughly every thirty seconds.
+   *
+   * Inside the caller's transaction, so the measurement commits with the sample
+   * it was read from or not at all - and the memory of having written it rolls
+   * back with the transaction (see `measuredDays`), or a rolled-back write
+   * would be skipped on the retry and the day would silently lose its
+   * measurement.
+   */
+  private async measurePack(store: Store, sample: VehicleSample): Promise<void> {
+    const measured = sample.nominalFullPackEnergyKwh
+    // A pack of zero kWh is a decode artefact, not a dead battery.
+    if (measured === null || !(measured > 0)) return
+
+    const day = sample.ts.toISOString().slice(0, 10)
+    if (this.measuredDays.get(sample.vehicleId) === day) return
+
+    await store.recordMeasuredCapacity({
+      vehicleId: sample.vehicleId,
+      observedOn: sample.ts,
+      measuredCapacityKwh: measured,
+      ratedRangeAt100Km: ratedRangeAtFull(sample),
+    })
+    this.measuredDays.set(sample.vehicleId, day)
+  }
+
   private async ensureMonth(store: Store, when: Date): Promise<void> {
     const key = `${when.getUTCFullYear()}-${when.getUTCMonth()}`
     if (this.ensuredMonths.has(key)) return
@@ -566,6 +626,7 @@ export class Pipeline {
       openPoints: [...this.openPoints],
       ensuredMonths: new Set(this.ensuredMonths),
       accumulators,
+      measuredDays: new Map(this.measuredDays),
     }
   }
 
@@ -575,7 +636,45 @@ export class Pipeline {
     this.openPoints = s.openPoints
     this.ensuredMonths = s.ensuredMonths
     this.accumulators = s.accumulators
+    this.measuredDays = s.measuredDays
   }
+}
+
+/**
+ * How much of the pack must be left before rated range is worth extrapolating.
+ *
+ * `rated_range_at_100_km` has never been written: a partial charge cannot give
+ * it (the estimator passes null and says so), but a sample can, because the car
+ * reports rated range, energy remaining and full pack energy together and the
+ * ratio of the last two is what the first is quoted against.
+ *
+ * The extrapolation is a division by that ratio, so its error grows as the pack
+ * empties - at 10% left, a kWh of disagreement between the two energy figures
+ * moves the answer by tens of kilometres, and the car's own range figure is at
+ * its least linear down there anyway. Half a pack caps the extrapolation at 2x
+ * and keeps the estimator's discipline: no row beats a bad row, and a day with
+ * no qualifying sample simply carries the measurement without a range.
+ */
+const MIN_PACK_FRACTION_FOR_RANGE = 0.5
+
+/**
+ * Rated range at 100% from one sample, or null when it would be invention.
+ *
+ * `rangeKm` is `RatedRange`, already converted from the miles the car streams.
+ */
+function ratedRangeAtFull(s: VehicleSample): number | null {
+  const full = s.nominalFullPackEnergyKwh
+  const remaining = s.energyRemaining
+  const rated = s.rangeKm
+  if (full === null || remaining === null || rated === null) return null
+  if (!(full > 0) || !(rated > 0)) return null
+
+  const fraction = remaining / full
+  // Over 1 the two energy figures are describing different things (a usable
+  // figure against a nominal one, or a stale carry), which makes the ratio
+  // meaningless rather than merely imprecise.
+  if (fraction < MIN_PACK_FRACTION_FOR_RANGE || fraction > 1) return null
+  return Math.round((rated / fraction) * 10) / 10
 }
 
 /**
