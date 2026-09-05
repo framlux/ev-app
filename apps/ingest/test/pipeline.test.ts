@@ -61,7 +61,10 @@ describe('Pipeline.handle: the tape', () => {
     await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Soc', 80))
     // An unknown field and an unreadable value: counted, taped, never a crash
     // and never a guess.
-    const unknown = await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Gear', 'D'))
+    // Not `Gear`: that one is catalogued and decoded now. This is a name the
+    // car could start sending tomorrow and that we have not decided about yet.
+    const unknown = await pipeline.handle(
+      field('2026-09-04T10:00:00.000Z', 'SomethingShippedNextTuesday', 'D'))
     const invalid = await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Soc', null))
 
     expect(db.state.raw).toHaveLength(3)

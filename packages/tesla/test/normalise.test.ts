@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import type { RawMessage } from '@ev/core'
+import { SAMPLE_COLUMNS, TS_TYPES_FOR_SQL, type RawMessage, type SqlType } from '@ev/core'
+import { TESLA_FIELDS, columnsOf, slotsOf, type TeslaField } from '../src/catalogue.js'
 import {
   MILES_TO_KM,
+  SQL_DECODERS,
+  TESLA_OVERRIDDEN_FIELDS,
+  VALUE_CONVERTERS,
   decodeTeslaConnectivity,
   decodeTeslaField,
   isKnownTeslaField,
@@ -85,13 +89,22 @@ describe('decodeTeslaField: units', () => {
 
 describe('decodeTeslaField: unknown fields', () => {
   it('ignores a field it has no home for', () => {
-    // Gear and ChargeAmps are streamed but have no VehicleSample counterpart,
-    // and Tesla ships new fields without warning. Neither may become a guess.
-    expect(decodeTeslaField('Gear', 'D')).toBeNull()
-    expect(decodeTeslaField('ChargeAmps', 32)).toBeNull()
+    // Tesla ships new fields without warning, and one we have not catalogued
+    // must never become a guess. The catalogue test is what makes this a
+    // decision rather than an oversight: a proto member that is neither
+    // catalogued nor excluded by name fails the build.
     expect(decodeTeslaField('SomethingShippedNextTuesday', 1)).toBeNull()
     expect(isKnownTeslaField('Soc')).toBe(true)
-    expect(isKnownTeslaField('Gear')).toBe(false)
+    expect(isKnownTeslaField('SomethingShippedNextTuesday')).toBe(false)
+  })
+
+  it('now places Gear and ChargeAmps, which were billed for and discarded', () => {
+    // THE CHANGE THIS WORK EXISTS FOR. Both have been streamed since day one
+    // and thrown away because there was nowhere to put them; they have columns
+    // now, and the tape can be reprocessed to backfill them.
+    expect(decoded('Gear', 'ShiftStateD')).toEqual({ gear: 'ShiftStateD' })
+    expect(decoded('ChargeAmps', 32)).toEqual({ chargeAmps: 32 })
+    expect(isKnownTeslaField('Gear')).toBe(true)
   })
 })
 
@@ -283,3 +296,238 @@ describe('connectivity', () => {
   })
 })
 
+
+/**
+ * THE CATALOGUE-WIDE TESTS (§5, "Types").
+ *
+ * The hand-written cases above pin the fourteen fields whose decoding is a
+ * judgement. These pin the other hundred and ninety, and they are written as a
+ * table over the WHOLE catalogue rather than as a list of examples because the
+ * failure they exist to catch is a field nobody wrote a test for: a signal we
+ * pay for, receive, and then silently fail to place. A catalogue entry added
+ * without a decoder fails here on the day it is added.
+ *
+ * The third assertion - bindability - is the one that is not about nulls. A
+ * value the column REJECTS is not a hole in the data: `insertSample` binds every
+ * column in one statement inside the ingest transaction, so it rolls back, is
+ * never acked, and is redelivered forever (§3.4). It is checked through
+ * `teslaStateToSample` rather than on the decoder's output because four fields
+ * decode to a number and land in a JSONB column, and it is the value that
+ * reaches the bind that has to be legal.
+ */
+
+const COLUMN = new Map(SAMPLE_COLUMNS.map((c) => [c.column, c]))
+
+/** A payload of the shape the column's type implies. */
+const REPRESENTATIVE: Record<SqlType, unknown> = {
+  'REAL': 12.5,
+  'DOUBLE PRECISION': 12.5,
+  'INT': 7,
+  'BOOLEAN': true,
+  'TEXT': 'SomeEnumName',
+  'TIME': { hour: 7, minute: 30, second: 0 },
+  'TIMESTAMPTZ': 1757000000,
+  'JSONB': { fl: 2.8 },
+}
+
+/**
+ * A payload of a type the column cannot hold. Note TEXT's: on this wire a
+ * payload is a number, string, boolean, object or null, and TEXT takes anything
+ * stringifiable on purpose (§3.4 - an unobserved shape is stored verbatim until
+ * it can be promoted), so `null` (Value_Invalid) is the only input that is
+ * genuinely wrong for it.
+ */
+const WRONG: Record<SqlType, unknown> = {
+  'REAL': 'not a number',
+  'DOUBLE PRECISION': 'not a number',
+  'INT': 'not a number',
+  'BOOLEAN': 42,
+  'TEXT': null,
+  'TIME': 'half past seven',
+  'TIMESTAMPTZ': 'half past seven',
+  'JSONB': 'not a record',
+}
+
+/**
+ * The fields whose payload shape is NOT their column's type: the pair-valued
+ * locations, the two enums the engine reasons about, the door struct, and the
+ * four TPMS corners, which are bare numbers that collapse into one JSONB record.
+ */
+const SHAPED: Record<string, { good: unknown; wrong: unknown }> = {
+  Location: { good: { latitude: 52.2, longitude: 0.13 }, wrong: 'somewhere' },
+  OriginLocation: { good: { latitude: 52.2, longitude: 0.13 }, wrong: 'somewhere' },
+  DestinationLocation: { good: { latitude: 52.2, longitude: 0.13 }, wrong: 'somewhere' },
+  ChargeState: { good: 'Charging', wrong: 'ChargeStateSomethingNew' },
+  DetailedChargeState: { good: 'Charging', wrong: 'ChargeStateSomethingNew' },
+  DoorState: { good: { DriverFront: false, PassengerFront: true }, wrong: 42 },
+  TpmsPressureFl: { good: 2.8, wrong: 'flat' },
+  TpmsPressureFr: { good: 2.9, wrong: 'flat' },
+  TpmsPressureRl: { good: 2.7, wrong: 'flat' },
+  TpmsPressureRr: { good: 2.75, wrong: 'flat' },
+}
+
+function sqlOf(entry: TeslaField): SqlType {
+  const column = COLUMN.get(columnsOf(entry)[0]!)
+  if (!column) throw new Error(`${entry.field} names a column @ev/core does not have`)
+  return column.sql
+}
+
+const goodPayload = (e: TeslaField): unknown => SHAPED[e.field]?.good ?? REPRESENTATIVE[sqlOf(e)]
+const wrongPayload = (e: TeslaField): unknown => SHAPED[e.field]?.wrong ?? WRONG[sqlOf(e)]
+
+/** Does `value` inhabit the TypeScript type the column's SQL type admits? */
+function isTsType(ts: string, value: unknown): boolean {
+  switch (ts) {
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value)
+    case 'boolean':
+      return typeof value === 'boolean'
+    case 'Date':
+      return value instanceof Date && !Number.isNaN(value.getTime())
+    case 'TpmsMap':
+      return (
+        typeof value === 'object' && value !== null && !Array.isArray(value) &&
+        Object.values(value).every((v) => typeof v === 'number' && Number.isFinite(v))
+      )
+    // 'string', and the two enum tags, all bind as text.
+    default:
+      return typeof value === 'string'
+  }
+}
+
+const CASES = TESLA_FIELDS.map((entry) => [entry.field, entry] as const)
+
+describe('every catalogued field decodes', () => {
+  it.each(CASES)('%s fills its slots from a representative payload', (_field, entry) => {
+    const update = decodeTeslaField(entry.field, goodPayload(entry)) as Record<string, unknown>
+    expect(update, `${entry.field} decoded nothing`).not.toBeNull()
+    for (const slot of slotsOf(entry)) {
+      expect(update[slot], `${entry.field} left ${slot} empty`).not.toBe(undefined)
+      expect(update[slot], `${entry.field} left ${slot} null`).not.toBeNull()
+    }
+  })
+
+  it.each(CASES)('%s binds to its column\'s SQL type', (_field, entry) => {
+    const update = decodeTeslaField(entry.field, goodPayload(entry))
+    const sample = teslaStateToSample(VEHICLE, TS, update!) as unknown as Record<string, unknown>
+    for (const name of columnsOf(entry)) {
+      const column = COLUMN.get(name)!
+      const value = sample[column.key]
+      expect(value, `${name} was not populated`).not.toBeNull()
+      expect(
+        TS_TYPES_FOR_SQL[column.sql].some((ts) => isTsType(ts, value)),
+        `${name} (${column.sql}) cannot bind ${JSON.stringify(value)}`,
+      ).toBe(true)
+      if (column.sql === 'INT') expect(Number.isInteger(value), `${name} is not an integer`).toBe(true)
+    }
+  })
+
+  it.each(CASES)('%s yields null for a wrong-typed payload', (_field, entry) => {
+    // Never a fabricated value: a wrong type must lose the message, not the
+    // transaction, and must not overwrite a good earlier reading either.
+    expect(decodeTeslaField(entry.field, wrongPayload(entry))).toBeNull()
+    expect(decodeTeslaField(entry.field, null)).toBeNull()
+  })
+})
+
+describe('teslaStateToSample: the whole catalogue', () => {
+  it('populates every catalogued column the car can fill', () => {
+    // The end-to-end shape of §1: everything we ask for, decoded, in a column.
+    const state: Record<string, unknown> = {}
+    for (const entry of TESLA_FIELDS) {
+      Object.assign(state, decodeTeslaField(entry.field, goodPayload(entry)))
+    }
+    const sample = teslaStateToSample(VEHICLE, TS, state) as unknown as Record<string, unknown>
+    const empty = SAMPLE_COLUMNS.filter((c) => sample[c.key] === null).map((c) => c.column)
+    // power_state is the one column no metric fills: it comes from connectivity.
+    expect(empty).toEqual(['power_state'])
+  })
+
+  it('still writes null, never 0, for what the car never reported', () => {
+    const sample = teslaStateToSample(VEHICLE, TS, { socPct: 72 }) as unknown as Record<string, unknown>
+    const populated = SAMPLE_COLUMNS.filter((c) => sample[c.key] !== null).map((c) => c.column)
+    expect(populated).toEqual(['soc_pct'])
+  })
+})
+
+describe('the overrides', () => {
+  it('names only catalogued fields', () => {
+    // An override for a field the catalogue does not carry would sit there doing
+    // nothing, which is the silent-loss failure in miniature.
+    const catalogued = new Set(TESLA_FIELDS.map((e) => e.field))
+    expect(TESLA_OVERRIDDEN_FIELDS.filter((f) => !catalogued.has(f))).toEqual([])
+  })
+
+  it('covers every field whose slot is not its column', () => {
+    // Ten fields collapse onto four columns; a generic rule keyed on the column
+    // type cannot tell them apart, so each must be hand-written.
+    const camel = (s: string) => s.replace(/_([a-z0-9])/g, (_m, c: string) => c.toUpperCase())
+    const collapsed = TESLA_FIELDS.filter((e) =>
+      slotsOf(e).some((slot, i) => camel(columnsOf(e)[i]!) !== slot))
+    expect(collapsed.map((e) => e.field).filter((f) => !TESLA_OVERRIDDEN_FIELDS.includes(f)))
+      .toEqual([])
+  })
+})
+
+describe('per-type decoders (§3.4)', () => {
+  it('rounds onto an INT column rather than refusing', () => {
+    expect(SQL_DECODERS['INT'](3.6)).toBe(4)
+    expect(SQL_DECODERS['INT']('3.4')).toBe(3)
+    expect(SQL_DECODERS['INT'](-3.6)).toBe(-4)
+  })
+
+  it('refuses an INT postgres would reject', () => {
+    // Out of int4 range is a BIND ERROR, and a bind error wedges ingest forever.
+    expect(SQL_DECODERS['INT'](3e9)).toBeNull()
+    expect(SQL_DECODERS['INT']('abc')).toBeNull()
+    expect(SQL_DECODERS['INT'](true)).toBeNull()
+  })
+
+  it('stores an unobserved shape verbatim as TEXT', () => {
+    // The reason a field of unknown shape is parked at TEXT: whatever the car
+    // sent is kept until a migration plus reprocess can promote it.
+    expect(SQL_DECODERS['TEXT']({ hour: 7, minute: 30, second: 0 }))
+      .toBe('{"hour":7,"minute":30,"second":0}')
+    expect(SQL_DECODERS['TEXT'](12.5)).toBe('12.5')
+    expect(SQL_DECODERS['TEXT'](false)).toBe('false')
+    expect(SQL_DECODERS['TEXT']('Park')).toBe('Park')
+    expect(SQL_DECODERS['TEXT']('')).toBeNull()
+    expect(SQL_DECODERS['TEXT'](null)).toBeNull()
+  })
+
+  it('parses a proto Time onto a TIME column', () => {
+    // `message Time` is {hour, minute, second}: a wall clock, no date, no zone.
+    expect(SQL_DECODERS['TIME']({ hour: 7, minute: 5, second: 9 })).toBe('07:05:09')
+    expect(SQL_DECODERS['TIME']({ hour: 7, minute: 5 })).toBe('07:05:00')
+    expect(SQL_DECODERS['TIME']({ hour: 25, minute: 0, second: 0 })).toBeNull()
+    expect(SQL_DECODERS['TIME']({ hour: 7, minute: 61, second: 0 })).toBeNull()
+    expect(SQL_DECODERS['TIME'](1757000000)).toBeNull()
+  })
+
+  it('accepts only what epochSecondsToDate produced on a TIMESTAMPTZ column', () => {
+    const date = VALUE_CONVERTERS['epochSecondsToDate'](1757000000)
+    expect(date).toEqual(new Date('2025-09-04T15:33:20.000Z'))
+    expect(SQL_DECODERS['TIMESTAMPTZ'](date)).toEqual(date)
+    // A bare epoch reaching a TIMESTAMPTZ column means the converter was not
+    // named in the catalogue, and postgres would read the number as a year.
+    expect(SQL_DECODERS['TIMESTAMPTZ'](1757000000)).toBeNull()
+    expect(SQL_DECODERS['TIMESTAMPTZ']('2025-09-04T15:33:20Z')).toBeNull()
+    expect(VALUE_CONVERTERS['epochSecondsToDate'](1e20)).toBeNull()
+    expect(VALUE_CONVERTERS['epochSecondsToDate']('nope')).toBeNull()
+  })
+
+  it('takes a record of numbers onto a JSONB column and nothing else', () => {
+    expect(SQL_DECODERS['JSONB']({ fl: 2.8 })).toEqual({ fl: 2.8 })
+    expect(SQL_DECODERS['JSONB']({ fl: 'flat' })).toBeNull()
+    expect(SQL_DECODERS['JSONB']([2.8])).toBeNull()
+    expect(SQL_DECODERS['JSONB']('not a record')).toBeNull()
+    // Nothing known is not a reading with nothing in it.
+    expect(SQL_DECODERS['JSONB']({})).toBeNull()
+  })
+
+  it('converts distances and speeds by the exact mile', () => {
+    expect(VALUE_CONVERTERS['milesToKm'](100)).toBeCloseTo(160.9344, 9)
+    expect(VALUE_CONVERTERS['mphToKph']('40')).toBeCloseTo(64.37376, 9)
+    expect(VALUE_CONVERTERS['milesToKm']('')).toBeNull()
+  })
+})

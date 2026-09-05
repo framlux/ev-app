@@ -26,12 +26,31 @@
  * lives in the ingest worker, which is the layer that knows about message
  * arrival, transactions and restarts. See `apps/ingest/src/pipeline.ts`.
  *
+ * ONE DECODER PER TYPE, NOT ONE PER FIELD. There are 204 catalogued signals and
+ * a hand-written map of 204 decoders would be free to disagree with the list we
+ * ask the car for and with the columns we store into - which is the whole
+ * failure this design exists to prevent, and it is silent in every direction.
+ * So `FIELD_DECODERS` is BUILT from `catalogue.ts`: the entry names the column,
+ * the column names its SQL type, and the type owns the decoder. Fourteen fields
+ * do something no generic rule can express and keep their hand-written decoders
+ * in `FIELD_OVERRIDES` - the two charge-state enums, the door struct, the
+ * charging rails, and the four TPMS corners, all of which collapse several
+ * messages into one column.
+ *
  * ABSENT MUST NEVER BECOME ZERO. `VehicleSample` makes every field nullable
  * precisely so "the car did not say" stays distinguishable from "the car said
  * 0". A parser that defaulted to 0 would tell the segmenter the car is parked at
  * 0 kph drawing 0 kW, which silently ends drives and charges. Every decoder here
  * returns `null` for anything it cannot vouch for, and an unknown field name is
  * ignored rather than guessed at.
+ *
+ * AND A WRONG TYPE MUST NEVER BECOME A BIND ERROR. `insertSample` binds every
+ * column in one statement inside the ingest transaction, so a value the column
+ * REJECTS - a float bound to INT, a number bound to TIMESTAMPTZ - rolls the
+ * transaction back, is never acked, and is redelivered forever: a permanent
+ * stall rather than a hole in one series. Each SQL type's decoder therefore
+ * coerces into that column's domain or returns null, and the test table asserts
+ * both directions for every catalogued field.
  *
  * TYPE DRIFT. Upstream warns that a field's JSON type can change between vehicle
  * software versions - the vehicle's speed may arrive as `12.3` in one build and
@@ -40,19 +59,30 @@
  * number-shaped lie.
  *
  * UNITS. Tesla streams US customary units for distance regardless of the display
- * setting on the touchscreen: `VehicleSpeed` is mph, `Odometer` and `RatedRange`
- * are miles. Our model is kph/km, so those three are converted by MILES_TO_KM.
- * Everything else is already in our units: temperatures Celsius, charging power
- * kW, charging energy kWh, `Soc` a percentage, TPMS pressures bar.
+ * setting on the touchscreen: speeds are mph and distances miles. Our model is
+ * kph/km, so the catalogue names the converter per field and any column holding
+ * a converted value carries the real unit in its name. Everything else is
+ * already in our units: temperatures Celsius, charging power kW, charging energy
+ * kWh, `Soc` a percentage, TPMS pressures bar.
  */
 
 import {
+  SAMPLE_COLUMNS,
   makeSample,
   type ChargeState,
   type PowerState,
   type RawMessage,
+  type SampleColumn,
+  type SqlType,
   type VehicleSample,
 } from '@ev/core'
+import {
+  TESLA_FIELDS,
+  columnsOf,
+  slotsOf,
+  type Converter,
+  type TeslaField,
+} from './catalogue.js'
 
 /**
  * Exact international mile. Named and exported because it is the one number in
@@ -63,32 +93,39 @@ import {
  */
 export const MILES_TO_KM = 1.609344
 
-const milesToKm = (miles: number | null): number | null =>
-  miles === null ? null : miles * MILES_TO_KM
+/** The columns whose value is collapsed from several fields at build time. */
+const COLLAPSED_KEYS = [
+  'chargeState',
+  'chargePowerKw',
+  'chargeEnergyAddedKwh',
+  'tpms',
+] as const satisfies readonly (keyof Omit<VehicleSample, 'vehicleId' | 'ts'>)[]
+
+type CollapsedKey = (typeof COLLAPSED_KEYS)[number]
+
+/**
+ * The slots that are simply the column, carried through unchanged. Derived from
+ * the column catalogue rather than written out: a slot missing from a hand list
+ * would be decoded, accumulated, and then dropped on the floor at build time.
+ */
+type DirectSlots = {
+  [K in Exclude<keyof Omit<VehicleSample, 'vehicleId' | 'ts'>, CollapsedKey>]: VehicleSample[K]
+}
 
 /**
  * The accumulated latest-known value of every slot we can fill from Tesla.
  *
  * This is deliberately NOT a `VehicleSample`. Several Tesla fields collapse into
- * one canonical field (AC/DC power, AC/DC energy, the four TPMS corners, the two
- * charge-state enums), and since each arrives in its own MQTT message the
+ * one canonical column (AC/DC power, AC/DC energy, the four TPMS corners, the
+ * two charge-state enums), and since each arrives in its own MQTT message the
  * collapse cannot happen at decode time - it happens once, in
- * `teslaStateToSample`, over whatever has accumulated.
+ * `teslaStateToSample`, over whatever has accumulated. Those are the slots
+ * spelled out below; every other slot IS its column.
  *
  * Every slot is nullable and `null` means "never reported", which is what keeps
  * an unreported field null in the emitted sample instead of 0.
  */
-export interface TeslaFieldState {
-  socPct: number | null
-  rangeKm: number | null
-  odometerKm: number | null
-  speedKph: number | null
-  insideTempC: number | null
-  outsideTempC: number | null
-  lat: number | null
-  lon: number | null
-  locked: boolean | null
-  doorsOpen: boolean | null
+export interface TeslaFieldState extends DirectSlots {
   tpmsFl: number | null
   tpmsFr: number | null
   tpmsRl: number | null
@@ -107,62 +144,90 @@ export interface TeslaFieldState {
   chargeStateBasic: ChargeState | null
   /** From `DetailedChargeState`; preferred when both are known. */
   chargeStateDetailed: ChargeState | null
-  /** From connectivity messages, not from a metric. */
-  powerState: PowerState | null
 }
 
 /** What one decoded field contributes. Merged into a `TeslaFieldState`. */
 export type TeslaFieldUpdate = Partial<TeslaFieldState>
 
+/** Anything a decoder may produce: the runtime side of `@ev/core`'s `TsType`. */
+type SlotValue = number | string | boolean | Date | Record<string, number>
+
 /**
- * Tesla field name -> the slots it fills.
+ * ONE DECODER PER SQL TYPE (§3.4).
  *
- * A decoder returns `null` when the value is unreadable, which is what
- * distinguishes "the car published Soc" from "the car published a readable Soc".
- * Only a non-null return is allowed to change accumulated state, so an
- * unreadable message can never blank a good earlier reading.
- *
- * Field names absent from this map are ignored on purpose. That covers fields
- * Tesla has not shipped yet, and fields we stream but have nowhere to put
- * (`Gear`, `ChargeAmps` have no `VehicleSample` counterpart, so they are
- * dropped rather than forced somewhere).
+ * Each coerces into its column's domain or returns null, and null is always the
+ * safe answer: it loses one reading, while a value the column rejects loses the
+ * whole pipeline until someone notices. Exported because `TIME` and
+ * `TIMESTAMPTZ` have no columns YET - every time-shaped field is parked at TEXT
+ * until we have seen what the car actually sends - and the promotion of one of
+ * those columns is a planned step, so the decoder that will carry it has to be
+ * testable before the column exists.
  */
-const FIELD_DECODERS: Record<string, (value: unknown) => TeslaFieldUpdate | null> = {
-  Soc: (v) => one('socPct', num(v)),
-  // Miles on the wire, km in the model.
-  RatedRange: (v) => one('rangeKm', milesToKm(num(v))),
-  Odometer: (v) => one('odometerKm', milesToKm(num(v))),
-  VehicleSpeed: (v) => one('speedKph', milesToKm(num(v))),
-  InsideTemp: (v) => one('insideTempC', num(v)),
-  OutsideTemp: (v) => one('outsideTempC', num(v)),
+export const SQL_DECODERS: Record<SqlType, (value: unknown) => SlotValue | null> = {
+  'REAL': num,
+  'DOUBLE PRECISION': num,
+  'INT': int,
+  'BOOLEAN': bool,
+  'TEXT': text,
+  'TIME': timeOfDay,
+  'TIMESTAMPTZ': timestamptz,
+  'JSONB': numberRecord,
+}
+
+/**
+ * The conversions the catalogue names, applied BEFORE the column's decoder, so
+ * the decoder is always checking the value that will actually be bound.
+ */
+export const VALUE_CONVERTERS: Record<Converter, (value: unknown) => unknown> = {
+  milesToKm: (v) => scaled(v, MILES_TO_KM),
+  // The same factor: an mph is a mile per hour.
+  mphToKph: (v) => scaled(v, MILES_TO_KM),
+  /**
+   * Unused by any entry today, and deliberately so: a `REAL` holding a Unix
+   * epoch has a 128-second resolution, so a field of unobserved shape is TEXT
+   * until we know, and this is what promotes it afterwards.
+   */
+  epochSecondsToDate: (v) => {
+    const seconds = num(v)
+    if (seconds === null) return null
+    const date = new Date(seconds * 1000)
+    return Number.isNaN(date.getTime()) ? null : date
+  },
+}
+
+/** Widened to `string` keys: the catalogue's `column` is looked up by name. */
+const COLUMNS_BY_NAME: ReadonlyMap<string, SampleColumn> = new Map(
+  SAMPLE_COLUMNS.map((c) => [c.column, c]),
+)
+
+/**
+ * The fields whose decoding is a judgement rather than a function of the column
+ * type. Every one of them collapses several messages into one column, or reads
+ * a struct: nine of the ten fields that share a column are here, plus the door
+ * struct, and each writes exactly the slots it wrote before this file learned to
+ * derive the rest.
+ *
+ * `Location` is NOT here, and that is the interesting absence: it was
+ * hand-written until `OriginLocation` and `DestinationLocation` arrived with the
+ * same `{latitude, longitude}` shape, at which point the both-or-neither rule
+ * stopped being special and became the rule for any entry whose column is a
+ * pair. It is the same code, reached from the catalogue.
+ */
+const FIELD_OVERRIDES: Record<string, (value: unknown) => TeslaFieldUpdate | null> = {
+  ChargeState: (v) => one('chargeStateBasic', chargeState(str(v))),
+  DetailedChargeState: (v) => one('chargeStateDetailed', chargeState(str(v))),
+
+  DoorState: (v) => one('doorsOpen', anyDoorOpen(v)),
 
   // Power is reported per rail and coalesced at build time. The rail that is
   // actually delivering is recorded here, while we can still see it, because
-  // the energy counters cannot be told apart on their own.
+  // the energy counters cannot be told apart on their own - which is why the
+  // four rail fields are written together rather than left to the generic rule
+  // that would handle the two energy counters perfectly well on their own.
   ACChargingPower: (v) => power('ac', num(v)),
   DCChargingPower: (v) => power('dc', num(v)),
   ACChargingEnergyIn: (v) => one('acEnergyKwh', num(v)),
   DCChargingEnergyIn: (v) => one('dcEnergyKwh', num(v)),
-
-  ChargeState: (v) => one('chargeStateBasic', chargeState(str(v))),
-  DetailedChargeState: (v) => one('chargeStateDetailed', chargeState(str(v))),
-
-  Locked: (v) => one('locked', bool(v)),
-  DoorState: (v) => one('doorsOpen', anyDoorOpen(v)),
-
-  /**
-   * Latitude and longitude arrive in ONE message, as a two-key object, and the
-   * pair is only meaningful whole: a sample carrying a latitude with a null
-   * longitude would be plotted on the prime meridian. Both land or neither does.
-   */
-  Location: (v) => {
-    const o = asRecord(v)
-    if (!o) return null
-    const lat = num(o['latitude'])
-    const lon = num(o['longitude'])
-    if (lat === null || lon === null) return null
-    return { lat, lon }
-  },
 
   // The four corners arrive as four separate messages and collapse into the
   // single tpms JSONB record at build time. Whichever corners are known land;
@@ -172,6 +237,82 @@ const FIELD_DECODERS: Record<string, (value: unknown) => TeslaFieldUpdate | null
   TpmsPressureRl: (v) => one('tpmsRl', num(v)),
   TpmsPressureRr: (v) => one('tpmsRr', num(v)),
 }
+
+/** The hand-written exceptions, for the test that pins them to the catalogue. */
+export const TESLA_OVERRIDDEN_FIELDS: readonly string[] = Object.keys(FIELD_OVERRIDES)
+
+/**
+ * Build the decoder for a field the column type fully describes.
+ *
+ * Throws rather than returning a no-op decoder if the catalogue names a column
+ * that does not exist: a field that decodes to nothing is a signal we pay for,
+ * receive and discard in silence, which is precisely what these two lists exist
+ * to make impossible. `catalogue.test.ts` already asserts every entry's column
+ * exists, so this cannot fire in a build that passed.
+ */
+function catalogueDecoder(entry: TeslaField): (value: unknown) => TeslaFieldUpdate | null {
+  const columns = columnsOf(entry).map((name) => {
+    const column = COLUMNS_BY_NAME.get(name)
+    if (!column) throw new Error(`${entry.field} names column '${name}', which @ev/core lacks`)
+    return column
+  })
+  const slots = slotsOf(entry)
+  const convert = entry.convert === null ? null : VALUE_CONVERTERS[entry.convert]
+  const decoders = columns.map((c) => SQL_DECODERS[c.sql])
+
+  /**
+   * A pair: latitude and longitude arrive in ONE message, as a two-key object,
+   * and the pair is only meaningful whole - a sample carrying a latitude with a
+   * null longitude would be plotted on the prime meridian. Both land or neither
+   * does.
+   */
+  if (slots.length === 2) {
+    // A converter would silently do nothing here - it takes a scalar and this
+    // payload is a struct - so a catalogue that ever names one on a pair should
+    // fail loudly rather than convert nothing.
+    if (convert) throw new Error(`${entry.field} is a pair; a converter cannot apply to it`)
+    const decodeLat = decoders[0]!
+    const decodeLon = decoders[1]!
+    const latSlot = slots[0]!
+    const lonSlot = slots[1]!
+    return (value) => {
+      const o = asRecord(value)
+      if (!o) return null
+      const lat = decodeLat(o['latitude'])
+      const lon = decodeLon(o['longitude'])
+      if (lat === null || lon === null) return null
+      return { [latSlot]: lat, [lonSlot]: lon } as TeslaFieldUpdate
+    }
+  }
+
+  const decode = decoders[0]!
+  const slot = slots[0]!
+  return (value) => {
+    const decoded = decode(convert ? convert(value) : value)
+    return decoded === null ? null : ({ [slot]: decoded } as TeslaFieldUpdate)
+  }
+}
+
+/**
+ * Tesla field name -> the slots it fills, one entry per catalogued signal.
+ *
+ * A decoder returns `null` when the value is unreadable, which is what
+ * distinguishes "the car published Soc" from "the car published a readable Soc".
+ * Only a non-null return is allowed to change accumulated state, so an
+ * unreadable message can never blank a good earlier reading.
+ *
+ * Field names absent from this map are ignored on purpose: they are the ones
+ * `EXCLUDED_FIELDS` names and the ones Tesla has not shipped yet. A field the
+ * proto gains that is neither catalogued nor excluded fails the catalogue test
+ * rather than arriving here.
+ */
+const FIELD_DECODERS: Record<string, (value: unknown) => TeslaFieldUpdate | null> =
+  Object.fromEntries(
+    TESLA_FIELDS.map((entry) => [
+      entry.field,
+      FIELD_OVERRIDES[entry.field] ?? catalogueDecoder(entry),
+    ]),
+  )
 
 /** The field names this adapter knows how to place. Exported for tests/metrics. */
 export const TESLA_KNOWN_FIELDS: readonly string[] = Object.keys(FIELD_DECODERS)
@@ -199,32 +340,45 @@ export function decodeTeslaField(field: string, value: unknown): TeslaFieldUpdat
 }
 
 /**
+ * The catalogued columns an accumulated state carries under their own key.
+ * Everything else on `sample` is either collapsed below or has no Tesla field.
+ */
+const DIRECT_KEYS: readonly string[] = SAMPLE_COLUMNS
+  .map((c) => c.key)
+  .filter((key) => !(COLLAPSED_KEYS as readonly string[]).includes(key))
+
+/**
  * Build a `VehicleSample` from accumulated state.
  *
  * `ts` is supplied by the caller because the metrics transport carries no
  * timestamp of its own: the only time we have is when the message arrived.
+ *
+ * The direct columns are copied by name over the catalogue rather than listed,
+ * for the same reason the decoders are built from it: a column left out of a
+ * hand-written list is a signal that is asked for, paid for, decoded and then
+ * silently not stored, and nothing at runtime would say so.
  */
 export function teslaStateToSample(
   vehicleId: string,
   ts: Date,
   state: TeslaFieldUpdate,
 ): VehicleSample {
-  const tpms = tpmsRecord(state)
+  const direct: Record<string, unknown> = {}
+  const slots = state as Record<string, unknown>
+  for (const key of DIRECT_KEYS) {
+    // Only what was actually reported: `makeSample` fills the rest with null,
+    // and an `undefined` reaching the insert would bind as NULL anyway but say
+    // nothing here about which of the two it meant.
+    if (slots[key] !== undefined && slots[key] !== null) direct[key] = slots[key]
+  }
   return makeSample({
+    // The cast is the price of iterating the catalogue by name; the values are
+    // whatever the per-type decoders produced, which the bindability test pins
+    // to each column's declared SQL type.
+    ...(direct as Partial<VehicleSample>),
     vehicleId,
     ts,
-    socPct: state.socPct ?? null,
-    rangeKm: state.rangeKm ?? null,
-    odometerKm: state.odometerKm ?? null,
-    speedKph: state.speedKph ?? null,
-    insideTempC: state.insideTempC ?? null,
-    outsideTempC: state.outsideTempC ?? null,
-    lat: state.lat ?? null,
-    lon: state.lon ?? null,
-    locked: state.locked ?? null,
-    doorsOpen: state.doorsOpen ?? null,
-    tpms,
-    powerState: state.powerState ?? null,
+    tpms: tpmsRecord(state),
     // DetailedChargeState is the finer-grained of the two enums and wins when
     // both are known.
     chargeState: state.chargeStateDetailed ?? state.chargeStateBasic ?? null,
@@ -327,9 +481,56 @@ function num(v: unknown): number | null {
   return null
 }
 
+const scaled = (v: unknown, factor: number): number | null => {
+  const n = num(v)
+  return n === null ? null : n * factor
+}
+
+/** Postgres `INT` is int4; anything outside it is a bind error, not a big number. */
+const INT_MAX = 2_147_483_647
+
+/**
+ * ROUND OR REJECT. A count that arrives as 3.0000001 is a count, and refusing it
+ * would lose a real reading; a count of 3e9 is not one this column can hold, and
+ * binding it would take the transaction down with it.
+ */
+function int(v: unknown): number | null {
+  const n = num(v)
+  if (n === null) return null
+  const rounded = Math.round(n)
+  return Math.abs(rounded) > INT_MAX ? null : rounded
+}
+
 /** Enums arrive as their protobuf `.String()` name, i.e. a bare JSON string. */
 function str(v: unknown): string | null {
   return typeof v === 'string' && v.trim() !== '' ? v : null
+}
+
+/**
+ * TEXT takes anything stringifiable, INCLUDING an object.
+ *
+ * That looks lax next to the rest of this file, and it is the point: a column is
+ * TEXT either because it holds a vendor enum name, or because we have not yet
+ * observed what shape the field arrives in (§3.4). For the second kind, storing
+ * `{"hour":7,"minute":30}` verbatim is what lets a later migration promote the
+ * column to `TIME` and `reprocess` fill it in; refusing the object would leave
+ * the column null and the promotion with nothing to read but the tape. Only
+ * `null` - Value_Invalid - and a blank string are refused, because neither is a
+ * value the car meant to send.
+ */
+function text(v: unknown): string | null {
+  if (typeof v === 'string') return v.trim() === '' ? null : v
+  if (typeof v === 'number') return Number.isFinite(v) ? String(v) : null
+  if (typeof v === 'boolean') return String(v)
+  if (typeof v === 'object' && v !== null) {
+    try {
+      const json = JSON.stringify(v)
+      return json === undefined ? null : json
+    } catch {
+      return null
+    }
+  }
+  return null
 }
 
 function bool(v: unknown): boolean | null {
@@ -339,6 +540,58 @@ function bool(v: unknown): boolean | null {
   if (v === 'true') return true
   if (v === 'false') return false
   return null
+}
+
+/**
+ * The proto's `message Time` is `{hour, minute, second}`: a wall clock, with no
+ * date and no zone, which is why these fields are NOT timestamps. Rendered as
+ * `HH:MM:SS` because that is what a `TIME` column takes.
+ *
+ * Out-of-range parts are refused rather than clamped: postgres rejects `25:00`,
+ * and a clamped `23:59` would be a value the car never sent.
+ */
+function timeOfDay(v: unknown): string | null {
+  const o = asRecord(v)
+  if (!o) return null
+  const hour = num(o['hour'])
+  const minute = num(o['minute'])
+  // The proto omits a zero field rather than sending it, so a missing second is
+  // the top of the minute, not an unreadable value.
+  const second = o['second'] === undefined ? 0 : num(o['second'])
+  if (!within(hour, 23) || !within(minute, 59) || !within(second, 59)) return null
+  return [hour, minute, second].map((n) => String(n).padStart(2, '0')).join(':')
+}
+
+function within(n: number | null, max: number): n is number {
+  return n !== null && Number.isInteger(n) && n >= 0 && n <= max
+}
+
+/**
+ * A `TIMESTAMPTZ` column accepts ONLY what `epochSecondsToDate` produced.
+ *
+ * A bare epoch or an ISO string reaching here means the catalogue did not name
+ * the converter, and postgres would read a bare number as a year - so this is
+ * the case where accepting the value is worse than losing it.
+ */
+function timestamptz(v: unknown): Date | null {
+  return v instanceof Date && !Number.isNaN(v.getTime()) ? v : null
+}
+
+/**
+ * The only JSONB column is `tpms`, whose declared type is a record of numbers,
+ * so that is what this takes. An empty record is null: "no corner reported" is
+ * not "a reading with nothing in it".
+ */
+function numberRecord(v: unknown): Record<string, number> | null {
+  const o = asRecord(v)
+  if (!o) return null
+  const out: Record<string, number> = {}
+  for (const [key, value] of Object.entries(o)) {
+    const n = num(value)
+    if (n === null) return null
+    out[key] = n
+  }
+  return Object.keys(out).length > 0 ? out : null
 }
 
 /**
@@ -383,10 +636,10 @@ function chargeState(s: string | null): ChargeState | null {
 /**
  * Any door open?
  *
- * `DoorState` is the one struct-valued field besides Location: a set of per-door
- * booleans. Absent or unreadable gives null rather than false, because "no door
- * reported" is not "all doors shut" - a false would show a car we know nothing
- * about as secure.
+ * `DoorState` is the one struct-valued field besides the locations: a set of
+ * per-door booleans. Absent or unreadable gives null rather than false, because
+ * "no door reported" is not "all doors shut" - a false would show a car we know
+ * nothing about as secure.
  */
 function anyDoorOpen(v: unknown): boolean | null {
   if (typeof v === 'boolean') return v
