@@ -24,10 +24,31 @@ import type { DbClient } from './types.js'
  */
 const BOUND_COLUMNS = ['vehicle_id', 'ts', ...SAMPLE_COLUMNS.map((c) => c.column)]
 
-export const SAMPLE_INSERT_SQL =
+const HEAD =
   `INSERT INTO sample (${BOUND_COLUMNS.join(', ')})\n` +
-  `VALUES (${BOUND_COLUMNS.map((_, i) => `$${i + 1}`).join(',')})\n` +
-  'ON CONFLICT (vehicle_id, ts) DO NOTHING'
+  `VALUES (${BOUND_COLUMNS.map((_, i) => `$${i + 1}`).join(',')})\n`
+
+export const SAMPLE_INSERT_SQL = HEAD + 'ON CONFLICT (vehicle_id, ts) DO NOTHING'
+
+/**
+ * The same insert, but writing onto a row that already exists. `reprocess`
+ * only — see `upsertSample`.
+ *
+ * COALESCE, not a plain `EXCLUDED.<col>` assignment, and that is the whole of
+ * what distinguishes it from the insert: the replayed value wins only when
+ * there IS one. A replay starting mid-history begins with a cold accumulator,
+ * so its first samples know strictly less than the rows already on disk, and
+ * assigning EXCLUDED outright would blank real values with the nulls of a
+ * warm-up — silently, since a null column is indistinguishable from a signal
+ * the car never sent. Neither key column is assigned: `ts` is the partition
+ * key, and updating either would make the conflict target a lie.
+ */
+export const SAMPLE_UPSERT_SQL =
+  HEAD +
+  'ON CONFLICT (vehicle_id, ts) DO UPDATE SET\n' +
+  SAMPLE_COLUMNS
+    .map((c) => `  ${c.column} = COALESCE(EXCLUDED.${c.column}, sample.${c.column})`)
+    .join(',\n')
 
 /**
  * ON CONFLICT DO NOTHING makes replay idempotent: the primary key is
@@ -37,10 +58,39 @@ export const SAMPLE_INSERT_SQL =
  * timestamp are the same observation redelivered, and the first write already
  * holds it; an upsert would let a later, sparser redelivery of the same instant
  * overwrite populated columns with nulls.
+ *
+ * This is the LIVE path and it does not change. MQTT redelivers until it is
+ * acked, and "the second delivery writes nothing" is what makes acking after
+ * COMMIT safe. The backfill's need to write existing rows is answered by a
+ * separate statement below, not by relaxing this one.
  */
 export async function insertSample(c: DbClient, s: VehicleSample): Promise<void> {
+  await c.query(SAMPLE_INSERT_SQL, bindingsFor(s))
+}
+
+/**
+ * Write a replayed sample onto a row that may already exist (spec §4's last
+ * row, §6 step 4).
+ *
+ * `gear` and `charge_amps` have been on the tape since day one and had no
+ * column to go to, so the rows they belong on were written long before those
+ * columns existed. `reprocess` rebuilds the derived tables from the tape, and
+ * under DO NOTHING every one of those writes would be discarded without a word
+ * — the backfill would report success and change nothing.
+ *
+ * `reprocess` ONLY. It is safe there for a reason that does not hold live: a
+ * replay is an authoritative rebuild of a window, run deliberately, whereas a
+ * live redelivery is the same observation arriving twice and the row we already
+ * have is the better copy of it.
+ */
+export async function upsertSample(c: DbClient, s: VehicleSample): Promise<void> {
+  await c.query(SAMPLE_UPSERT_SQL, bindingsFor(s))
+}
+
+/** Shared so the two statements cannot bind the same catalogue differently. */
+function bindingsFor(s: VehicleSample): unknown[] {
   const row = s as unknown as Record<string, unknown>
-  await c.query(SAMPLE_INSERT_SQL, [
+  return [
     s.vehicleId,
     s.ts,
     // JSONB is the one type that is not already what pg wants to bind: the
@@ -51,7 +101,7 @@ export async function insertSample(c: DbClient, s: VehicleSample): Promise<void>
       const v = row[col.key]
       return col.sql === 'JSONB' && v != null ? JSON.stringify(v) : v
     }),
-  ])
+  ]
 }
 
 /**

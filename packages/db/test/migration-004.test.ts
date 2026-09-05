@@ -3,7 +3,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { SAMPLE_COLUMNS } from '@ev/core'
-import { SAMPLE_INSERT_SQL } from '../src/repo/samples.js'
+import { SAMPLE_INSERT_SQL, SAMPLE_UPSERT_SQL } from '../src/repo/samples.js'
 
 /**
  * The drift tests that need no database (spec §5): the checked-in migration and
@@ -126,5 +126,51 @@ describe('the generated insert', () => {
     // near it, and the assertion is here so that a future catalogue that IS
     // near it fails on a test rather than on a production insert.
     expect(placeholders.length).toBeLessThan(65535 / 4)
+  })
+})
+
+/**
+ * The reprocess-only statement (spec §4's last row). It is generated from the
+ * same catalogue as the insert, so it drifts from the schema in exactly the
+ * same way if nobody checks: a column missing from its SET list is a column the
+ * backfill silently never writes, which is indistinguishable from a signal we
+ * never recorded.
+ */
+describe('the reprocess upsert', () => {
+  const columnList = /INSERT INTO sample \(([\s\S]*?)\)\s*VALUES/.exec(SAMPLE_UPSERT_SQL)?.[1]
+  const columns = (columnList ?? '').split(',').map((c) => c.trim()).filter(Boolean)
+  const assignments = [...SAMPLE_UPSERT_SQL.matchAll(/^\s*([a-z0-9_]+) = /gm)].map((m) => m[1])
+
+  it('binds the same columns as the insert, in the same order', () => {
+    expect(columns).toEqual(['vehicle_id', 'ts', ...catalogued])
+  })
+
+  it('is still one statement, with the same conflict target', () => {
+    expect(SAMPLE_UPSERT_SQL.match(/INSERT INTO/g)).toHaveLength(1)
+    expect(SAMPLE_UPSERT_SQL).not.toContain(';')
+    expect(SAMPLE_UPSERT_SQL).toMatch(/ON CONFLICT \(vehicle_id, ts\) DO UPDATE SET/)
+  })
+
+  it('updates every catalogued column and neither key column', () => {
+    expect(assignments).toEqual(catalogued)
+    // Updating the partition key would move the row between partitions, and
+    // updating the identity would make the conflict target a lie.
+    expect(assignments).not.toContain('ts')
+    expect(assignments).not.toContain('vehicle_id')
+  })
+
+  it('never lets a null from the replay blank a stored value', () => {
+    // The reason `insertSample` does nothing on conflict, preserved here: the
+    // replayed value wins only when there IS one.
+    for (const c of catalogued) {
+      expect(SAMPLE_UPSERT_SQL)
+        .toContain(`${c} = COALESCE(EXCLUDED.${c}, sample.${c})`)
+    }
+  })
+
+  it('has one placeholder per bound column, numbered from $1', () => {
+    const placeholders = [...SAMPLE_UPSERT_SQL.matchAll(/\$(\d+)/g)].map((m) => Number(m[1]))
+    expect(placeholders).toEqual(columns.map((_, i) => i + 1))
+    expect(placeholders).toHaveLength(SAMPLE_COLUMNS.length + 2)
   })
 })

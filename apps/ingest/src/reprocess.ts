@@ -20,7 +20,7 @@ import {
 } from '@ev/db'
 import { loadConfig } from './config.js'
 import { Pipeline } from './pipeline.js'
-import { storeOn } from './store.js'
+import { replayStoreOn } from './store.js'
 
 export interface Window { from: Date; to: Date }
 
@@ -56,8 +56,20 @@ async function main(): Promise<void> {
 
     // One client, so every write joins the enclosing transaction rather than
     // committing message by message.
+    //
+    // `replayStoreOn`, not `storeOn`: a replay must be able to write onto a
+    // sample row that already exists, and the live path's insert does nothing
+    // on conflict by design (spec §4's last row). Without it, backfilling a
+    // signal we taped but never had a column for (`gear`, `charge_amps`) can
+    // run to completion, print a count, and change nothing.
+    //
+    // `deleteDerived` above clears most of that away first, so the conflict is
+    // not the common case — but it deletes for ONE vehicle while `streamRaw`
+    // replays the whole tape, so any other vehicle's rows survive it and would
+    // be replayed straight into the DO NOTHING. A backfill that silently skips
+    // a vehicle is exactly the failure this is here to remove.
     const pipeline = new Pipeline(
-      { run: (fn) => fn(storeOn(client, config.cursorSource)) },
+      { run: (fn) => fn(replayStoreOn(client, config.cursorSource)) },
       { usableCapacityKwh: config.usableCapacityKwh },
     )
 

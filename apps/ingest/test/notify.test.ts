@@ -101,7 +101,9 @@ describe('reprocess', () => {
   it('constructs its own runner and therefore cannot notify', () => {
     const src = readFileSync(new URL('../src/reprocess.ts', import.meta.url), 'utf8')
     expect(src).not.toMatch(/pgRunner/)
-    expect(src).toMatch(/run:\s*\(fn\)\s*=>\s*fn\(storeOn\(/)
+    // `replayStoreOn` since the backfill (spec §4): still a plain store bound
+    // to the replay's own client, which is what this test is about.
+    expect(src).toMatch(/run:\s*\(fn\)\s*=>\s*fn\(replayStoreOn\(/)
   })
 
   it('keeps the notify out of the Store interface', () => {

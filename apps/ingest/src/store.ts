@@ -10,6 +10,7 @@ import {
   openSession,
   recordMeasuredCapacity,
   upsertBatteryHealth,
+  upsertSample,
   withTransaction,
   type DbClient,
   type DbPool,
@@ -62,6 +63,31 @@ export function storeOn(client: DbClient, cursorSource: string): Store {
     recordBatteryHealth: (row) => upsertBatteryHealth(client, row),
     recordMeasuredCapacity: (row) => recordMeasuredCapacity(client, row),
     advanceCursor: (at) => advanceCursor(client, cursorSource, at),
+  }
+}
+
+/**
+ * The same bindings, but samples are written with the explicit upsert. For
+ * `reprocess` and nothing else (spec §4's last row, §6 step 4).
+ *
+ * WHY A SECOND STORE rather than a flag on the first: the live path's
+ * `insertSample` does nothing on conflict, and that is what makes acking an
+ * MQTT message after COMMIT safe — a redelivery must not be able to overwrite
+ * the row we already have with a sparser copy of the same instant. But a
+ * backfill writes onto rows that already exist by definition: `gear` and
+ * `charge_amps` were taped for a year with no column to hold them, and under DO
+ * NOTHING every replayed row would be discarded silently and the backfill would
+ * report success.
+ *
+ * Which store you get is therefore a property of the CALLER, decided once at
+ * the entrypoint, rather than a mode the pipeline has to reason about. The
+ * pipeline is unchanged and cannot tell the difference, which is what keeps
+ * replay producing the same samples as the live worker did.
+ */
+export function replayStoreOn(client: DbClient, cursorSource: string): Store {
+  return {
+    ...storeOn(client, cursorSource),
+    insertSample: (s) => upsertSample(client, s),
   }
 }
 

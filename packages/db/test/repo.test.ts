@@ -7,9 +7,11 @@ import { closePool, getPool } from '../src/pool.js'
 import { runMigrationsUnderGate } from '../src/migrate.js'
 import { withTransaction } from '../src/repo/types.js'
 import { insertRaw, streamRaw } from '../src/repo/raw.js'
-import { ensurePartitions, insertSample } from '../src/repo/samples.js'
+import { ensurePartitions, insertSample, upsertSample } from '../src/repo/samples.js'
 import { ensureVehicle } from '../src/repo/vehicles.js'
-import { appendPoint, closeSession, findOpenSession, openSession } from '../src/repo/sessions.js'
+import {
+  appendPoint, closeSession, deleteDerived, findOpenSession, openSession,
+} from '../src/repo/sessions.js'
 import { recordMeasuredCapacity, upsertBatteryHealth } from '../src/repo/battery.js'
 import { advanceCursor, readCursor } from '../src/repo/cursor.js'
 import { notifyVehicleChanged, VEHICLE_CHANGED_CHANNEL } from '../src/repo/notify.js'
@@ -161,6 +163,85 @@ describe.skipIf(!hasDb)('repositories', () => {
     expect(after.rows).toHaveLength(1)
     expect(after.rows[0]?.soc_pct).toBe(sampleValue(SAMPLE_COLUMNS[0]!))
     expect(after.rows[0]?.gear).not.toBeNull()
+  })
+
+  /**
+   * The reprocess write path (spec §4's last row, §6 step 4).
+   *
+   * `gear` and `charge_amps` have been taped since day one and had nowhere to
+   * go, so the rows they belong on already exist — and `insertSample` cannot
+   * write them, by design. The backfill therefore gets its OWN statement rather
+   * than a relaxation of that one: the live path's DO NOTHING is what makes an
+   * MQTT redelivery a no-op, and it stays exactly as it was.
+   */
+  describe('the reprocess upsert', () => {
+    const REPLAY_TS = new Date('2026-09-20T10:00:00.000Z')
+    const WINDOW_FROM = new Date('2026-09-20T00:00:00.000Z')
+    const WINDOW_TO = new Date('2026-09-21T00:00:00.000Z')
+
+    it('writes the columns an existing row lacks', async () => {
+      // The row as the live worker wrote it before those columns existed: the
+      // car was reporting gear and charge amps, and both were discarded.
+      await withTransaction(getPool(), (c) =>
+        insertSample(c, makeSample({ vehicleId: VEHICLE, ts: REPLAY_TS, socPct: 80 })))
+
+      await withTransaction(getPool(), (c) =>
+        upsertSample(c, makeSample({
+          vehicleId: VEHICLE, ts: REPLAY_TS, socPct: 80, gear: 'D', chargeAmps: 16,
+        })))
+
+      const { rows } = await getPool().query(
+        'SELECT soc_pct, gear, charge_amps FROM sample WHERE vehicle_id=$1 AND ts=$2',
+        [VEHICLE, REPLAY_TS])
+      expect(rows).toHaveLength(1)
+      expect(rows[0]?.gear).toBe('D')
+      expect(rows[0]?.charge_amps).toBe(16)
+      expect(rows[0]?.soc_pct).toBe(80)
+    })
+
+    it('does not blank a populated column with a sparser replay', async () => {
+      // The reason DO NOTHING was chosen, kept intact where it still applies. A
+      // replay starting mid-history begins with a cold accumulator, so its first
+      // samples know LESS than the rows already on disk; a straight EXCLUDED
+      // assignment would write those nulls over real values, and nothing would
+      // report it. A value still wins over a value — the tape is authoritative
+      // when it has something to say.
+      await withTransaction(getPool(), (c) =>
+        upsertSample(c, makeSample({ vehicleId: VEHICLE, ts: REPLAY_TS, gear: 'P' })))
+
+      const { rows } = await getPool().query(
+        'SELECT soc_pct, gear, charge_amps FROM sample WHERE vehicle_id=$1 AND ts=$2',
+        [VEHICLE, REPLAY_TS])
+      expect(rows).toHaveLength(1)
+      expect(rows[0]?.gear).toBe('P')
+      expect(rows[0]?.soc_pct).toBe(80)
+      expect(rows[0]?.charge_amps).toBe(16)
+    })
+
+    it('does not resurrect a row the rebuild deleted', async () => {
+      const gone = new Date('2026-09-20T11:00:00.000Z')
+      await withTransaction(getPool(), (c) =>
+        insertSample(c, makeSample({ vehicleId: VEHICLE, ts: gone, socPct: 40 })))
+
+      // What `reprocess` does, in the order it does it: delete the window, then
+      // replay the tape into it. The upsert must write only what the replay
+      // produced — a row whose messages are no longer on the tape stays gone,
+      // or a rebuild would be a merge onto history rather than a rebuild of it.
+      await withTransaction(getPool(), async (c) => {
+        await deleteDerived(c, VEHICLE, WINDOW_FROM, WINDOW_TO)
+        await upsertSample(c, makeSample({
+          vehicleId: VEHICLE, ts: REPLAY_TS, socPct: 80, gear: 'D',
+        }))
+      })
+
+      const { rows } = await getPool().query(
+        'SELECT ts, gear FROM sample WHERE vehicle_id=$1 AND ts >= $2 AND ts < $3 ORDER BY ts',
+        [VEHICLE, WINDOW_FROM, WINDOW_TO])
+      expect(rows.map((r: { ts: Date }) => r.ts.toISOString()))
+        .toEqual([REPLAY_TS.toISOString()])
+      // And the row it did write is the replay's, not a survivor of it.
+      expect(rows[0]?.gear).toBe('D')
+    })
   })
 
   it('opening a session twice adopts the one that is already open', async () => {
