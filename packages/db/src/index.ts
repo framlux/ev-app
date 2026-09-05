@@ -16,6 +16,7 @@ export { runMigrations, runMigrationsUnderGate, MIGRATION_GATE_KEY } from './mig
 export * from './repo/types.js'
 export * from './repo/battery.js'
 export * from './repo/cursor.js'
+export * from './repo/notify.js'
 export * from './repo/raw.js'
 export * from './repo/samples.js'
 export * from './repo/sessions.js'

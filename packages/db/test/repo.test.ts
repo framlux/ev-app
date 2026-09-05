@@ -9,6 +9,7 @@ import { ensureVehicle } from '../src/repo/vehicles.js'
 import { appendPoint, closeSession, findOpenSession, openSession } from '../src/repo/sessions.js'
 import { upsertBatteryHealth } from '../src/repo/battery.js'
 import { advanceCursor, readCursor } from '../src/repo/cursor.js'
+import { notifyVehicleChanged, VEHICLE_CHANGED_CHANNEL } from '../src/repo/notify.js'
 
 /**
  * The repository layer against a real Postgres. These exist because the ingest
@@ -237,5 +238,33 @@ describe.skipIf(!hasDb)('repositories', () => {
     // Ordered, and `to` is exclusive so adjacent windows neither overlap nor
     // leave a hole.
     expect(seen).toEqual([0, 1])
+  })
+
+  it('delivers a notification only after the transaction commits', async () => {
+    const pool = getPool()
+    const listener = await pool.connect()
+    const received: string[] = []
+    listener.on('notification', (msg) => received.push(msg.payload ?? ''))
+    await listener.query(`LISTEN ${VEHICLE_CHANGED_CHANNEL}`)
+
+    const change = { vehicleId: VEHICLE, ts: TS.toISOString(), kind: 'sample' as const }
+
+    // A transaction that rolls back must deliver nothing.
+    await withTransaction(pool, async (c) => {
+      await notifyVehicleChanged(c, change)
+      throw new Error('rollback')
+    }).catch(() => undefined)
+    await new Promise((r) => setTimeout(r, 200))
+    expect(received).toEqual([])
+
+    // A transaction that commits must deliver exactly once.
+    await withTransaction(pool, (c) => notifyVehicleChanged(c, change))
+    await new Promise((r) => setTimeout(r, 200))
+    expect(received).toEqual([JSON.stringify(change)])
+
+    // UNLISTEN before the connection goes back to the pool: a subscription
+    // that followed it back would deliver into a later test's client.
+    await listener.query('UNLISTEN *')
+    listener.release()
   })
 })
