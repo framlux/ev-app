@@ -35,3 +35,16 @@ it('passes client_id, redirect_uri and state through unmangled', () => {
   expect(u.searchParams.get('state')).toBe('nonce123')
   expect(u.searchParams.get('response_type')).toBe('code')
 })
+
+it('asks Tesla to prompt for scopes an existing grant does not already carry', () => {
+  // Without this, Tesla reuses the scopes of the existing (account, app) grant
+  // and ignores the scope parameter entirely. Consent and exchange both
+  // succeed, and the token silently carries the OLD scope set.
+  const u = new URL(authorizeUrl('cid', 'https://ev.framlux.io/tesla_login', 's'))
+  expect(u.searchParams.get('prompt_missing_scopes')).toBe('true')
+})
+
+it('requires the full requested scope set, so a partial grant fails loudly', () => {
+  const u = new URL(authorizeUrl('cid', 'https://ev.framlux.io/tesla_login', 's'))
+  expect(u.searchParams.get('require_requested_scopes')).toBe('true')
+})

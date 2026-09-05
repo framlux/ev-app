@@ -43,6 +43,23 @@ export function authorizeUrl(
     // Tesla silently reuses that session, which is how you consent as the
     // wrong account and get an empty vehicle list with no error.
     prompt: 'login',
+    // BOTH of these are required to widen the scopes of an app a Tesla account
+    // has already authorized, and their absence is silent.
+    //
+    // Tesla records a grant per (account, application). Once one exists, a
+    // fresh authorize call reuses ITS scopes and ignores what you asked for -
+    // consent succeeds, the exchange succeeds, and the token comes back with
+    // the original scope set. `prompt: 'login'` does not help: it forces
+    // re-authentication, not re-consent, so it produces a convincing login
+    // screen and the same old grant. That is precisely how this app spent a
+    // round of consent believing it had vehicle_cmds when it had four scopes.
+    //
+    // prompt_missing_scopes asks the user to approve scopes not already
+    // granted. require_requested_scopes then makes a partial grant an outright
+    // failure instead of a quiet downgrade - the failure mode being fixed here
+    // is not that a scope was refused, it is that nothing said so.
+    prompt_missing_scopes: 'true',
+    require_requested_scopes: 'true',
   })
   return `${AUTHORIZE_URL}?${q}`
 }
