@@ -95,17 +95,66 @@ describe('apps/web authentication boundaries', () => {
     expect(offenders).toEqual([])
   })
 
+  /**
+   * What "issues an app session" means, in one place so the guard and the test
+   * that proves the guard still works cannot drift apart.
+   *
+   * `cookies.set(` used to be part of this pattern, as a proxy for "mints a
+   * credential". It stopped being a usable proxy the moment a Tesla flow
+   * legitimately needed a cookie of its own: the consent flow's `state` nonce
+   * is a CSRF token for an OUTBOUND authorization request, not a credential for
+   * this app, and it has to be set in a file that says the word Tesla. Left as
+   * it was, a correct connect route turned this test red, and the only ways out
+   * were deleting the guard or hiding the flow from it - both worse.
+   *
+   * Narrowing a guard is exactly the move that should be suspicious, so the
+   * invariant is restated rather than assumed: no Tesla credential may ever
+   * mint an APP session. This app mints one in exactly one way - `sealSession`,
+   * written to the cookie `SESSION_COOKIE` names - and those are what this
+   * matches now. The test below proves it, against fixture strings rather than
+   * by reading the regex.
+   */
+  const issuesAppSession = (src: string) => /sealSession|SESSION_COOKIE\b|ev_session/.test(src)
+  const touchesTesla = (src: string) => /tesla/i.test(src)
+
   it('never issues an app session from a Tesla credential', () => {
     const offenders: string[] = []
     for (const f of files) {
       const src = readFileSync(f, 'utf8')
-      // A session cookie or sealSession call in the same file as Tesla OAuth
-      // handling is the shape this forbids.
-      const touchesTesla = /tesla/i.test(src)
-      const issuesSession = /sealSession|ev_session|cookies\.set\(/.test(src)
-      if (touchesTesla && issuesSession) offenders.push(f)
+      // Sealing a session, or writing the session cookie by name, in the same
+      // file as Tesla OAuth handling is the shape this forbids.
+      if (touchesTesla(src) && issuesAppSession(src)) offenders.push(f)
     }
     expect(offenders).toEqual([])
+  })
+
+  it('still catches a Tesla credential that mints an app session', () => {
+    // The narrowing above is only defensible if what it defends is still
+    // caught, and that has to be demonstrated rather than argued.
+    const sealsIt = `
+      import { exchangeCode } from '@ev/tesla'
+      const tokens = await exchangeCode(code, clientId, clientSecret, redirectUri)
+      cookies.set(SESSION_COOKIE, await sealSession({ sub }, key), SESSION_COOKIE_OPTIONS)
+    `
+    expect(touchesTesla(sealsIt) && issuesAppSession(sealsIt)).toBe(true)
+
+    // And by the cookie's literal name, which is how it would be written by
+    // something reaching around $lib/server/session.js.
+    const writesTheCookieByName = `
+      const token = await teslaAccessToken(code)
+      response.headers.set('set-cookie', \`ev_session=\${token}; Path=/\`)
+    `
+    expect(touchesTesla(writesTheCookieByName) && issuesAppSession(writesTheCookieByName)).toBe(true)
+
+    // What the narrowing deliberately admits, pinned so re-widening this guard
+    // breaks a test that explains why it was narrowed: a consent flow setting
+    // its own CSRF nonce grants nothing about this app.
+    const setsAStateNonce = `
+      import { teslaRedirectUri } from '$lib/server/tesla-client.js'
+      cookies.set(TESLA_FLOW_COOKIE, JSON.stringify({ s: state }), { sameSite: 'lax' })
+    `
+    expect(touchesTesla(setsAStateNonce)).toBe(true)
+    expect(issuesAppSession(setsAStateNonce)).toBe(false)
   })
 
   it('offers no Tesla sign-in affordance in the UI', () => {

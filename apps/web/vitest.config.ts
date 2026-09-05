@@ -78,7 +78,17 @@ function svelteSsrForTests(): Plugin {
 export default defineConfig({
 	plugins: [svelteSsrForTests()],
 	resolve: {
-		conditions: ['svelte', 'import', 'default']
+		conditions: ['svelte', 'import', 'default'],
+		/**
+		 * `$env/dynamic/private` only exists inside a SvelteKit runtime, so
+		 * without this any server module that reads configuration cannot be
+		 * imported by a test at all — the import fails before a single assertion
+		 * runs. The stub reads process.env and applies SvelteKit's own PUBLIC_
+		 * filter, so a module under test sees what it sees in the pod.
+		 */
+		alias: {
+			'$env/dynamic/private': fileURLToPath(new URL('./test/support/env.ts', import.meta.url))
+		}
 	},
 	test: {
 		name: 'web',

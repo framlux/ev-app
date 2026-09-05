@@ -24,6 +24,7 @@
 	"dependencies": {
 		"@ev/core": "workspace:*",
 		"@ev/db": "workspace:*",
+		"@ev/tesla": "workspace:*",
 		"jose": "^5.9.0",
 		"maplibre-gl": "^4.7.0",
 		"openid-client": "^6.1.0"

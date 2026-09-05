@@ -44,6 +44,9 @@ importers:
       '@ev/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@ev/tesla':
+        specifier: workspace:*
+        version: link:../../packages/tesla
       jose:
         specifier: ^5.9.0
         version: 5.10.0
