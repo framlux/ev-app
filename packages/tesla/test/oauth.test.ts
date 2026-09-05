@@ -1,5 +1,5 @@
-import { expect, it } from 'vitest'
-import { SCOPES, authorizeUrl } from '../src/oauth.js'
+import { afterEach, expect, it, vi } from 'vitest'
+import { SCOPES, WEB_SCOPES, authorizeUrl, exchangeCode } from '../src/oauth.js'
 
 it('always requests offline_access, or there is no refresh token at all', () => {
   // This omission has already happened once. Its symptom is not a failed
@@ -47,4 +47,55 @@ it('asks Tesla to prompt for scopes an existing grant does not already carry', (
 it('requires the full requested scope set, so a partial grant fails loudly', () => {
   const u = new URL(authorizeUrl('cid', 'https://ev.framlux.io/tesla_login', 's'))
   expect(u.searchParams.get('require_requested_scopes')).toBe('true')
+})
+
+/**
+ * WEB_SCOPES is pinned exactly the way the export surface of fleet-api.ts is,
+ * and for the same reason: the failure of quietly using the default SCOPES is
+ * silent. The exchange would succeed, the app would work, and Tesla would have
+ * minted a refresh token - a standing, vehicle-capable credential living in a
+ * pod, which is the single thing the web consent flow exists to avoid.
+ */
+it('the web flow requests exactly openid and vehicle_device_data', () => {
+  expect([...WEB_SCOPES]).toEqual(['openid', 'vehicle_device_data'])
+})
+
+it('the web flow never requests offline_access, so no refresh token can exist', () => {
+  // Without offline_access Tesla returns NO refresh token at all. That is the
+  // mechanism, not a policy: the flow cannot create a long-lived credential
+  // even by mistake.
+  expect(WEB_SCOPES).not.toContain('offline_access')
+})
+
+it('the web flow requests no command scope', () => {
+  expect(WEB_SCOPES).not.toContain('vehicle_cmds')
+  expect(WEB_SCOPES).not.toContain('vehicle_charging_cmds')
+})
+
+function stubToken(body: Record<string, unknown>): void {
+  vi.stubGlobal('fetch', async () => new Response(JSON.stringify(body), {
+    status: 200, headers: { 'content-type': 'application/json' },
+  }))
+}
+
+afterEach(() => { vi.unstubAllGlobals() })
+
+it('returns a token set with no refreshToken when Tesla issues none', async () => {
+  // The web flow asks for no offline_access, so this is its NORMAL response.
+  // The field must be genuinely absent rather than `undefined` behind a type
+  // that promises a string: the callback asserts on its absence, and that
+  // assertion is the executable form of "this flow holds no standing
+  // credential".
+  stubToken({ access_token: 'at', expires_in: 28800 })
+  const t = await exchangeCode('code', 'cid', 'secret', 'https://ev.framlux.io/cb')
+  expect(t.accessToken).toBe('at')
+  expect('refreshToken' in t).toBe(false)
+  expect(t.expiresAt.getTime()).toBeGreaterThan(Date.now())
+})
+
+it('still carries the refreshToken through when Tesla issues one', async () => {
+  // The scripts' flow does request offline_access, and it must keep working.
+  stubToken({ access_token: 'at', refresh_token: 'rt', expires_in: 28800 })
+  const t = await exchangeCode('code', 'cid', 'secret', 'https://ev.framlux.io/cb')
+  expect(t.refreshToken).toBe('rt')
 })

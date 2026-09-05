@@ -29,6 +29,29 @@ export const SCOPES = [
   'vehicle_charging_cmds',
 ] as const
 
+/**
+ * The scopes the WEB app's interactive consent asks for, and nothing else.
+ *
+ * It is a separate constant rather than a subset computed from SCOPES because
+ * the two are decided for opposite reasons. SCOPES mints a standing refresh
+ * token deliberately; this flow exists so that no standing credential is
+ * created at all. Omitting `offline_access` is the mechanism, not the policy:
+ * without it Tesla issues NO refresh token, so the flow cannot mint one even by
+ * accident. The command scopes are not asked for either.
+ *
+ * Passing the default SCOPES here would fail silently - the consent and the
+ * exchange would both succeed, and the app would have created exactly the
+ * credential this design removes - so `oauth.test.ts` pins this list the way
+ * `fleet-api.test.ts` pins the export surface.
+ *
+ * Read the comment in `authorizeUrl` before trusting this to be a REDUCTION:
+ * Tesla records a grant per (account, application) and this account's grant
+ * already carries the command scopes, so a fresh authorize may hand back a
+ * token with them regardless of what was requested. What actually holds that
+ * line is that no function in this repo sends a command.
+ */
+export const WEB_SCOPES = ['openid', 'vehicle_device_data'] as const
+
 export function authorizeUrl(
   clientId: string, redirectUri: string, state: string,
   scopes: readonly string[] = SCOPES,
@@ -64,7 +87,16 @@ export function authorizeUrl(
   return `${AUTHORIZE_URL}?${q}`
 }
 
-export interface TokenSet { accessToken: string; refreshToken: string; expiresAt: Date }
+/**
+ * `refreshToken` is optional because it genuinely is: Tesla returns one only
+ * when `offline_access` was requested, and the web consent flow deliberately
+ * does not ask (see WEB_SCOPES). Typing it `string` would put an `undefined`
+ * behind a type promising otherwise - the same silent-shape trap this file's
+ * SCOPES comment documents in the other direction - and the web callback
+ * asserts on its ABSENCE, which is the executable form of "this flow holds no
+ * standing credential".
+ */
+export interface TokenSet { accessToken: string; refreshToken?: string; expiresAt: Date }
 
 export async function exchangeCode(
   code: string, clientId: string, clientSecret: string, redirectUri: string,
@@ -88,10 +120,16 @@ async function post(body: Record<string, string>): Promise<TokenSet> {
     body: new URLSearchParams(body),
   })
   if (!res.ok) throw new Error(`token request failed: ${res.status} ${await res.text()}`)
-  const j = await res.json() as { access_token: string; refresh_token: string; expires_in: number }
+  const j = await res.json() as {
+    access_token: string; refresh_token?: string; expires_in: number
+  }
   return {
     accessToken: j.access_token,
-    refreshToken: j.refresh_token,
+    // Spread rather than assigned: under exactOptionalPropertyTypes an
+    // explicit `undefined` is not the same as an absent key, and the web
+    // callback distinguishes them on purpose - it refuses a token set that
+    // CARRIES a refresh token, so the key must not exist when there is none.
+    ...(j.refresh_token !== undefined && { refreshToken: j.refresh_token }),
     expiresAt: new Date(Date.now() + j.expires_in * 1000),
   }
 }
