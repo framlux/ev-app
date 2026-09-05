@@ -1,0 +1,236 @@
+/*
+ * The whole palette, in one place.
+ *
+ * Light is the base definition and dark is a token swap, so no component ever
+ * writes a literal colour: a component that hard-codes #fff is invisible in
+ * dark mode and nothing in CI catches it. Three states matter — an explicit
+ * choice sets data-theme on <html>, and the default follows the system.
+ */
+:root {
+  color-scheme: light;
+
+  --bg: #f6f7f8;
+  --bg-grad: radial-gradient(120% 90% at 50% -20%, #ffffff 0%, #f6f7f8 60%);
+  --surface: #ffffff;
+  --surface-2: #f1f3f5;
+  --surface-inset: #eceef1;
+  --border: #e2e5e9;
+  --border-strong: #cfd4da;
+
+  --text: #14181d;
+  --text-muted: #5b6572;
+  --text-faint: #8c95a1;
+
+  --accent: #12876a;
+  --accent-text: #0d6b54;
+  --accent-soft: rgba(18, 135, 106, 0.12);
+
+  --driving: #2563c9;
+  --driving-soft: rgba(37, 99, 201, 0.12);
+  --charging: #b7791f;
+  --charging-soft: rgba(183, 121, 31, 0.14);
+  --asleep: #7a5bb5;
+  --asleep-soft: rgba(122, 91, 181, 0.13);
+  --offline: #8c95a1;
+  --offline-soft: rgba(140, 149, 161, 0.16);
+  --danger: #c0392b;
+
+  --grid: rgba(20, 24, 29, 0.09);
+
+  --radius: 14px;
+  --radius-sm: 9px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.05), 0 8px 24px -12px rgba(16, 24, 40, 0.18);
+
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, Helvetica, Arial,
+    sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  --page-max: 1140px;
+}
+
+:root[data-theme='dark'],
+html[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg: #0d1013;
+  --bg-grad: radial-gradient(120% 90% at 50% -20%, #181d23 0%, #0d1013 60%);
+  --surface: #161b21;
+  --surface-2: #1c222a;
+  --surface-inset: #11161b;
+  --border: #252c35;
+  --border-strong: #333c47;
+
+  --text: #e8ecf1;
+  --text-muted: #9aa5b2;
+  --text-faint: #6d7885;
+
+  --accent: #35c79a;
+  --accent-text: #4ad6ab;
+  --accent-soft: rgba(53, 199, 154, 0.15);
+
+  --driving: #5b9dff;
+  --driving-soft: rgba(91, 157, 255, 0.16);
+  --charging: #f0b429;
+  --charging-soft: rgba(240, 180, 41, 0.16);
+  --asleep: #a98bec;
+  --asleep-soft: rgba(169, 139, 236, 0.16);
+  --offline: #7b8593;
+  --offline-soft: rgba(123, 133, 147, 0.18);
+  --danger: #ef6b5c;
+
+  --grid: rgba(232, 236, 241, 0.10);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 30px -14px rgba(0, 0, 0, 0.7);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+
+    --bg: #0d1013;
+    --bg-grad: radial-gradient(120% 90% at 50% -20%, #181d23 0%, #0d1013 60%);
+    --surface: #161b21;
+    --surface-2: #1c222a;
+    --surface-inset: #11161b;
+    --border: #252c35;
+    --border-strong: #333c47;
+
+    --text: #e8ecf1;
+    --text-muted: #9aa5b2;
+    --text-faint: #6d7885;
+
+    --accent: #35c79a;
+    --accent-text: #4ad6ab;
+    --accent-soft: rgba(53, 199, 154, 0.15);
+
+    --driving: #5b9dff;
+    --driving-soft: rgba(91, 157, 255, 0.16);
+    --charging: #f0b429;
+    --charging-soft: rgba(240, 180, 41, 0.16);
+    --asleep: #a98bec;
+    --asleep-soft: rgba(169, 139, 236, 0.16);
+    --offline: #7b8593;
+    --offline-soft: rgba(123, 133, 147, 0.18);
+    --danger: #ef6b5c;
+
+    --grid: rgba(232, 236, 241, 0.10);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 30px -14px rgba(0, 0, 0, 0.7);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  background-image: var(--bg-grad);
+  background-attachment: fixed;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 620;
+  letter-spacing: -0.015em;
+}
+
+h1 {
+  font-size: 1.6rem;
+}
+h2 {
+  font-size: 1.05rem;
+}
+
+/* Numeric columns must align down the page; this is the whole reason drives
+   and charges read as a table rather than as ragged text. */
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.faint {
+  color: var(--text-faint);
+}
+
+.page {
+  max-width: var(--page-max);
+  margin: 0 auto;
+  padding: 28px 20px 72px;
+}
+
+.section-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 12px;
+}
+
+.section-title h2 {
+  color: var(--text);
+}
+
+.link {
+  color: var(--accent-text);
+  font-weight: 550;
+  font-size: 0.86rem;
+}
+
+.link:hover {
+  text-decoration: underline;
+}
+
+.eyebrow {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

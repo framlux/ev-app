@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "start": "node dist/main.js"
+    "start": "node dist/main.js",
+    "reprocess": "node dist/reprocess.js"
   },
   "dependencies": {
     "@ev/core": "workspace:*",
