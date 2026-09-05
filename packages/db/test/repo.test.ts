@@ -8,7 +8,7 @@ import { runMigrationsUnderGate } from '../src/migrate.js'
 import { withTransaction } from '../src/repo/types.js'
 import { insertRaw, streamRaw } from '../src/repo/raw.js'
 import { ensurePartitions, insertSample, upsertSample } from '../src/repo/samples.js'
-import { ensureVehicle } from '../src/repo/vehicles.js'
+import { ensureVehicle, findVehicleIdByVendorId } from '../src/repo/vehicles.js'
 import {
   appendPoint, closeSession, deleteDerived, findOpenSession, openSession,
 } from '../src/repo/sessions.js'
@@ -601,6 +601,39 @@ describe.skipIf(!hasDb)('repositories', () => {
         caPresent: null, firmware: null, keyPaired: null,
         streamingEnabled: null, checkedAt: null, pushedAt: PUSHED,
       })
+    })
+  })
+
+  /**
+   * The VIN is what the vendor knows; `vehicle.id` is what every FK in this
+   * schema points at, and `telemetry_status` is keyed by the second. The web
+   * app only ever learns the first — `listVehicles` returns VINs — so
+   * something has to bridge them, and the (vendor, vendor_vehicle_id) UNIQUE
+   * from migration 001 is what makes the bridge single-valued.
+   */
+  describe('finding a vehicle by the identifier its vendor uses', () => {
+    it('resolves the VIN a vendor API reports to the local vehicle id', async () => {
+      const id = await withTransaction(getPool(), (c) =>
+        findVehicleIdByVendorId(c, 'tesla', 'VIN-REPO'))
+      expect(id).toBe(VEHICLE)
+    })
+
+    it('answers null for a VIN this deployment does not ingest', async () => {
+      // Not an error: a Tesla account can hold a car this deployment was never
+      // configured for, and the caller has a much better sentence to say about
+      // that than a repository function does.
+      const id = await withTransaction(getPool(), (c) =>
+        findVehicleIdByVendorId(c, 'tesla', 'VIN-NOBODY-INGESTS'))
+      expect(id).toBeNull()
+    })
+
+    it('does not match the same identifier under another vendor', async () => {
+      // The uniqueness is on the PAIR. Matching on vendor_vehicle_id alone
+      // would silently attribute one vendor's car to another's row the day a
+      // second vendor exists.
+      const id = await withTransaction(getPool(), (c) =>
+        findVehicleIdByVendorId(c, 'rivian', 'VIN-REPO'))
+      expect(id).toBeNull()
     })
   })
 })

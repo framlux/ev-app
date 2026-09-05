@@ -25,10 +25,15 @@ import {
  * Trust is NOT arranged here. The proxy's certificate comes from the cluster's
  * internal CA issuer that no public trust store knows, and the answer is
  * NODE_EXTRA_CA_CERTS on the pod, which Node applies to the process trust
- * store. No CA is read by this application at all: it is a mount and an
- * environment variable (§3.3). An injected undici dispatcher was rejected
- * because undici is not a dependency here and "works in a test, not in the
- * image" is the exact failure that would produce.
+ * store. No CA is read by THIS module at all: it is a mount and an environment
+ * variable (§3.3). An injected undici dispatcher was rejected because undici is
+ * not a dependency here and "works in a test, not in the image" is the exact
+ * failure that would produce.
+ *
+ * The other certificate in this feature is not trust and does not belong here:
+ * `telemetry.ts` reads the CA the CAR pins and puts it inside the pushed
+ * configuration, where it is payload. Confusing the two is the expensive
+ * mistake, which is why each is read in exactly one place.
  */
 
 /**
@@ -66,6 +71,41 @@ function teslaBaseUrl(): string {
  */
 export function teslaRedirectUri(): string {
 	return required('TESLA_REDIRECT_URI')
+}
+
+/** What the consent flow needs from the environment, in one read. */
+export interface TeslaOAuthEnv {
+	clientId: string
+	clientSecret: string
+	redirectUri: string
+}
+
+/**
+ * The application credential behind the interactive consent.
+ *
+ * Prefixed `TESLA_` rather than mounted under the bare `CLIENT_ID` /
+ * `CLIENT_SECRET` names the `ev-tesla-oauth` Secret uses: this pod already
+ * holds POCKETID_CLIENT_ID and POCKETID_CLIENT_SECRET, and two unqualified
+ * names for a second identity provider in the same environment is a mix-up
+ * waiting to happen — one that would present Pocket-ID's credential to Tesla
+ * and fail as an opaque `invalid_client`.
+ *
+ * All three are demanded TOGETHER, by the connect route as well as the
+ * callback, even though connect needs no secret. `authorizeUrl` hard-codes
+ * `prompt: 'login'`, so a consent costs a full Tesla re-authentication with
+ * password and MFA (§3.4); discovering a missing CLIENT_SECRET only at the
+ * callback would waste that whole ceremony on a 500.
+ *
+ * It is an APPLICATION credential, not a vehicle one: on its own it grants
+ * nothing about any car, because vehicle access needs a user's consent token.
+ * That is why §2 accepts it in this pod while refusing a refresh token.
+ */
+export function teslaOAuthEnv(): TeslaOAuthEnv {
+	return {
+		clientId: required('TESLA_CLIENT_ID'),
+		clientSecret: required('TESLA_CLIENT_SECRET'),
+		redirectUri: teslaRedirectUri()
+	}
 }
 
 /**

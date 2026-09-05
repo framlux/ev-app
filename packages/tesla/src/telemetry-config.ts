@@ -34,8 +34,18 @@ export const TELEMETRY_HOSTNAME = 'ev-telemetry.framlux.io'
 /** 443, because it must survive whatever network the car happens to be on. */
 export const TELEMETRY_PORT = 443
 
-/** What "the CA is really a CA" means, in both the builder and the comparison. */
-const looksLikeCertificate = (ca: string): boolean => ca.includes('BEGIN CERTIFICATE')
+/**
+ * What "the CA is really a CA" means — the ONE definition of it.
+ *
+ * Exported because three places now ask the question and they must all mean
+ * the same thing: the builder refuses a config that would carry no
+ * certificate, the comparison below reports an applied config that carries
+ * none as needing a re-push, and the web app records `ca_present` from the
+ * echo (§3.7). `check-telemetry-synced.sh` greps for the same string. A second
+ * spelling of "present" — non-empty, say — would make the stored flag and the
+ * push decision disagree about the same bytes.
+ */
+export const hasCertificate = (ca: string): boolean => ca.includes('BEGIN CERTIFICATE')
 
 /**
  * The `fields` map in Tesla's shape, in catalogue order.
@@ -98,7 +108,7 @@ export function buildTelemetryConfig(input: {
   // public chain. A mis-projected or empty mount yields a configuration the car
   // accepts and then fails every connection against, which looks exactly like a
   // car that never wakes. The script greps for this; so do we.
-  if (!looksLikeCertificate(input.ca)) {
+  if (!hasCertificate(input.ca)) {
     throw new Error(
       'the telemetry CA holds no BEGIN CERTIFICATE: the car pins this, and a ' +
       'configuration carrying the wrong bytes fails every connection silently.')
@@ -166,7 +176,7 @@ export function compareTelemetryConfig(
   if (applied.port !== desired.port) {
     differences.push(`port: applied ${applied.port}, would push ${desired.port}`)
   }
-  if (!looksLikeCertificate(applied.ca ?? '')) {
+  if (!hasCertificate(applied.ca ?? '')) {
     differences.push('ca: the applied configuration carries no certificate')
   }
 
