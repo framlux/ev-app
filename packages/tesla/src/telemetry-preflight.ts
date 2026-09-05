@@ -40,8 +40,11 @@ export function firmwareAtLeast(
   version: string,
   floor: readonly [number, number] = MIN_FIRMWARE,
 ): boolean {
-  const parts = version.trim().split('.').map((p) => Number.parseInt(p, 10))
-  const [year, week] = parts
+  // parseInt on `undefined ?? ''` yields NaN rather than undefined, which keeps
+  // the guard below a single finite-check under noUncheckedIndexedAccess.
+  const parts = version.trim().split('.')
+  const year = Number.parseInt(parts[0] ?? '', 10)
+  const week = Number.parseInt(parts[1] ?? '', 10)
   if (!Number.isFinite(year) || !Number.isFinite(week)) return false
   if (year !== floor[0]) return year > floor[0]
   return week >= floor[1]
