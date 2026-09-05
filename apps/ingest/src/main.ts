@@ -60,7 +60,7 @@ async function main(): Promise<void> {
   // startup here instead is the honest outcome, and the pod restarts.
   await registerVehicle(pool, config.vehicle)
 
-  const pipeline = new Pipeline(pgRunner(pool, config.cursorSource), {
+  const pipeline = new Pipeline(pgRunner(pool, config.cursorSource, config.vehicle.id), {
     usableCapacityKwh: config.usableCapacityKwh,
   })
 

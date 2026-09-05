@@ -63,7 +63,7 @@ describe.skipIf(!hasDb)('worker startup', () => {
   it('registers the configured vehicle, so the first message is ingested', async () => {
     await registerVehicle(getPool(), identity)
 
-    const pipeline = new Pipeline(pgRunner(getPool(), 'startup-test'), {
+    const pipeline = new Pipeline(pgRunner(getPool(), 'startup-test', VEHICLE), {
       usableCapacityKwh: 75,
     })
     await pipeline.handle(field('Soc', 80))

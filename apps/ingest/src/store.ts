@@ -6,11 +6,13 @@ import {
   ensureVehicle,
   insertRaw,
   insertSample,
+  notifyVehicleChanged,
   openSession,
   upsertBatteryHealth,
   withTransaction,
   type DbClient,
   type DbPool,
+  type VehicleChange,
 } from '@ev/db'
 import type { Config } from './config.js'
 import type { Store, StoreRunner } from './pipeline.js'
@@ -62,12 +64,66 @@ export function storeOn(client: DbClient, cursorSource: string): Store {
 }
 
 /**
+ * Does this unit of work contain anything a viewer could see?
+ *
+ * Keyed off the RESULT rather than the transaction, and that distinction is the
+ * whole design. fleet-telemetry publishes one field per message, and the
+ * accumulator debounces a burst of them into a single sample, so transactions
+ * are about ten times more frequent than samples and most of them do nothing
+ * but add a value to the accumulator. Notifying per transaction would wake the
+ * web tier — and cost it a query — for an answer that has not changed.
+ *
+ * Typed as `unknown` because StoreRunner.run is generic: `reprocess` and the
+ * tests hand it callbacks returning other things. A shape that is not a
+ * PipelineResult simply does not notify.
+ */
+export function vehicleChangeFrom(result: unknown, vehicleId: string): VehicleChange | null {
+  if (typeof result !== 'object' || result === null || Array.isArray(result)) return null
+  const r = result as Record<string, unknown>
+  const num = (k: string): number => (typeof r[k] === 'number' ? (r[k] as number) : 0)
+  const opened = num('sessionsOpened')
+  const closed = num('sessionsClosed')
+  if (num('samples') === 0 && opened === 0 && closed === 0) return null
+  // Stamped with the observation's time, not the wall clock, so a replayed or
+  // late message describes when the car was in this state rather than when we
+  // heard about it. Nothing observable landed without one, so its absence means
+  // there is nothing to announce.
+  const ts = r['lastSampleTs']
+  if (!(ts instanceof Date)) return null
+  return {
+    vehicleId,
+    ts: ts.toISOString(),
+    kind: opened > 0 || closed > 0 ? 'session' : 'sample',
+  }
+}
+
+/**
  * One `run()` is one transaction. Everything a single MQTT message produces —
  * the raw row, its samples, the session rows, the watermark — commits together
  * or not at all, which is what lets the caller ack only after a commit.
+ *
+ * The change notification is issued HERE, inside that transaction, rather than
+ * from a Store method, for two reasons that both matter:
+ *
+ *  - `reprocess.ts` builds its own runner over the same `storeOn`, and replays
+ *    an entire window inside ONE transaction. A Store-level notify would queue
+ *    one pg_notify per replayed sample — potentially hundreds of thousands,
+ *    delivered in a single burst at COMMIT — and set the web tier querying for
+ *    as long as it took to drain, for nothing anyone asked to see. Placing it
+ *    here means a replay notifies nothing, with no flag to remember to set.
+ *  - Only the runner sees the PipelineResult, which is what makes "notify once
+ *    per sample" possible rather than once per field message.
+ *
+ * Inside the transaction, so a rollback un-notifies exactly as it un-writes.
  */
-export function pgRunner(pool: DbPool, cursorSource: string): StoreRunner {
+export function pgRunner(pool: DbPool, cursorSource: string, vehicleId: string): StoreRunner {
   return {
-    run: (fn) => withTransaction(pool, (client) => fn(storeOn(client, cursorSource))),
+    run: (fn) =>
+      withTransaction(pool, async (client) => {
+        const out = await fn(storeOn(client, cursorSource))
+        const change = vehicleChangeFrom(out, vehicleId)
+        if (change) await notifyVehicleChanged(client, change)
+        return out
+      }),
   }
 }
