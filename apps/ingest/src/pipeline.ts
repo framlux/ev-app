@@ -1,4 +1,10 @@
-import { teslaStateToSample, type TeslaFieldUpdate } from '@ev/tesla'
+import {
+  TESLA_FIELDS,
+  slotsOf,
+  teslaStateToSample,
+  type TeslaFieldState,
+  type TeslaFieldUpdate,
+} from '@ev/tesla'
 import { decodeIfKnown } from './deps.js'
 import {
   estimateCapacity,
@@ -163,16 +169,61 @@ export const VOLATILE_STALE_MS = 5 * 60_000
 export const STALE_VALUE_MS = 6 * 60 * 60_000
 
 /**
- * The fields treated as volatile.
+ * Drive-tier fields whose last value is still true in Park, so they are carried
+ * like levels despite their tier.
  *
- * Deliberately short. `speedKph` is the one that matters most: the segmenter
- * reads a null speed as 'unknown' motion, which does NOT start the parked
- * clock, so a stale non-zero speed is what wedges a drive open. `chargePowerKw`
- * is the same argument for charge sessions. Everything else - SoC, odometer,
- * range, lock state, doors, temperatures, tyre pressures, charge state - is a
- * level, and its last value stays true.
+ * `Location` and `Gear` are on the drive tier because they are asked for often
+ * while moving, not because they decay: a parked car is still where it parked,
+ * and a car left in P stays in P. Expiring either would write a null over a
+ * fact - the position column would blank mid-drive whenever GPS went quiet for
+ * five minutes, which is a gap in the route rather than an absence of one.
  */
-export const VOLATILE_FIELDS: ReadonlySet<string> = new Set(['speedKph', 'chargePowerKw'])
+const CARRIED_DRIVE_FIELDS: ReadonlySet<string> = new Set(['Location', 'Gear'])
+
+/**
+ * Slots that are volatile for a reason the tier does not express.
+ *
+ * `speedKph` is also drive-tier, and is repeated here because it is the one
+ * that matters most: the segmenter reads a null speed as 'unknown' motion,
+ * which does NOT start the parked clock, so a stale non-zero speed is what
+ * wedges a drive open. The two charge rails are the same argument for charge
+ * sessions - a carried non-zero power holds a session open against a car that
+ * has been unplugged - and they are charge-tier, so nothing below would pick
+ * them up.
+ *
+ * `satisfies keyof TeslaFieldState` is the load-bearing part: this list is the
+ * hand-written half of the set, and it is exactly where the bug lived.
+ * `chargePowerKw` was listed here for a year and expired nothing, because it is
+ * a COLUMN - `teslaStateToSample` collapses the two rails into it - and never a
+ * slot, so `staleWindowFor` was never called with that name. Written this way
+ * the same mistake is a compile error.
+ */
+const ALWAYS_VOLATILE = [
+  'speedKph',
+  'acPowerKw',
+  'dcPowerKw',
+] as const satisfies readonly (keyof TeslaFieldState)[]
+
+/**
+ * The slots treated as volatile: a rate or an instantaneous reading, whose
+ * staleness actively misleads rather than merely ages.
+ *
+ * DERIVED FROM THE FIELD CATALOGUE, not listed. The drive tier already means
+ * "pins to a constant in Park" - speed 0, torque 0, pedals released - which is
+ * the same statement as "a value carried out of a drive is a lie". Listing them
+ * by hand at 20 fields (and at 204 signals, growing) is how the `chargePowerKw`
+ * entry survived: a name that matches no slot is silently inert, and the field
+ * it was meant to expire is carried for six hours instead of five minutes.
+ *
+ * Everything not here - SoC, odometer, range, lock state, doors, temperatures,
+ * tyre pressures, charge state - is a level, and its last value stays true.
+ */
+export const VOLATILE_FIELDS: ReadonlySet<string> = new Set<string>([
+  ...ALWAYS_VOLATILE,
+  ...TESLA_FIELDS
+    .filter((e) => e.tier === 'drive' && !CARRIED_DRIVE_FIELDS.has(e.field))
+    .flatMap(slotsOf),
+])
 
 export function staleWindowFor(field: string): number {
   return VOLATILE_FIELDS.has(field) ? VOLATILE_STALE_MS : STALE_VALUE_MS

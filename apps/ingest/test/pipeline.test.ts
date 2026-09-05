@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_SEGMENTER_OPTIONS, makeSample, type RawMessage } from '@ev/core'
+import { TESLA_FIELDS, slotsOf, teslaStateToSample } from '@ev/tesla'
 import {
   FieldAccumulator,
   MAX_SAMPLE_INTERVAL_MS,
@@ -571,6 +572,40 @@ describe('staleness windows match the telemetry configuration we push', () => {
       expect(staleWindowFor(field)).toBe(STALE_VALUE_MS)
     }
   })
+
+  it('names only slots the accumulator can actually hold', () => {
+    // THE TEST THAT WOULD HAVE CAUGHT THE LIVE BUG. `staleWindowFor` is only
+    // ever called with accumulator slot keys, so a member of this set that is
+    // not a slot is not a mistake anyone can see: it simply never matches, and
+    // the field it was meant to expire is carried for six hours instead of
+    // five minutes. `chargePowerKw` sat here doing exactly that - it is a
+    // COLUMN, produced by `teslaStateToSample` collapsing the two rails, and it
+    // never exists in the accumulator at all.
+    const slots = new Set(TESLA_FIELDS.flatMap(slotsOf))
+    // Not from the field catalogue: connectivity messages fill it, and the
+    // accumulator derives it from power flow. Neither is volatile, but both are
+    // real slots, so listing them here keeps this test about reality rather
+    // than about the catalogue.
+    slots.add('powerState')
+    slots.add('activeRail')
+    expect([...VOLATILE_FIELDS].filter((f) => !slots.has(f))).toEqual([])
+  })
+
+  it('treats every drive-tier slot except location and gear as volatile', () => {
+    // A drive-tier field is one that pins to a constant in Park, so carrying
+    // its last driving value into a parked sample describes motion that ended
+    // hours ago. The two exceptions are levels wearing a drive tier's clothes:
+    // a parked car's position is still where it is, and a car left in P is
+    // still in P.
+    const carried = new Set(['Location', 'Gear'])
+    for (const entry of TESLA_FIELDS.filter((e) => e.tier === 'drive')) {
+      for (const slot of slotsOf(entry)) {
+        expect(staleWindowFor(slot)).toBe(
+          carried.has(entry.field) ? STALE_VALUE_MS : VOLATILE_STALE_MS,
+        )
+      }
+    }
+  })
 })
 
 describe('FieldAccumulator staleness, at the boundaries', () => {
@@ -610,6 +645,28 @@ describe('FieldAccumulator staleness, at the boundaries', () => {
     fresh.apply({ socPct: 55 }, at(0))
     fresh.apply({ speedKph: 0 }, at(STALE_VALUE_MS - 1))
     expect(fresh.take()?.state.socPct).toBe(55)
+  })
+
+  it('expires a stale charge power instead of carrying it for six hours', () => {
+    // THE LIVE BUG, end to end. The accumulator holds the two RAILS, and only
+    // `teslaStateToSample` collapses them into `chargePowerKw` - so listing the
+    // collapsed name as volatile expired nothing. A charge that stops being
+    // reported must go null, not keep claiming 11 kW: a non-zero power holds a
+    // charge session open exactly as a non-zero speed holds a drive open.
+    const acc = new FieldAccumulator()
+    acc.apply({ acPowerKw: 11, activeRail: 'ac' }, at(0))
+    acc.apply({ socPct: 71 }, at(VOLATILE_STALE_MS))
+    const taken = acc.take()
+    expect(taken?.state.acPowerKw).toBeUndefined()
+    expect(teslaStateToSample('veh-1', taken!.ts, taken!.state).chargePowerKw).toBeNull()
+  })
+
+  it('keeps a charge power one millisecond inside the volatile window', () => {
+    const acc = new FieldAccumulator()
+    acc.apply({ dcPowerKw: 48, activeRail: 'dc' }, at(0))
+    acc.apply({ socPct: 71 }, at(VOLATILE_STALE_MS - 1))
+    const taken = acc.take()
+    expect(teslaStateToSample('veh-1', taken!.ts, taken!.state).chargePowerKw).toBe(48)
   })
 
   it('never invents a value for a field that was never reported', () => {
