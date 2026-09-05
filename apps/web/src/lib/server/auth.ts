@@ -28,7 +28,18 @@ function required(name: string): string {
 }
 
 export function authEnv(): AuthEnv {
-	const origin = required('PUBLIC_ORIGIN').replace(/\/$/, '')
+	// APP_ORIGIN, not PUBLIC_ORIGIN, and the name is load-bearing.
+	//
+	// SvelteKit reserves the `PUBLIC_` prefix for values it exposes to the
+	// browser, and `$env/dynamic/private` FILTERS THOSE OUT. So a variable named
+	// PUBLIC_ORIGIN is invisible here however carefully the deployment sets it:
+	// process.env.PUBLIC_ORIGIN was correct in the container and this still threw
+	// "PUBLIC_ORIGIN is not set", which reads as a missing ConfigMap entry rather
+	// than a framework rule. Every sign-in was a 500.
+	//
+	// This is server-side configuration, so the fix is the name rather than
+	// reaching into $env/dynamic/public for it.
+	const origin = required('APP_ORIGIN').replace(/\/$/, '')
 	return {
 		issuer: new URL(required('POCKETID_ISSUER')),
 		clientId: required('POCKETID_CLIENT_ID'),
