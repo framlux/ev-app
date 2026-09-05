@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { makeSample, type SessionSummary } from '@ev/core'
+import {
+  makeSample, SAMPLE_COLUMNS,
+  type SampleColumn, type SessionSummary, type VehicleSample,
+} from '@ev/core'
 import { closePool, getPool } from '../src/pool.js'
 import { runMigrationsUnderGate } from '../src/migrate.js'
 import { withTransaction } from '../src/repo/types.js'
@@ -27,6 +30,24 @@ if (!hasDb && process.env['CI']) {
     'PGHOST is unset in CI: the repository tests must run against a real Postgres. ' +
       'See the postgres service in .github/workflows/test.yml.',
   )
+}
+
+/**
+ * A representative value for one column, picked so that what Postgres hands
+ * back is comparable to what went in. 1.5 is exact in a `REAL`; 0.1 is not, and
+ * would come back as 0.10000000149011612 and fail a round-trip that is in fact
+ * fine. `INT` gets a whole number for the same reason.
+ */
+function sampleValue(c: SampleColumn): unknown {
+  switch (c.ts) {
+    case 'number': return c.sql === 'INT' ? 7 : 1.5
+    case 'string': return `v:${c.column}`
+    case 'boolean': return true
+    case 'PowerState': return 'online'
+    case 'ChargeState': return 'charging'
+    case 'TpmsMap': return { fl: 2.5, fr: 2.5, rl: 2.5, rr: 2.5 }
+    case 'Date': return new Date('2026-09-04T09:00:00.000Z')
+  }
 }
 
 const VEHICLE = 'repo-test-v1'
@@ -104,6 +125,42 @@ describe.skipIf(!hasDb)('repositories', () => {
     expect(rows).toHaveLength(1)
     // DO NOTHING, not an upsert: the first write wins.
     expect(rows[0]?.soc_pct).toBe(80)
+  })
+
+  /**
+   * Every column at once. `insertSample` binds all of them in a single
+   * statement inside the ingest transaction, so ONE column whose declared SQL
+   * type rejects what the decoder produces rolls the whole transaction back —
+   * the message is never acked and is redelivered forever (spec §3.4's wedge).
+   * A per-column unit test cannot see that; only a full-width insert against a
+   * real Postgres can.
+   */
+  it('round-trips a sample with every catalogued column populated', async () => {
+    const ts = new Date('2026-09-04T10:05:00.000Z')
+    const populated = Object.fromEntries(
+      SAMPLE_COLUMNS.map((c) => [c.key, sampleValue(c)]),
+    ) as Partial<VehicleSample>
+    const full = makeSample({ vehicleId: VEHICLE, ts, ...populated })
+
+    await withTransaction(getPool(), (c) => insertSample(c, full))
+
+    const { rows } = await getPool().query(
+      'SELECT * FROM sample WHERE vehicle_id=$1 AND ts=$2', [VEHICLE, ts])
+    expect(rows).toHaveLength(1)
+    for (const c of SAMPLE_COLUMNS) {
+      expect(`${c.column}=${JSON.stringify(rows[0]?.[c.column])}`)
+        .toBe(`${c.column}=${JSON.stringify(sampleValue(c))}`)
+    }
+
+    // The replay. Same key, every value different: DO NOTHING must leave the
+    // first write standing, at two hundred columns exactly as at seventeen.
+    await withTransaction(getPool(), (c) =>
+      insertSample(c, makeSample({ vehicleId: VEHICLE, ts, socPct: 1 })))
+    const after = await getPool().query(
+      'SELECT soc_pct, gear FROM sample WHERE vehicle_id=$1 AND ts=$2', [VEHICLE, ts])
+    expect(after.rows).toHaveLength(1)
+    expect(after.rows[0]?.soc_pct).toBe(sampleValue(SAMPLE_COLUMNS[0]!))
+    expect(after.rows[0]?.gear).not.toBeNull()
   })
 
   it('opening a session twice adopts the one that is already open', async () => {

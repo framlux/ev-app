@@ -1,5 +1,33 @@
-import type { VehicleSample } from '@ev/core'
+import { SAMPLE_COLUMNS, type VehicleSample } from '@ev/core'
 import type { DbClient } from './types.js'
+
+/**
+ * The insert, built once at module load from @ev/core's column catalogue rather
+ * than written out.
+ *
+ * WHY GENERATED. Two hundred columns, their placeholders and their bindings all
+ * have to stay in the same order, and a hand-written list of three parallel
+ * sequences is one rebase away from binding `inside_temp_c` to the outside
+ * temperature — a mistake nothing would report, because both are REAL and both
+ * accept the value. Deriving all three from one array makes the order
+ * unstatable-wrongly rather than merely checked.
+ *
+ * It is also the third leg of §3.1's agreement: the pushed config asks the car
+ * for what the field catalogue names, the normaliser fills the columns the
+ * column catalogue declares, and this writes exactly those columns. A signal
+ * added to the catalogue is stored without anyone remembering to come here.
+ *
+ * Exported so the drift test can read it. It is one statement — no semicolon,
+ * no second INSERT — because `pipeline.ts` runs it inside the per-message
+ * transaction and a value the schema rejects must fail that one statement, not
+ * leave half a sample behind.
+ */
+const BOUND_COLUMNS = ['vehicle_id', 'ts', ...SAMPLE_COLUMNS.map((c) => c.column)]
+
+export const SAMPLE_INSERT_SQL =
+  `INSERT INTO sample (${BOUND_COLUMNS.join(', ')})\n` +
+  `VALUES (${BOUND_COLUMNS.map((_, i) => `$${i + 1}`).join(',')})\n` +
+  'ON CONFLICT (vehicle_id, ts) DO NOTHING'
 
 /**
  * ON CONFLICT DO NOTHING makes replay idempotent: the primary key is
@@ -11,18 +39,19 @@ import type { DbClient } from './types.js'
  * overwrite populated columns with nulls.
  */
 export async function insertSample(c: DbClient, s: VehicleSample): Promise<void> {
-  await c.query(
-    `INSERT INTO sample (
-       vehicle_id, ts, soc_pct, range_km, odometer_km, lat, lon, speed_kph,
-       power_state, charge_state, charge_power_kw, charge_energy_added_kwh,
-       inside_temp_c, outside_temp_c, locked, doors_open, tpms)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-     ON CONFLICT (vehicle_id, ts) DO NOTHING`,
-    [s.vehicleId, s.ts, s.socPct, s.rangeKm, s.odometerKm, s.lat, s.lon,
-      s.speedKph, s.powerState, s.chargeState, s.chargePowerKw,
-      s.chargeEnergyAddedKwh, s.insideTempC, s.outsideTempC, s.locked,
-      s.doorsOpen, s.tpms ? JSON.stringify(s.tpms) : null],
-  )
+  const row = s as unknown as Record<string, unknown>
+  await c.query(SAMPLE_INSERT_SQL, [
+    s.vehicleId,
+    s.ts,
+    // JSONB is the one type that is not already what pg wants to bind: the
+    // driver would stringify a plain object for us, but doing it here keeps the
+    // binding a function of the catalogue's declared SQL type rather than of
+    // what the value happens to look like at runtime.
+    ...SAMPLE_COLUMNS.map((col) => {
+      const v = row[col.key]
+      return col.sql === 'JSONB' && v != null ? JSON.stringify(v) : v
+    }),
+  ])
 }
 
 /**

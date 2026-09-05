@@ -1,6 +1,24 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { SAMPLE_COLUMNS, type SqlType } from '@ev/core'
 import { closePool, getPool } from '../src/pool.js'
 import { runMigrationsUnderGate } from '../src/migrate.js'
+
+/**
+ * What `information_schema` calls each of our declared SQL types. Spelled out
+ * rather than lower-cased, because Postgres renames three of them on the way in
+ * and a test that compared `sql.toLowerCase()` would pass while believing
+ * `TIMESTAMPTZ` and `TIMESTAMP` are different columns.
+ */
+const INFORMATION_SCHEMA_TYPE: Record<SqlType, string> = {
+  'REAL': 'real',
+  'DOUBLE PRECISION': 'double precision',
+  'INT': 'integer',
+  'BOOLEAN': 'boolean',
+  'TEXT': 'text',
+  'TIME': 'time without time zone',
+  'TIMESTAMPTZ': 'timestamp with time zone',
+  'JSONB': 'jsonb',
+}
 
 /**
  * These tests need a real Postgres. Locally, point them at a throwaway one:
@@ -83,6 +101,33 @@ describe.skipIf(!hasDb)('migrations', () => {
       p.query(`INSERT INTO session (id, vehicle_id, kind, started_at, is_open)
                VALUES ('s2','v1','drive', now(), true)`),
     ).rejects.toThrow(/session_one_open_per_kind/)
+  })
+
+  /**
+   * The drift test spec §5 exists for, asserted against the schema that is
+   * actually applied rather than against the text of one migration. A signal
+   * added to the catalogue but to no migration is invisible at runtime — the
+   * insert would fail, the transaction would roll back and the message would be
+   * redelivered forever — and this is what makes it a test failure instead.
+   *
+   * It compares the whole applied `sample` table, so it keeps holding when
+   * `005` and later add columns of their own; a check against `004`'s text
+   * alone would have to be rewritten every time.
+   */
+  it('gives sample exactly the catalogued columns plus the primary key', async () => {
+    const { rows } = await getPool().query<{ column_name: string, data_type: string }>(
+      `SELECT column_name, data_type FROM information_schema.columns
+       WHERE table_name = 'sample' ORDER BY ordinal_position`)
+
+    // vehicle_id and ts are structural, not catalogued: they are the key.
+    expect(rows.map((r) => r.column_name))
+      .toEqual(['vehicle_id', 'ts', ...SAMPLE_COLUMNS.map((c) => c.column)])
+
+    const actual = new Map(rows.map((r) => [r.column_name, r.data_type]))
+    for (const c of SAMPLE_COLUMNS) {
+      expect(`${c.column}: ${actual.get(c.column)}`)
+        .toBe(`${c.column}: ${INFORMATION_SCHEMA_TYPE[c.sql]}`)
+    }
   })
 
   it('creates the current month partitions', async () => {
