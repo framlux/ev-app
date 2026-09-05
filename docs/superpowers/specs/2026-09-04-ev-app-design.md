@@ -175,7 +175,19 @@ Steps 1–2 gate everything and are the first task in the plan.
 
 ### 5.2 Telemetry configuration
 
-Fields to request, chosen to support the engine without wasting signal budget: `Location`, `VehicleSpeed`, `Odometer`, `Soc`, `RatedRange`, `ChargeState`, `ChargeAmps`, `ChargerPower`, `ACChargingEnergyIn`, `DCChargingEnergyIn`, `InsideTemp`, `OutsideTemp`, `Locked`, `DoorState`, `TpmsPressure*`, `Gear`.
+Fields to request, chosen to support the engine without wasting signal budget: `Location`,
+`VehicleSpeed`, `Odometer`, `Soc`, `RatedRange`, `ChargeState`, `DetailedChargeState`,
+`ChargeAmps`, `ACChargingPower`, `DCChargingPower`, `ACChargingEnergyIn`, `DCChargingEnergyIn`,
+`InsideTemp`, `OutsideTemp`, `Locked`, `DoorState`, `Gear`, `TpmsPressureFl`, `TpmsPressureFr`,
+`TpmsPressureRl`, `TpmsPressureRr`.
+
+**Corrected 2026-09-04, checked against `protos/vehicle_data.proto` upstream.** This list
+previously named `ChargerPower`, which is not a field. Charging power is split by current type
+into `ACChargingPower` (35) and `DCChargingPower` (37), and an unknown field name is dropped
+rather than refused — the config would have applied cleanly and simply never delivered charging
+power. `VehicleSample.chargePowerKw` is a single value, so normalisation coalesces whichever of
+the two is non-zero; they are never both active. `TpmsPressure*` was likewise shorthand for four
+separate fields, and a wildcard is not accepted.
 
 Signals transmit only on change, subject to a per-field minimum interval. At $1 per 150,000 signals against a $10 monthly discount, the budget is not a practical constraint for one car — but the field list should still be deliberate rather than "everything", because a chatty field with a short interval is where cost would actually come from.
 
