@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "This _comment aside, a GET /api/1/vehicles/<vin>/fleet_telemetry_config",
+    "response in the shape the car echoes it back. The envelope, the key order",
+    "and the keys we do NOT send (alert_types, exp, vins, key_paired) are as",
+    "captured; the fields map is trimmed to seven signals so the fixture stays",
+    "readable, which is safe because the rule is per-field and set-based.",
+    "The certificate is a throwaway, not ev-telemetry-ca: nothing here is a",
+    "secret and nothing verifies against it - the rule compares ca on presence."
+  ],
+  "response": {
+    "synced": true,
+    "key_paired": true,
+    "config": {
+      "hostname": "ev-telemetry.framlux.io",
+      "port": 443,
+      "ca": "-----BEGIN CERTIFICATE-----\nMIIBcTCCARegAwIBAgIQZ0Xt3jVYRk9hZ0RiZ1pQYTAKBggqhkjOPQQDAjAXMRUw\nEwYDVQQDEwxldi10ZWxlbWV0cnkwHhcNMjUwOTA1MDAwMDAwWhcNMzUwOTAzMDAw\nMDAwWjAXMRUwEwYDVQQDEwxldi10ZWxlbWV0cnkwWTATBgcqhkjOPQIBBggqhkjO\nPQMBBwNCAAT3S1RkZXBsb3ltZW50Q0FmaXh0dXJlb25seU5PVGFyZWFsa2V5UEVN\nQkxPQjEyMzQ1Njc4OTBhYmNkZWZnaGlqo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYD\nVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUZmFrZUNBZml4dHVyZUtleUlEMAoGCCqG\nSM49BAMCA0gAMEUCIQDmFakeSignatureForAFixtureOnlyAAAAAAAAAAAAAgIg\nZmFrZVNpZ25hdHVyZUZvckFGaXh0dXJlT25seUJCQkJCQkI=\n-----END CERTIFICATE-----\n",
+      "prefer_typed": true,
+      "alert_types": ["service"],
+      "exp": 1788307200,
+      "vins": ["5YJYGDEE0MF000000"],
+      "fields": {
+        "DriveRail": { "interval_seconds": 3600 },
+        "ChargeState": { "interval_seconds": 60 },
+        "VehicleSpeed": { "interval_seconds": 10, "minimum_delta": 1 },
+        "Odometer": { "interval_seconds": 60 },
+        "Soc": { "interval_seconds": 60, "minimum_delta": 0.5 },
+        "Location": { "interval_seconds": 10, "minimum_delta": 10 },
+        "InsideTemp": { "interval_seconds": 300, "minimum_delta": 0.5 }
+      }
+    }
+  }
+}

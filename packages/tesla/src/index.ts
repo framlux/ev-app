@@ -1,5 +1,6 @@
 export * from './oauth.js'
 export * from './fleet-api.js'
+export * from './telemetry-config.js'
 export * from './telemetry-preflight.js'
 export * from './normalise.js'
 export * from './catalogue.js'
