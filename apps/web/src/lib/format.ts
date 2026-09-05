@@ -36,12 +36,62 @@ export function formatInteger(value: Maybe): string {
   return Math.round(value).toLocaleString('en-GB')
 }
 
-export const formatKm = (v: Maybe, dp = 1): string => unit(formatNumber(v, dp), 'km')
+/* ------------------------------------------------------------------ *
+ * Units
+ * ------------------------------------------------------------------ *
+ *
+ * The app displays US imperial. Everything BEHIND this module stays SI: the
+ * database columns, the ingest pipeline and the /api/v1 contract, whose field
+ * names are themselves the units (`rangeKm`, `speedKph`, `efficiencyWhPerKm`).
+ * A native app reading that contract gets metric, as documented.
+ *
+ * So this file is the ONLY place a conversion happens, and it happens on the
+ * way to the screen. Two consequences worth stating, because both are easy to
+ * undo by accident:
+ *
+ *  - The formatters below take CONTRACT units and render imperial. They are
+ *    named for the quantity (`formatDistance`) rather than for either unit,
+ *    because a `formatKm` that prints miles is a lie and a `formatMiles` that
+ *    takes kilometres is a trap.
+ *  - The converters are exported separately because the charts need converted
+ *    NUMBERS, not strings: axis ticks are computed from the data, so a series
+ *    left in km/h under an axis labelled mph would be wrong and look right.
+ */
+
+const KM_PER_MILE = 1.609344
+const PSI_PER_BAR = 14.503773773022
+
+/** null in, null out — the null discipline survives conversion. */
+const convert = (f: (n: number) => number) => (v: Maybe): number | null =>
+  v == null || !Number.isFinite(v) ? null : f(v)
+
+export const kmToMi = convert((km) => km / KM_PER_MILE)
+export const cToF = convert((c) => c * 1.8 + 32)
+export const barToPsi = convert((bar) => bar * PSI_PER_BAR)
+
+/**
+ * Wh/km -> Wh/mi MULTIPLIES by kilometres per mile.
+ *
+ * Efficiency is energy PER distance, so it scales the opposite way to a
+ * distance: a mile is longer than a kilometre, so covering one costs more
+ * watt-hours. Dividing here — the instinct carried straight over from
+ * `kmToMi` — would report the car as roughly half as thirsty as it is, which
+ * is a believable enough number on screen that nobody would ever query it.
+ */
+export const whPerKmToWhPerMi = convert((whPerKm) => whPerKm * KM_PER_MILE)
+
+export const formatDistance = (v: Maybe, dp = 1): string =>
+  unit(formatNumber(kmToMi(v), dp), 'mi')
+export const formatSpeed = (v: Maybe, dp = 0): string =>
+  unit(formatNumber(kmToMi(v), dp), 'mph')
+export const formatEfficiency = (v: Maybe): string =>
+  unit(formatNumber(whPerKmToWhPerMi(v), 0), 'Wh/mi')
+export const formatPressure = (v: Maybe): string =>
+  unit(formatNumber(barToPsi(v), 1), 'psi')
+
+/** Energy and power are identical in both systems: no conversion, ever. */
 export const formatKwh = (v: Maybe, dp = 2): string => unit(formatNumber(v, dp), 'kWh')
 export const formatKw = (v: Maybe, dp = 1): string => unit(formatNumber(v, dp), 'kW')
-export const formatKph = (v: Maybe, dp = 0): string => unit(formatNumber(v, dp), 'km/h')
-export const formatWhPerKm = (v: Maybe): string => unit(formatNumber(v, 0), 'Wh/km')
-export const formatBar = (v: Maybe): string => unit(formatNumber(v, 1), 'bar')
 
 /** Percent. The value is already 0-100 in the contract, not 0-1. */
 export function formatPct(value: Maybe, dp = 0): string {
@@ -49,16 +99,16 @@ export function formatPct(value: Maybe, dp = 0): string {
   return n === DASH ? DASH : `${n}%`
 }
 
-/** Celsius, with the degree sign attached to the number rather than spaced. */
-export function formatTempC(value: Maybe, dp = 0): string {
-  const n = formatNumber(value, dp)
-  return n === DASH ? DASH : `${n}°C`
+/** Takes Celsius, renders Fahrenheit, degree sign attached to the number. */
+export function formatTemp(value: Maybe, dp = 0): string {
+  const n = formatNumber(cToF(value), dp)
+  return n === DASH ? DASH : `${n}°F`
 }
 
-/** Odometer readings, which are always whole kilometres in practice. */
+/** Odometer readings, rounded to whole miles: the last digit is never news. */
 export function formatOdometer(value: Maybe): string {
-  const n = formatInteger(value)
-  return n === DASH ? DASH : `${n} km`
+  const n = formatInteger(kmToMi(value))
+  return n === DASH ? DASH : `${n} mi`
 }
 
 /** Money, only ever called when `costCurrency` is set alongside `cost`. */

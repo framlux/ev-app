@@ -6,12 +6,12 @@
 		formatCost,
 		formatDateTime,
 		formatDuration,
-		formatKm,
+		formatDistance,
 		formatKw,
 		formatKwh,
 		formatPct,
 		formatTime,
-		formatWhPerKm
+		formatEfficiency
 	} from '$lib/format.js'
 
 	interface Props {
@@ -89,7 +89,7 @@
 
 					{#if mode === 'mixed'}
 						<td><span class="kind {s.kind}">{s.kind}</span></td>
-						<td class="r num">{formatKm(s.distanceKm)}</td>
+						<td class="r num">{formatDistance(s.distanceKm)}</td>
 						<td class="r num">{formatKwh(s.energyKwh)}</td>
 					{:else if mode === 'drive'}
 						<td class="hide-sm route">
@@ -97,9 +97,9 @@
 							<span class="arrow" aria-hidden="true">→</span>
 							<span class="num">{place(s.endLat, s.endLon)}</span>
 						</td>
-						<td class="r num">{formatKm(s.distanceKm)}</td>
+						<td class="r num">{formatDistance(s.distanceKm)}</td>
 						<td class="r num">{formatKwh(s.energyKwh)}</td>
-						<td class="r num hide-sm">{formatWhPerKm(s.efficiencyWhPerKm)}</td>
+						<td class="r num hide-sm">{formatEfficiency(s.efficiencyWhPerKm)}</td>
 					{:else}
 						<td class="hide-sm num">{place(s.startLat, s.startLon)}</td>
 						<td class="r num">{formatKwh(s.energyKwh)}</td>

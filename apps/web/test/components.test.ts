@@ -328,10 +328,10 @@ describe('pages render against an empty database', () => {
 				}
 			} as never
 		})
-		// An empty 30-day window reports nothing, not 0 km / 0.00 kWh: those are
+		// An empty 30-day window reports nothing, not 0 mi / 0.00 kWh: those are
 		// claims about the car that the data does not support.
 		expect(out.body).toContain('—')
-		expect(out.body).not.toContain('0.0 km')
+		expect(out.body).not.toContain('0.0 mi')
 		expect(out.body).not.toContain('0.00 kWh')
 		assertNoBrokenValues(out.body)
 	})
@@ -372,9 +372,10 @@ describe('pages render against an empty database', () => {
 			props: { data: { detail: DRIVE_WITHOUT_LOCATION, vehicle: VEHICLE } } as never
 		})
 		expect(out.body).toContain('This drive has no route')
-		// The numbers are unaffected by the missing location scope.
-		expect(out.body).toContain('22.4 km')
-		expect(out.body).toContain('174 Wh/km')
+		// The numbers are unaffected by the missing location scope. The fixture
+		// is in contract units (22.4 km, 174 Wh/km); the page displays imperial.
+		expect(out.body).toContain('13.9 mi')
+		expect(out.body).toContain('280 Wh/mi')
 		assertNoBrokenValues(out.body)
 	})
 
@@ -420,8 +421,9 @@ describe('pages render real data too, so the empty-state tests are not the only 
 		}
 		const out = render(GaragePage as never, { props: { data: { vehicles: [entry] } } as never })
 		expect(out.body).toContain('62%')
-		expect(out.body).toContain('288 km')
-		expect(out.body).toContain('18,234 km')
+		// 288 km of range and an 18,234 km odometer, in miles.
+		expect(out.body).toContain('179 mi')
+		expect(out.body).toContain('11,330 mi')
 		// The pill deep-links to the open session.
 		expect(out.body).toContain('/charges/chg-9')
 		assertNoBrokenValues(out.body)

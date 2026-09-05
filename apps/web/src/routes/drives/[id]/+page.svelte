@@ -5,13 +5,14 @@
 	import {
 		DASH,
 		formatDateTime,
+		formatDistance,
 		formatDuration,
-		formatKm,
-		formatKph,
+		formatEfficiency,
 		formatKwh,
 		formatPct,
+		formatSpeed,
 		formatTime,
-		formatWhPerKm
+		kmToMi
 	} from '$lib/format.js'
 	import Map from '$lib/components/Map.svelte'
 	import StatTile from '$lib/components/StatTile.svelte'
@@ -34,14 +35,17 @@
 				key: 'speed',
 				label: 'Speed',
 				color: 'var(--driving)',
-				unit: ' km/h',
+				unit: ' mph',
 				dp: 0,
 				fill: true,
 				axis: 'left' as const,
 				points: toPoints(
 					rows,
 					(p) => Date.parse(p.ts),
-					(p) => p.speedKph
+					// Converted here, not in the chart: the axis ticks are computed
+					// from the data, so a series left in km/h under an mph label
+					// would be wrong and look entirely plausible.
+					(p) => kmToMi(p.speedKph)
 				)
 			},
 			{
@@ -87,15 +91,15 @@
 	</div>
 
 	<div class="tiles">
-		<StatTile label="Distance" value={formatKm(s.distanceKm)} tone="driving" />
+		<StatTile label="Distance" value={formatDistance(s.distanceKm)} tone="driving" />
 		<StatTile
 			label="Duration"
 			value={s.isOpen ? DASH : formatDuration(s.durationS)}
 			hint={s.isOpen ? 'still driving' : null}
 		/>
 		<StatTile label="Energy" value={formatKwh(s.energyKwh)} />
-		<StatTile label="Efficiency" value={formatWhPerKm(s.efficiencyWhPerKm)} tone="accent" />
-		<StatTile label="Average speed" value={formatKph(s.avgSpeedKph)} />
+		<StatTile label="Efficiency" value={formatEfficiency(s.efficiencyWhPerKm)} tone="accent" />
+		<StatTile label="Average speed" value={formatSpeed(s.avgSpeedKph)} />
 		<StatTile
 			label="State of charge"
 			value="{formatPct(s.startSocPct)} → {formatPct(s.endSocPct)}"

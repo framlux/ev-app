@@ -3,18 +3,19 @@
 	import { decimate, toPoints } from '$lib/chart.js'
 	import type { ChartSeries } from '$lib/chart.js'
 	import {
+		cToF,
 		DASH,
+		formatDistance,
 		formatDuration,
-		formatKm,
+		formatEfficiency,
 		formatKw,
 		formatKwh,
-		formatKph,
 		formatOdometer,
 		formatPct,
+		formatPressure,
 		formatRelative,
-		formatBar,
-		formatTempC,
-		formatWhPerKm,
+		formatSpeed,
+		formatTemp,
 		hasCoords
 	} from '$lib/format.js'
 	import BatteryGauge from '$lib/components/BatteryGauge.svelte'
@@ -68,26 +69,29 @@
 				key: 'inside',
 				label: 'Inside',
 				color: 'var(--charging)',
-				unit: '°C',
+				unit: '°F',
 				dp: 0,
 				axis: 'right' as const,
 				points: toPoints(
 					rows,
 					(r) => Date.parse(r.ts),
-					(r) => r.insideTempC ?? null
+					// Converted here rather than in the chart: the right-hand axis is
+					// scaled from these values, and °C plotted under a °F label is
+					// wrong in a way that looks perfectly reasonable on screen.
+					(r) => cToF(r.insideTempC)
 				)
 			},
 			{
 				key: 'outside',
 				label: 'Outside',
 				color: 'var(--driving)',
-				unit: '°C',
+				unit: '°F',
 				dp: 0,
 				axis: 'right' as const,
 				points: toPoints(
 					rows,
 					(r) => Date.parse(r.ts),
-					(r) => r.outsideTempC ?? null
+					(r) => cToF(r.outsideTempC)
 				)
 			}
 		].filter((sr) => sr.points.length > 0)
@@ -110,7 +114,7 @@
 			<div class="tiles">
 				<StatTile label="Odometer" value={formatOdometer(s.odometerKm)} />
 				{#if entry.activity === 'driving'}
-					<StatTile label="Speed" value={formatKph(s.speedKph)} tone="driving" />
+					<StatTile label="Speed" value={formatSpeed(s.speedKph)} tone="driving" />
 				{:else if charging}
 					<StatTile
 						label="Charging at"
@@ -121,9 +125,9 @@
 						tone="charging"
 					/>
 				{:else}
-					<StatTile label="Inside" value={formatTempC(s.insideTempC)} />
+					<StatTile label="Inside" value={formatTemp(s.insideTempC)} />
 				{/if}
-				<StatTile label="Outside" value={formatTempC(s.outsideTempC)} />
+				<StatTile label="Outside" value={formatTemp(s.outsideTempC)} />
 				<StatTile
 					label="Locked"
 					value={s.locked == null ? DASH : s.locked ? 'Locked' : 'Unlocked'}
@@ -138,7 +142,7 @@
 						{#each tyres as [key, label] (key)}
 							<div>
 								<span class="faint">{label}</span>
-								<strong class="num">{formatBar(s.tpms?.[key])}</strong>
+								<strong class="num">{formatPressure(s.tpms?.[key])}</strong>
 							</div>
 						{/each}
 					</div>
@@ -173,14 +177,14 @@
 		<div class="tiles wide">
 			<StatTile
 				label="Distance (30d)"
-				value={formatKm(period.distanceKm)}
+				value={formatDistance(period.distanceKm)}
 				hint="{period.driveCount} drives"
 			/>
 			<StatTile label="Used (30d)" value={formatKwh(period.driveEnergyKwh)} />
 			<StatTile label="Charged (30d)" value={formatKwh(period.chargeEnergyKwh)} hint="{period.chargeCount} charges" />
-			<StatTile label="Efficiency (30d)" value={formatWhPerKm(period.efficiencyWhPerKm)} tone="accent" />
+			<StatTile label="Efficiency (30d)" value={formatEfficiency(period.efficiencyWhPerKm)} tone="accent" />
 			<StatTile label="Driving time (30d)" value={formatDuration(period.drivingTimeS)} />
-			<StatTile label="Lifetime distance" value={formatKm(lifetime.distanceKm)} />
+			<StatTile label="Lifetime distance" value={formatDistance(lifetime.distanceKm)} />
 			<StatTile label="Lifetime charged" value={formatKwh(lifetime.chargeEnergyKwh)} />
 			<StatTile
 				label="Peak charge power"

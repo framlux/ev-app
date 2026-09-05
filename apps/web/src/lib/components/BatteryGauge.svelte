@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { DASH, formatKm, formatPct } from '$lib/format.js'
+	import { DASH, formatDistance, formatPct } from '$lib/format.js'
 
 	interface Props {
 		socPct: number | null
@@ -42,7 +42,7 @@
 	</div>
 	<div class="sub num">
 		{#if known}
-			{formatKm(rangeKm, 0)} range
+			{formatDistance(rangeKm, 0)} range
 		{:else}
 			{DASH} no state of charge recorded
 		{/if}

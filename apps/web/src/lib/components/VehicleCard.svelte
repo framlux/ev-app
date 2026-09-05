@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { VehicleWithState } from '$lib/api-types.js'
-	import { DASH, formatOdometer, formatRelative, formatTempC } from '$lib/format.js'
+	import { DASH, formatOdometer, formatRelative, formatTemp } from '$lib/format.js'
 	import { hasCoords } from '$lib/format.js'
 	import ActivityPill from './ActivityPill.svelte'
 	import BatteryGauge from './BatteryGauge.svelte'
@@ -42,11 +42,11 @@
 				</div>
 				<div>
 					<dt>Inside</dt>
-					<dd class="num">{formatTempC(s.insideTempC)}</dd>
+					<dd class="num">{formatTemp(s.insideTempC)}</dd>
 				</div>
 				<div>
 					<dt>Outside</dt>
-					<dd class="num">{formatTempC(s.outsideTempC)}</dd>
+					<dd class="num">{formatTemp(s.outsideTempC)}</dd>
 				</div>
 				<div>
 					<dt>Locked</dt>
