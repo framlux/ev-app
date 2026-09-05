@@ -1,7 +1,8 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { compile } from 'svelte/compiler'
+import { compile, compileModule } from 'svelte/compiler'
+import { transformWithEsbuild } from 'vite'
 import { defineConfig, type Plugin } from 'vitest/config'
 
 /**
@@ -50,7 +51,18 @@ function svelteSsrForTests(): Plugin {
 			}
 			return null
 		},
-		transform(_code, id) {
+		/**
+		 * A .svelte.ts module carries runes too, and esbuild leaves `$state` as an
+		 * undefined global — a ReferenceError at import, before a single test
+		 * runs. compileModule is what handles runes outside a component, and it
+		 * has no TypeScript parser, so the types come off first.
+		 */
+		async transform(_code, id) {
+			if (id.endsWith('.svelte.ts')) {
+				const stripped = await transformWithEsbuild(readFileSync(id, 'utf8'), id, { loader: 'ts' })
+				const { js } = compileModule(stripped.code, { filename: id, generate: 'server' })
+				return { code: js.code, map: js.map }
+			}
 			if (!id.endsWith('.svelte')) return null
 			const source = readFileSync(id, 'utf8')
 			const { js } = compile(source, {
