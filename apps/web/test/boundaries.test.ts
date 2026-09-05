@@ -68,3 +68,54 @@ describe('apps/web architectural boundaries', () => {
     expect(offenders).toEqual([])
   })
 })
+
+/**
+ * Authentication boundary: Pocket-ID is the ONLY way into this app.
+ *
+ * The trap this guards is a naming accident. Tesla's application form demands a
+ * redirect URI, and the one registered is https://ev.framlux.io/tesla_login.
+ * That path is not a login: it is a one-time OAuth callback the operator uses to
+ * mint a Fleet API refresh token, and it authenticates nobody. Its name reads
+ * like a sign-in option, which is exactly how a future change ends up adding
+ * "Sign in with Tesla" and quietly turning a Tesla account into a second way
+ * into a single-user app whose whole authorisation model is one Pocket-ID `sub`.
+ *
+ * Tesla tokens grant vehicle access. They must never grant app access.
+ */
+describe('apps/web authentication boundaries', () => {
+  const files = sourceFiles(new URL('../src', import.meta.url).pathname)
+
+  it('never places a Tesla path in the public/unauthenticated allowlist', () => {
+    const offenders: string[] = []
+    for (const f of files) {
+      const src = readFileSync(f, 'utf8')
+      const m = src.match(/PUBLIC_PATHS\s*=\s*\[([\s\S]*?)\]/)
+      if (m && /tesla/i.test(m[1] ?? '')) offenders.push(f)
+    }
+    expect(offenders).toEqual([])
+  })
+
+  it('never issues an app session from a Tesla credential', () => {
+    const offenders: string[] = []
+    for (const f of files) {
+      const src = readFileSync(f, 'utf8')
+      // A session cookie or sealSession call in the same file as Tesla OAuth
+      // handling is the shape this forbids.
+      const touchesTesla = /tesla/i.test(src)
+      const issuesSession = /sealSession|ev_session|cookies\.set\(/.test(src)
+      if (touchesTesla && issuesSession) offenders.push(f)
+    }
+    expect(offenders).toEqual([])
+  })
+
+  it('offers no Tesla sign-in affordance in the UI', () => {
+    const offenders: string[] = []
+    for (const f of files.filter((f) => f.endsWith('.svelte'))) {
+      const src = readFileSync(f, 'utf8')
+      if (/sign\s*in\s*with\s*tesla|log\s*in\s*with\s*tesla|tesla\s*login/i.test(src)) {
+        offenders.push(f)
+      }
+    }
+    expect(offenders).toEqual([])
+  })
+})

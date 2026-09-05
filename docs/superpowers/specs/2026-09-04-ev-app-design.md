@@ -189,6 +189,15 @@ Even with streaming, a small Fleet API client is needed for the vehicle list, `k
 
 ### 6.1 Authentication
 
+**Pocket-ID is the only way into this app.** There is no second authentication path and no
+"Sign in with Tesla". This matters because the naming invites the opposite: Tesla's application
+form requires a redirect URI, and the one registered is `https://ev.framlux.io/tesla_login`.
+That path is *not* a login. It is a one-time OAuth callback the operator uses to mint a Fleet
+API refresh token, it authenticates nobody, and it must never appear in `PUBLIC_PATHS` or issue
+a session cookie. A Tesla token grants access to the *vehicle*; it must never grant access to
+the *app*, whose entire authorisation model is a single Pocket-ID `sub`. Enforced by
+`apps/web/test/boundaries.test.ts`, which is mutation-verified.
+
 Authorization code + PKCE against `https://sso.framlux.io`. Session in an HttpOnly, Secure, SameSite=Lax cookie. Client credentials and the session signing key are SealedSecrets named `ev-pocketid-client` and `ev-session`, mirroring `crm-pocketid-client` and `crm-session`.
 
 A single Pocket-ID subject is authorised; anyone else authenticating successfully is rejected at the application layer. The allowed subject is configuration, not code.
