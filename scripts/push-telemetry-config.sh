@@ -11,8 +11,18 @@
 # and leaves fleet_telemetry_config reporting synced: false forever - which is
 # indistinguishable from a car that is merely asleep.
 #
+# The FIELD LIST is not here. It is `packages/tesla/src/catalogue.ts`, printed
+# in Tesla's shape by scripts/telemetry-fields.mjs, because what we ask the car
+# for has to agree with what we decode and what we store - and a shell script
+# cannot be checked against either. See step 5.
+#
+#   pnpm --filter @ev/tesla build
 #   CLIENT_ID=... REFRESH_TOKEN=... ./scripts/push-telemetry-config.sh [VIN]
 set -euo pipefail
+
+# Resolved rather than assumed, so the script works from any working directory;
+# it needs the repo to reach the field catalogue.
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 NS=ev
 POD=ev-teslacmd-push
@@ -26,7 +36,7 @@ pass() { printf '   \033[32mPASS\033[0m %s\n' "$1"; }
 fail() { printf '   \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
 info() { printf '        %s\n' "$1"; }
 
-for bin in kubectl curl python3 base64; do
+for bin in kubectl curl python3 base64 node; do
   command -v "$bin" >/dev/null || { echo "required command not found: $bin" >&2; exit 2; }
 done
 : "${CLIENT_ID:?set CLIENT_ID}" "${REFRESH_TOKEN:?set REFRESH_TOKEN}"
@@ -146,39 +156,27 @@ grep -q "BEGIN CERTIFICATE" "$TMP/ca.pem" || fail "ev-telemetry-ca holds no cert
 # then fails every connection.
 info "ca: $(grep -c 'BEGIN CERTIFICATE' "$TMP/ca.pem") certificate(s) from ev-telemetry-ca"
 
-python3 - "$TMP/ca.pem" "$VIN" "$HOSTNAME_" "$PORT" > "$TMP/config.json" <<'EOF'
+# The field list, from packages/tesla/src/catalogue.ts, in the shape the API
+# takes: interval_seconds from the entry's tier and minimum_delta from its
+# delta. It lives there and not here because an unknown field name is DROPPED by
+# the car, not refused - a name that does not match the normaliser costs a signal
+# with no error anywhere - and only a list in the repo can be tested against the
+# vendored proto, the column catalogue and the schema. That test is
+# packages/tesla/test/push-config.test.ts; this script's job is to send what it
+# is given.
+node "$ROOT/scripts/telemetry-fields.mjs" > "$TMP/fields.json" \
+  || fail "could not build the field list - run: pnpm --filter @ev/tesla build"
+COUNT=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$TMP/fields.json")
+# A config with no fields is accepted and stops the car streaming ANYTHING, which
+# looks exactly like a car that is asleep. Refuse rather than push it.
+[ "$COUNT" -gt 0 ] || fail "the catalogue emitted no fields"
+info "$COUNT fields from packages/tesla/src/catalogue.ts"
+
+python3 - "$TMP/ca.pem" "$VIN" "$HOSTNAME_" "$PORT" "$TMP/fields.json" > "$TMP/config.json" <<'EOF'
 import json,sys
 ca=open(sys.argv[1]).read()
 vin, host, port = sys.argv[2], sys.argv[3], int(sys.argv[4])
-# Field names verified against protos/vehicle_data.proto. An unknown name is
-# DROPPED, not refused, so a typo here costs a field with no error anywhere.
-# Intervals are minimum seconds between sends, and the car only sends on change,
-# so parked time is nearly free. Location and speed are the only fields set fast
-# enough to shape a drive; everything else is sampled to keep the signal bill
-# down (streaming is billed per signal).
-fields = {
-    "Location":            10,
-    "VehicleSpeed":        10,
-    "Gear":                30,
-    "Soc":                 60,
-    "Odometer":            60,
-    "ChargeState":         60,
-    "DetailedChargeState": 60,
-    "ACChargingPower":     30,
-    "DCChargingPower":     30,
-    "ACChargingEnergyIn":  60,
-    "DCChargingEnergyIn":  60,
-    "ChargeAmps":          60,
-    "RatedRange":         300,
-    "InsideTemp":         300,
-    "OutsideTemp":        300,
-    "Locked":             300,
-    "DoorState":          300,
-    "TpmsPressureFl":    3600,
-    "TpmsPressureFr":    3600,
-    "TpmsPressureRl":    3600,
-    "TpmsPressureRr":    3600,
-}
+fields=json.load(open(sys.argv[5]))
 cfg = {
     "vins": [vin],
     "config": {
@@ -188,12 +186,12 @@ cfg = {
         # Typed enums rather than raw ints, decided before the normaliser is
         # written so the fixtures it is built against match production.
         "prefer_typed": True,
-        "fields": {k: {"interval_seconds": v} for k, v in fields.items()},
+        "fields": fields,
     },
 }
 print(json.dumps(cfg))
 EOF
-info "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["config"]["fields"]), "fields")' "$TMP/config.json")"
+info "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["config"]["fields"]), "fields in the configuration")' "$TMP/config.json")"
 
 # --------------------------------------------------------------- push
 step "6. Pushing to the vehicle"
