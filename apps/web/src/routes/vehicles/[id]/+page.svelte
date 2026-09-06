@@ -69,14 +69,26 @@
 		return s.softwareUpdateVersion ? `${s.softwareUpdateVersion} available` : 'update available'
 	})
 
-	let portHint = $derived(s?.chargePortLatch ? `latch ${s.chargePortLatch}` : null)
+	// Through formatText, like every other vendor enum on this page: the raw
+	// value is `ChargePortLatchEngaged`, and the tile has 140px.
+	let portHint = $derived(s?.chargePortLatch ? `latch ${formatText(s.chargePortLatch)}` : null)
 
 	// The AC state and cabin overheat protection ride along with the climate
 	// tile: three tiles for one subsystem would crowd out everything else.
 	let climateHint = $derived.by(() => {
 		const parts: string[] = []
 		if (s?.hvacAcEnabled != null) parts.push(s.hvacAcEnabled ? 'A/C on' : 'A/C off')
-		if (s?.cabinOverheatProtectionMode) parts.push(`overheat ${s.cabinOverheatProtectionMode}`)
+		if (s?.cabinOverheatProtectionMode) {
+			// Only the FIRST letter, so this sits beside "A/C off" as one phrase
+			// without mangling anything: lowercasing the whole label turned an
+			// unrecognised `FanOnly` into `fanonly`. An all-caps label is a name
+			// and is left alone entirely - `SNA` is not `sna`.
+			const mode = formatText(s.cabinOverheatProtectionMode)
+			const phrased = mode === mode.toUpperCase()
+				? mode
+				: mode.charAt(0).toLowerCase() + mode.slice(1)
+			parts.push(`overheat ${phrased}`)
+		}
 		return parts.length > 0 ? parts.join(' · ') : null
 	})
 

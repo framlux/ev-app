@@ -13,6 +13,12 @@
  * someone reaches for `value || '—'` (which eats zeros) instead of a null check.
  */
 
+// The ONE vendor-specific import in a browser module, and it is a subpath on
+// purpose: `@ev/tesla` the barrel pulls jose and the whole Fleet API client in
+// with it, none of which belongs in a page bundle. This file is pure string
+// handling over the vendored proto's enum names.
+import { teslaEnumLabel } from '@ev/tesla/enum-labels'
+
 /** The single "not recorded" glyph. Never '0', never 'N/A', never blank. */
 export const DASH = '—'
 
@@ -108,7 +114,14 @@ export const formatVolts = (v: Maybe, dp = 0): string => unit(formatNumber(v, dp
 export function formatText(value: string | null | undefined): string {
   if (value == null) return DASH
   const trimmed = value.trim()
-  return trimmed === '' ? DASH : trimmed
+  if (trimmed === '') return DASH
+  // The ONE transformation applied to a vendor enum, and it invents nothing:
+  // `teslaEnumLabel` deletes a prefix the vendored proto itself defines, so
+  // `SentryModeStateOff` reads `Off`. A value from an enum it does not know
+  // comes back untouched, which keeps the guarantee above intact - what is on
+  // screen is either the car's own word or the car's own word with its type
+  // name removed, never a translation of it.
+  return teslaEnumLabel(trimmed)
 }
 
 /**

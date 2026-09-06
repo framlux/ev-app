@@ -9,5 +9,17 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
-  "dependencies": { "@ev/core": "workspace:*" }
+  "dependencies": {
+    "@ev/core": "workspace:*"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./enum-labels": {
+      "types": "./dist/enum-labels.d.ts",
+      "default": "./dist/enum-labels.js"
+    }
+  }
 }

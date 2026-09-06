@@ -470,13 +470,17 @@ describe('the tiles spec §3.8 added', () => {
 		ts: '2026-09-04T07:31:00.000Z',
 		socPct: 62,
 		gear: 'P',
-		sentryMode: 'Off',
+		// The values the CAR sends, not tidied ones. With prefer_typed the wire
+		// carries the full protobuf enum name, and a fixture that says 'Off'
+		// where production says 'SentryModeStateOff' is why these tiles passed
+		// their tests and overflowed on screen.
+		sentryMode: 'SentryModeStateOff',
 		chargeLimitSoc: 80,
 		chargePortDoorOpen: false,
-		chargePortLatch: 'Engaged',
-		hvacPower: 'On',
+		chargePortLatch: 'ChargePortLatchEngaged',
+		hvacPower: 'HvacPowerStateOn',
 		hvacAcEnabled: true,
-		cabinOverheatProtectionMode: 'FanOnly',
+		cabinOverheatProtectionMode: 'CabinOverheatProtectionModeStateFanOnly',
 		version: '2026.20.1',
 		softwareUpdateAvailable: true,
 		softwareUpdateVersion: '2026.24.3',
@@ -523,8 +527,13 @@ describe('the tiles spec §3.8 added', () => {
 		expect(body).toContain('2026.20.1')
 		expect(body).toContain('2026.24.3')
 		expect(body).toContain('80%')
-		expect(body).toContain('Engaged')
-		expect(body).toContain('FanOnly')
+		// The LABEL, not the wire value: the type name in front of it is dropped
+		// (`ChargePortLatchEngaged` -> `Engaged`), and a multi-word value reads
+		// as words. Asserting the raw value here would pin the overflow back in.
+		expect(body).toContain('latch Engaged')
+		expect(body).toContain('overheat fan only')
+		expect(body).not.toContain('CabinOverheatProtectionModeState')
+		expect(body).not.toContain('SentryModeState')
 		expect(body).toContain('Sentry')
 		expect(body).toContain('Gear')
 		expect(body).toContain('>P<')

@@ -41,11 +41,17 @@
 		font-size: 1.15rem;
 		font-weight: 620;
 		letter-spacing: -0.02em;
+		/* A tile is 140px of content box and some values are single unbroken
+		   tokens far wider than that - a Tesla enum name overflowed by 33px
+		   before the labels were shortened. `anywhere` rather than `break-word`
+		   so a long token also stops the tile itself from widening the grid. */
+		overflow-wrap: anywhere;
 	}
 
 	.hint {
 		font-size: 0.75rem;
 		color: var(--text-muted);
+		overflow-wrap: anywhere;
 	}
 
 	.accent .value {

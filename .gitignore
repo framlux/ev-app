@@ -12,3 +12,7 @@ build/
 npm-cache/
 /tesla-private-key.pem
 /tesla-public-key.pem
+
+# Playwright MCP scratch output: screenshots and page snapshots from local
+# verification runs. Artefacts of looking at the app, not part of it.
+.playwright-mcp/
