@@ -1,2 +1,0 @@
-[      61ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:5199/auth/login:0
-[     110ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:5199/auth/login?next=%2Ffavicon.ico:0
