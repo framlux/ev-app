@@ -3,7 +3,9 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { TESLA_FIELDS, TIER_INTERVAL_SECONDS, WITHHELD_FIELDS } from '../src/catalogue.js'
+import {
+  API_FIELD_RULES, TESLA_FIELDS, TIER_INTERVAL_SECONDS, WITHHELD_NAMES,
+} from '../src/catalogue.js'
 import type { AppliedTelemetryConfig, TelemetryFields } from '../src/fleet-api.js'
 import {
   TELEMETRY_HOSTNAME,
@@ -24,7 +26,7 @@ const VIN = '5YJYGDEE0MF000000'
  * the same set until the API rejected `BrickSocMinPercent`, and the difference
  * between them is now a decision the catalogue records rather than an accident.
  */
-const PUSHED = TESLA_FIELDS.filter((e) => !WITHHELD_FIELDS.fields.includes(e.field))
+const PUSHED = TESLA_FIELDS.filter((e) => !WITHHELD_NAMES.includes(e.field))
 
 /** The captured `fleet_telemetry_config` response §3.6's rule is pinned against. */
 const captured = JSON.parse(readFileSync(
@@ -286,7 +288,7 @@ describe('buildTelemetryFields', () => {
 describe('fields the Fleet API does not accept yet', () => {
   it('asks for none of the 1.3.0 block', () => {
     const asked = Object.keys(buildTelemetryFields())
-    expect(asked.filter((f) => WITHHELD_FIELDS.fields.includes(f))).toEqual([])
+    expect(asked.filter((f) => WITHHELD_NAMES.includes(f))).toEqual([])
   })
 
   it('asks for nothing named BrickSocMinPercent', () => {
@@ -294,8 +296,66 @@ describe('fields the Fleet API does not accept yet', () => {
   })
 
   it('still asks for everything else the catalogue captures', () => {
-    const withheld = new Set<string>(WITHHELD_FIELDS.fields)
+    const withheld = new Set<string>(WITHHELD_NAMES)
     expect(Object.keys(buildTelemetryFields()).sort())
       .toEqual(TESLA_FIELDS.map((e) => e.field).filter((f) => !withheld.has(f)).sort())
+  })
+})
+
+/**
+ * The SECOND 400, and the reason the rules below are data rather than a fix:
+ * `SelfDrivingMilesSinceReset requires minimum delta be explicitly set and >= 1`.
+ * The proto could not have told us this. Only Tesla's field reference does.
+ */
+describe('the API rules the proto does not carry', () => {
+  it('asks for SelfDrivingMilesSinceReset with a delta the API accepts', () => {
+    const rule = API_FIELD_RULES.find((r) => r.field === 'SelfDrivingMilesSinceReset')!
+    const asked = buildTelemetryFields()['SelfDrivingMilesSinceReset']
+    expect(asked?.minimum_delta).toBeGreaterThanOrEqual(rule.minimumDelta)
+  })
+
+  it('satisfies every MANDATORY delta rule, not just the one that bit us', () => {
+    const fields = buildTelemetryFields()
+    for (const rule of API_FIELD_RULES) {
+      if (rule.minimumDelta === 0) continue // recorded as read, not enforced
+      const asked = fields[rule.field]
+      if (!asked) continue // withheld or uncatalogued: not asked for, not a violation
+      const delta = asked.minimum_delta ?? 0
+      expect(`${rule.field}=${delta >= rule.minimumDelta}`).toBe(`${rule.field}=true`)
+    }
+  })
+
+  /**
+   * A rule recorded with `minimumDelta: 0` is a note about what was READ, not a
+   * constraint - the difference between "the doc does not require one" and "the
+   * doc was never checked". It must never fail a build on its own.
+   */
+  it('never rejects a config over a rule that only recommends a delta', () => {
+    const recommended = API_FIELD_RULES.filter((r) => r.minimumDelta === 0)
+    expect(recommended.length).toBeGreaterThan(0)
+    const stripped = TESLA_FIELDS.map((e) =>
+      recommended.some((r) => r.field === e.field) ? { ...e, delta: null } : e)
+    expect(() => buildTelemetryFields(stripped)).not.toThrow()
+  })
+
+  it('cites a source for every rule, so a moved doc can be re-checked', () => {
+    for (const rule of API_FIELD_RULES) {
+      expect(rule.source.length, rule.field).toBeGreaterThan(20)
+    }
+  })
+
+  // The guard, not the fix: a catalogue that violates a rule must fail HERE,
+  // where a test sees it, rather than as a 400 from a car.
+  it('refuses to build a config that a rule says the API will reject', () => {
+    const broken = TESLA_FIELDS.map((e) =>
+      e.field === 'SelfDrivingMilesSinceReset' ? { ...e, delta: null } : e)
+    expect(() => buildTelemetryFields(broken))
+      .toThrow(/SelfDrivingMilesSinceReset/)
+  })
+
+  it('refuses a delta below the documented minimum, not merely a missing one', () => {
+    const broken = TESLA_FIELDS.map((e) =>
+      e.field === 'SelfDrivingMilesSinceReset' ? { ...e, delta: 0.5 } : e)
+    expect(() => buildTelemetryFields(broken)).toThrow(/SelfDrivingMilesSinceReset/)
   })
 })

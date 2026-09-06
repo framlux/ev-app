@@ -29,7 +29,8 @@ import * as fleet from '../src/fleet-api.js'
  */
 it('exposes no vehicle-data or command helper, so neither happens by accident', () => {
   expect(Object.keys(fleet).sort()).toEqual(
-    ['fleetStatus', 'getTelemetryConfig', 'listVehicles', 'setTelemetryConfig'])
+    ['TeslaApiError', 'fleetStatus', 'getTelemetryConfig', 'listVehicles',
+      'setTelemetryConfig'])
 })
 
 /**
@@ -116,4 +117,56 @@ it('reads the applied configuration back, not just the synced flag', async () =>
   expect(res.synced).toBe(true)
   expect(res.config).toEqual(applied)
   expect(res.config?.fields.VehicleSpeed?.minimum_delta).toBe(1)
+})
+
+/**
+ * WHAT TESLA'S REFUSAL SAYS, kept intact all the way to the operator.
+ *
+ * Both 400s this API has returned were precise and actionable - one named the
+ * unknown field, one named the rule and the value it wanted - and both reached
+ * the operator as a 500 and a stack trace in a log, because the failure was a
+ * bare `Error` carrying a JSON blob in its message. The refusal is the most
+ * useful thing in the whole exchange; it must survive as data.
+ */
+it('carries Tesla\'s own refusal, parsed, rather than a JSON blob in a message', async () => {
+  const body = JSON.stringify({
+    response: null,
+    error: 'SelfDrivingMilesSinceReset requires minimum delta be explicitly set and >= 1',
+    error_description: '',
+    txid: 'cbe224814cdef1d182bb6622da5dd0fc',
+  })
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    new Response(body, { status: 400, statusText: 'Bad Request' }))
+
+  const thrown = await fleet.setTelemetryConfig('token', {
+    vins: ['5YJYGDEE0MF000000'],
+    config: {
+      hostname: 'h', port: 443, ca: 'x', prefer_typed: true,
+      fields: { Soc: { interval_seconds: 60 } },
+    },
+  }).catch((e: unknown) => e)
+
+  expect(thrown).toBeInstanceOf(fleet.TeslaApiError)
+  const err = thrown as InstanceType<typeof fleet.TeslaApiError>
+  expect(err.status).toBe(400)
+  expect(err.teslaError)
+    .toBe('SelfDrivingMilesSinceReset requires minimum delta be explicitly set and >= 1')
+  expect(err.txid).toBe('cbe224814cdef1d182bb6622da5dd0fc')
+  // The message is what an operator reads: Tesla's sentence, not our wrapper.
+  expect(err.message).toContain('requires minimum delta be explicitly set and >= 1')
+  expect(err.message).not.toContain('{')
+})
+
+it('keeps the body when Tesla answers with something that is not its error shape', async () => {
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    new Response('<html>gateway timeout</html>', { status: 504 }))
+
+  const thrown = await fleet.fleetStatus('token', ['5YJYGDEE0MF000000'])
+    .catch((e: unknown) => e) as InstanceType<typeof fleet.TeslaApiError>
+
+  expect(thrown).toBeInstanceOf(fleet.TeslaApiError)
+  expect(thrown.status).toBe(504)
+  expect(thrown.teslaError).toBeNull()
+  // Unparseable is not the same as empty: an operator still needs the bytes.
+  expect(thrown.message).toContain('gateway timeout')
 })

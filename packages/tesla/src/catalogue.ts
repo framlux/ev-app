@@ -558,8 +558,11 @@ export const TESLA_FIELDS: readonly TeslaField[] = [
     slot: 'chargeRateKmPerHour', tier: 'charge', convert: 'milesToKm', delta: 1 },
   { field: 'MilesSinceReset', column: 'km_since_reset', slot: 'kmSinceReset',
     tier: 'static', convert: 'milesToKm', delta: null },
+  // delta 1 is MANDATORY here, not a cost decision: the API rejects the whole
+  // push without it. One mile, because delta is in wire units. See
+  // `API_FIELD_RULES`.
   { field: 'SelfDrivingMilesSinceReset', column: 'self_driving_km_since_reset',
-    slot: 'selfDrivingKmSinceReset', tier: 'static', convert: 'milesToKm', delta: null },
+    slot: 'selfDrivingKmSinceReset', tier: 'static', convert: 'milesToKm', delta: 1 },
   { field: 'GpsAccuracyMeters', column: 'gps_accuracy_meters',
     slot: 'gpsAccuracyMeters', tier: 'static', convert: null, delta: 1 },
   { field: 'LifetimeEnergyChargedKwh', column: 'lifetime_energy_charged_kwh',
@@ -581,6 +584,77 @@ export const TESLA_FIELDS: readonly TeslaField[] = [
     slot: 'remoteStartActive', tier: 'static', convert: null, delta: null },
   { field: 'SemiCruiseSpeedLimitMph', column: 'semi_cruise_speed_limit_kph',
     slot: 'semiCruiseSpeedLimitKph', tier: 'static', convert: 'mphToKph', delta: null },
+]
+
+/**
+ * WHAT THE PROTO CANNOT TELL US: the Fleet API's own per-field rules.
+ *
+ * The catalogue above was built from `vehicle_data.proto`, and the proto
+ * carries names and firmware-availability comments and NOTHING ELSE. The API
+ * that accepts the configuration has rules of its own, and they are published
+ * in one place only — Tesla's "Available Data" field reference — which the
+ * original design never read. So the rules arrived the expensive way, one
+ * rejected push at a time:
+ *
+ *   400 SelfDrivingMilesSinceReset requires minimum delta be explicitly set
+ *       and >= 1
+ *
+ * They are DATA here, checked by `buildTelemetryFields`, so that the next one
+ * fails a test rather than a car. Each carries the sentence it came from,
+ * because a rule whose source is lost cannot be re-checked when the doc moves.
+ *
+ * Read against https://developer.tesla.com/docs/fleet-api/fleet-telemetry/available-data
+ * on 2026-09-06. Every field on that page whose text mentions `minimum_delta`
+ * is accounted for below, including the three that merely recommend one: the
+ * point is to record what was read, so a later reader can tell the difference
+ * between "not required" and "not looked at".
+ */
+export interface FieldRule {
+  readonly field: string
+  /** The smallest `minimum_delta` the API accepts. 0 means "not required". */
+  readonly minimumDelta: number
+  /** The documented sentence, verbatim. */
+  readonly source: string
+}
+
+export const API_FIELD_RULES: readonly FieldRule[] = [
+  {
+    field: 'SelfDrivingMilesSinceReset',
+    minimumDelta: 1,
+    source:
+      'This field requires minimum_delta to be explicitly set to a value >= 1 ' +
+      'and is only available on HW4 vehicles running firmware version ' +
+      '2025.44.25.5 or later.',
+  },
+  {
+    field: 'ChargerVoltage',
+    minimumDelta: 0,
+    source:
+      'It is recommended to set minimum_delta, which is available on firmware ' +
+      'version 2024.44.32 and later. Beginning with firmware version 2025.2.6, ' +
+      'minimum_delta is set to 0.3 by default.',
+  },
+  {
+    field: 'InsideTemp',
+    minimumDelta: 0,
+    source:
+      'This field frequently changes in small increments and setting a ' +
+      'minimum delta is recommended.',
+  },
+  {
+    field: 'Odometer',
+    minimumDelta: 0,
+    source:
+      'Beginning with firmware version 2025.2.6, the minimum delta for ' +
+      'Odometer is set to 0.1 by default.',
+  },
+  {
+    field: 'Location',
+    minimumDelta: 0,
+    source:
+      'Beginning with firmware version 2025.2.6, specifying minimum delta for ' +
+      'location values is possible. Changes in distance are measured in metres.',
+  },
 ]
 
 /** A group of proto members we deliberately do not ask for. */
@@ -678,19 +752,41 @@ export const EXCLUDED_FIELDS: readonly ExclusionGroup[] = [
  * exist, and the drift test still accounts for them. Only the pushed config
  * omits them, so re-enabling is deleting a name from this list once a push
  * proves the API knows it.
+ *
+ * THE SECOND GROUP was not learned from a car. `reference/tesla-available-data.json`
+ * is Tesla's own published field table, and it turns out to be exactly the set
+ * the API accepts: every proto member missing from it is either a placeholder
+ * we exclude outright or a name the API refused. Two fields we were still
+ * pushing sit in that gap, so they are held back on the same evidence rather
+ * than on a third failed push. The test that pins this is the one that would
+ * have caught BrickSocMinPercent before it ever reached a car.
  */
-export const WITHHELD_FIELDS: ExclusionGroup = {
-  reason:
-    'Proto members 260-269 (firmware 2026.32, device client 1.3.0). The Fleet ' +
-    'API rejected BrickSocMinPercent on 2026-09-06 and one unknown name fails ' +
-    'the entire push, so the block is held back until the API accepts it.',
-  fields: [
-    'GpsAccuracyMeters', 'LifetimeEnergyChargedKwh', 'BrickSocMinPercent',
-    'NominalFullPackEnergyKwh', 'GradeEstimatePercent',
-    'MaxSpeedToReachDestinationMph', 'SoftwareUpdateAvailable',
-    'SoftwareUpdateInProgress', 'RemoteStartActive', 'SemiCruiseSpeedLimitMph',
-  ],
-}
+export const WITHHELD_FIELDS: readonly ExclusionGroup[] = [
+  {
+    reason:
+      'Proto members 260-269 (firmware 2026.32, device client 1.3.0). The Fleet ' +
+      'API rejected BrickSocMinPercent on 2026-09-06 and one unknown name fails ' +
+      'the entire push, so the block is held back until the API accepts it.',
+    fields: [
+      'GpsAccuracyMeters', 'LifetimeEnergyChargedKwh', 'BrickSocMinPercent',
+      'NominalFullPackEnergyKwh', 'GradeEstimatePercent',
+      'MaxSpeedToReachDestinationMph', 'SoftwareUpdateAvailable',
+      'SoftwareUpdateInProgress', 'RemoteStartActive', 'SemiCruiseSpeedLimitMph',
+    ],
+  },
+  {
+    reason:
+      'In the proto but absent from Tesla\'s published field table, which is the ' +
+      'set the API actually accepts. Never observed rejected, because the 1.3.0 ' +
+      'block failed the push first - and they sit in exactly the category that ' +
+      'block did. Held back rather than discovered from a car.',
+    fields: ['ScheduledDepartureTime', 'LifetimeEnergyGainedRegen'],
+  },
+]
+
+/** Every withheld name, whatever the reason. */
+export const WITHHELD_NAMES: readonly string[] =
+  WITHHELD_FIELDS.flatMap((g) => g.fields)
 
 /** Days in the billing month the projection below is quoted in. */
 const DAYS_PER_MONTH = 30

@@ -1,6 +1,64 @@
 const BASE = 'https://fleet-api.prd.na.vn.cloud.tesla.com/api/1'
 
 /**
+ * A non-2xx from the Fleet API, with Tesla's own refusal kept as data.
+ *
+ * Tesla's refusals are the most useful thing this integration receives. Both
+ * that this app has hit named exactly what was wrong - an unknown field, and a
+ * rule with the value it wanted - and both reached the operator as a 500 with a
+ * stack trace, because the failure was a bare Error whose message happened to
+ * contain a JSON document. The page then had nothing to show but "Internal
+ * Error", and the actual sentence had to be dug out of a pod log.
+ *
+ * So the refusal is parsed HERE, once, at the boundary that knows the shape:
+ * `{ response, error, error_description, txid }`. `message` is Tesla's sentence
+ * so anything that merely logs the error is already better off, and the parts
+ * stay addressable so the web layer can put the sentence in front of a person
+ * and quote the txid, which is what Tesla asks for when reporting a problem.
+ *
+ * A body that is not that shape - an HTML gateway page, an empty 502 - keeps
+ * its bytes verbatim, because "unparseable" and "empty" are different problems
+ * and the difference is the whole diagnosis.
+ */
+export class TeslaApiError extends Error {
+  readonly status: number
+  readonly path: string
+  /** Tesla's `error`, or null when the body was not its error shape. */
+  readonly teslaError: string | null
+  /** Tesla's `error_description`. Frequently empty, even on a real refusal. */
+  readonly teslaErrorDescription: string | null
+  /** Tesla's correlation id. What they ask for when reporting a problem. */
+  readonly txid: string | null
+
+  constructor(path: string, status: number, body: string) {
+    const parsed = TeslaApiError.parse(body)
+    const detail = parsed.error ?? (body.trim() === '' ? '(no body)' : body.trim())
+    super(`Tesla refused ${path} with ${status}: ${detail}`)
+    this.name = 'TeslaApiError'
+    this.status = status
+    this.path = path
+    this.teslaError = parsed.error
+    this.teslaErrorDescription = parsed.description
+    this.txid = parsed.txid
+  }
+
+  private static parse(body: string): {
+    error: string | null; description: string | null; txid: string | null
+  } {
+    try {
+      const o: unknown = JSON.parse(body)
+      if (typeof o !== 'object' || o === null) return { error: null, description: null, txid: null }
+      const r = o as Record<string, unknown>
+      const str = (v: unknown): string | null =>
+        typeof v === 'string' && v.trim() !== '' ? v : null
+      return { error: str(r['error']), description: str(r['error_description']), txid: str(r['txid']) }
+    } catch {
+      return { error: null, description: null, txid: null }
+    }
+  }
+}
+
+/**
  * Where the calls go. `baseUrl` INCLUDES the `/api/1` prefix, because the
  * default does and a base that silently meant something else between callers is
  * exactly the kind of thing that only shows up against a real car.
@@ -55,7 +113,7 @@ async function get<T>(path: string, accessToken: string, opts?: FleetApiOptions)
   const res = await fetch(url(path, opts), {
     headers: { authorization: `Bearer ${accessToken}` },
   })
-  if (!res.ok) throw new Error(`${path} failed: ${res.status} ${await res.text()}`)
+  if (!res.ok) throw new TeslaApiError(path, res.status, await res.text())
   return (await res.json() as { response: T }).response
 }
 
@@ -104,6 +162,6 @@ async function post<T>(
     headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`${path} failed: ${res.status} ${await res.text()}`)
+  if (!res.ok) throw new TeslaApiError(path, res.status, await res.text())
   return (await res.json() as { response: T }).response
 }

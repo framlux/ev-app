@@ -2,12 +2,14 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { SAMPLE_COLUMNS } from '@ev/core'
 import {
+  API_FIELD_RULES,
   COLLAPSED_COLUMNS,
   CONVERTERS,
   EXCLUDED_FIELDS,
   TESLA_FIELDS,
   TIER_INTERVAL_SECONDS,
   WITHHELD_FIELDS,
+  WITHHELD_NAMES,
   columnsOf,
   projectMonthlySignals,
   slotsOf,
@@ -128,23 +130,26 @@ describe('exclusions', () => {
 describe('withheld fields', () => {
   it('names only real proto members', () => {
     const members = new Set(PROTO_FIELDS)
-    expect(WITHHELD_FIELDS.fields.filter((f) => !members.has(f))).toEqual([])
+    expect(WITHHELD_NAMES.filter((f) => !members.has(f))).toEqual([])
   })
 
   it('names only fields the catalogue still captures', () => {
     const catalogued = new Set(CATALOGUED_NAMES)
-    expect(WITHHELD_FIELDS.fields.filter((f) => !catalogued.has(f))).toEqual([])
+    expect(WITHHELD_NAMES.filter((f) => !catalogued.has(f))).toEqual([])
   })
 
   it('never names something already excluded outright', () => {
     const excluded = new Set(EXCLUDED_NAMES)
-    expect(WITHHELD_FIELDS.fields.filter((f) => excluded.has(f))).toEqual([])
+    expect(WITHHELD_NAMES.filter((f) => excluded.has(f))).toEqual([])
   })
 
-  it('holds back the whole 260-269 block, with a reason', () => {
-    expect(WITHHELD_FIELDS.fields).toHaveLength(10)
-    expect(new Set(WITHHELD_FIELDS.fields).size).toBe(10)
-    expect(WITHHELD_FIELDS.reason.length).toBeGreaterThan(20)
+  it('holds back 12 names in two groups, each with a reason', () => {
+    expect(WITHHELD_NAMES).toHaveLength(12)
+    expect(new Set(WITHHELD_NAMES).size).toBe(12)
+    for (const group of WITHHELD_FIELDS) {
+      expect(group.fields.length, group.reason).toBeGreaterThan(0)
+      expect(group.reason.length).toBeGreaterThan(20)
+    }
   })
 
   /**
@@ -162,7 +167,224 @@ describe('withheld fields', () => {
     const tail = block.slice(block.indexOf('device client version 1.3.0'))
     const gated = [...tail.matchAll(/^\s+([A-Za-z_0-9]+)\s*=\s*\d+;/gm)].map((m) => m[1]!)
     expect(gated.length).toBeGreaterThan(0)
-    expect([...WITHHELD_FIELDS.fields].sort()).toEqual([...gated].sort())
+    expect([...WITHHELD_FIELDS[0]!.fields].sort()).toEqual([...gated].sort())
+  })
+})
+
+/**
+ * The rules are the SECOND source this catalogue answers to. The proto says
+ * what exists; Tesla's field reference says what the API will accept, and the
+ * two disagree in ways only a rejected push revealed. Keeping the rules honest
+ * matters as much as keeping the field names honest.
+ */
+/**
+ * Tesla's published field table, vendored at `reference/tesla-available-data.json`
+ * and refreshed by `scripts/fetch-tesla-fields.mjs`.
+ *
+ * This is the SECOND authority the catalogue answers to, and the more important
+ * one for the push: the proto says what a signal is named, this says what the
+ * API will accept. Read separately from the catalogue, like the proto is, for
+ * the same reason - a drift test that derives both sides from one source
+ * detects nothing.
+ */
+const DOCUMENTED: readonly { field: string; type: string; description: string }[] =
+  JSON.parse(readFileSync(
+    new URL('../reference/tesla-available-data.json', import.meta.url), 'utf8')).fields
+
+const DOCUMENTED_NAMES = new Set(DOCUMENTED.map((f) => f.field))
+
+describe("Tesla's published field table", () => {
+  it('is vendored whole, not truncated', () => {
+    expect(DOCUMENTED.length).toBeGreaterThan(200)
+    expect(new Set(DOCUMENTED.map((f) => f.field)).size).toBe(DOCUMENTED.length)
+  })
+
+  /**
+   * THE TEST THAT WOULD HAVE PREVENTED BOTH 400s. Everything we ask the car for
+   * must be a name Tesla publishes, because a name it does not publish is a name
+   * the API has refused every time we have tried one - and it fails the whole
+   * configuration, not the field.
+   */
+  it('documents every field we push', () => {
+    const withheld = new Set<string>(WITHHELD_NAMES)
+    const asked = CATALOGUED_NAMES.filter((f) => !withheld.has(f))
+    expect(asked.filter((f) => !DOCUMENTED_NAMES.has(f))).toEqual([])
+  })
+
+  /**
+   * The other direction, and the reason the withheld list is not just a
+   * denylist that grows forever: a withheld field that Tesla has since
+   * published is one the API has probably started accepting, and this failing
+   * is the prompt to try it again rather than leave a signal unasked-for.
+   */
+  it('does not yet document anything we withhold', () => {
+    const nowDocumented = WITHHELD_NAMES.filter((f) => DOCUMENTED_NAMES.has(f))
+    expect(nowDocumented, 'withheld but now documented: try re-enabling these')
+      .toEqual([])
+  })
+
+  /**
+   * The correspondence the withheld decision rests on: every proto member the
+   * table omits is either a placeholder we exclude outright or a name we
+   * withhold. If a real signal ever falls outside both, the assumption that
+   * "undocumented means refused" needs re-checking before the next push.
+   */
+  it('omits nothing except placeholders we exclude and names we withhold', () => {
+    const accountedFor = new Set([...EXCLUDED_NAMES, ...WITHHELD_NAMES])
+    const undocumented = PROTO_FIELDS.filter((f) => !DOCUMENTED_NAMES.has(f))
+    expect(undocumented.filter((f) => !accountedFor.has(f))).toEqual([])
+  })
+})
+
+/**
+ * WHAT TYPE THE CAR ACTUALLY SENDS, checked against the column we put it in.
+ *
+ * §3.4 of the spec says the types are OUR determination, because the MQTT
+ * transport unwraps the protobuf `oneof` and the proto therefore gives no
+ * field->type mapping. That was true when it was written; it is not true any
+ * more. Tesla's field table types every signal, so the determination can be
+ * checked instead of asserted - and a column that cannot hold what the car
+ * sends is a value silently dropped at insert, which nothing else here detects.
+ */
+const SQL_FOR_DOC_TYPE: Record<string, readonly string[]> = {
+  real: ['REAL', 'DOUBLE PRECISION'],
+  integer: ['INT', 'INTEGER', 'BIGINT', 'REAL', 'DOUBLE PRECISION'],
+  boolean: ['BOOLEAN'],
+  enum: ['TEXT'],
+  string: ['TEXT'],
+  // Every time-shaped column is parked at TEXT until the wire shape is seen
+  // (§3.4), and the doc now says why that was right: "Timestamp fields report
+  // incorrectly. Treating the reported value as Pacific Time will yield the
+  // date and time in the vehicle's timezone."
+  timestamp: ['TEXT', 'TIMESTAMPTZ', 'TIME'],
+  // The proto's `Time` is a wall clock - {hour, minute, second}, no date and no
+  // zone - so a TEXT column is the honest home for one until the wire shape is
+  // seen (§3.4).
+  time: ['TEXT', 'TIME'],
+  Location: ['DOUBLE PRECISION'],
+}
+
+/**
+ * Columns that deliberately do not match the documented type, and why.
+ *
+ * Each is a decision, not an accident, which is the only reason it is allowed
+ * to differ - and naming them here means a SIXTH deviation appearing is a test
+ * failure rather than a silent drop.
+ */
+const SANCTIONED_TYPE_DEVIATIONS: Record<string, string> = {
+  // TEXT is a superset of the boolean the doc promises: it takes `true` and it
+  // takes whatever enum the car turns out to send. Promoting these is a
+  // migration, worth doing once real values have been seen.
+  DriveRail: 'shape unobserved; TEXT takes either a flag or an enum',
+  BrakePedal: 'shape unobserved; TEXT takes either a flag or a position',
+  GpsState: 'shape unobserved; TEXT takes either a flag or an enum',
+  DriverSeatBelt: 'BuckleStatus or bool; TEXT takes either',
+  // The legacy `doors_open` column predates the full signal set and answers a
+  // narrower question than the signal carries: `anyDoorOpen` collapses the
+  // per-door record to "is any door open". Which doors is discarded on purpose.
+  DoorState: 'collapsed to a boolean by anyDoorOpen; the legacy column asks only "any"',
+  // Catalogued as "level or state name" when nobody knew which. The doc says
+  // integer, and `text()` stores a number as its digits, so nothing is lost -
+  // but the column is wider than it needs to be until a migration narrows it.
+  HvacFanStatus: 'catalogued before the shape was known; doc says integer, TEXT holds the digits',
+}
+
+describe('the values we store', () => {
+  it('puts every signal in a column that can hold what the doc says it is', () => {
+    const withheld = new Set<string>(WITHHELD_NAMES)
+    const problems: string[] = []
+    for (const entry of TESLA_FIELDS) {
+      if (withheld.has(entry.field)) continue
+      if (entry.field in SANCTIONED_TYPE_DEVIATIONS) continue
+      const documented = DOCUMENTED.find((f) => f.field === entry.field)
+      if (!documented) continue
+      const allowed = SQL_FOR_DOC_TYPE[documented.type]
+      if (!allowed) { problems.push(`${entry.field}: undocumented doc type ${documented.type}`); continue }
+      for (const column of columnsOf(entry)) {
+        const sql = COLUMN_SQL.get(column)
+        // The four TPMS corners are numbers on the wire and JSONB only after
+        // they collapse into one record, which `delta` already relies on.
+        if (!sql || column === 'tpms') continue
+        if (!allowed.includes(sql)) {
+          problems.push(`${entry.field}: doc says ${documented.type}, ${column} is ${sql}`)
+        }
+      }
+    }
+    expect(problems).toEqual([])
+  })
+
+  it('states a reason for every sanctioned deviation, and sanctions no more', () => {
+    for (const [field, why] of Object.entries(SANCTIONED_TYPE_DEVIATIONS)) {
+      expect(why.length, field).toBeGreaterThan(20)
+      expect(CATALOGUED_NAMES, field).toContain(field)
+    }
+    expect(Object.keys(SANCTIONED_TYPE_DEVIATIONS)).toHaveLength(6)
+  })
+
+  /**
+   * §2: a column claiming km or kph is a LIE unless something converts, because
+   * Tesla streams miles and mph whatever the touchscreen shows. That was an
+   * assertion about the wire; the doc now lets it be checked from the other
+   * end - if the description says miles, the entry must convert.
+   */
+  it('converts every field the doc describes in miles or mph', () => {
+    const withheld = new Set<string>(WITHHELD_NAMES)
+    for (const entry of TESLA_FIELDS) {
+      if (withheld.has(entry.field)) continue
+      const documented = DOCUMENTED.find((f) => f.field === entry.field)
+      if (!documented) continue
+      const mph = /\bmph\b|miles per hour/i.test(documented.description)
+      const miles = !mph && /\bmiles\b/i.test(documented.description)
+      if (!mph && !miles) continue
+      expect(`${entry.field}=${entry.convert}`)
+        .toBe(`${entry.field}=${mph ? 'mphToKph' : 'milesToKm'}`)
+    }
+  })
+
+  /**
+   * The display-unit settings are exactly that - what the touchscreen shows -
+   * so they must never be read as saying what is on the wire. Capturing them is
+   * what makes the miles-always assumption checkable against real data later.
+   */
+  it('captures the display-unit settings without converting them', () => {
+    for (const name of ['SettingDistanceUnit', 'SettingChargeUnit', 'SettingTemperatureUnit']) {
+      const entry = TESLA_FIELDS.find((e) => e.field === name)
+      expect(entry?.convert, name).toBeNull()
+    }
+  })
+})
+
+describe('the Fleet API field rules', () => {
+  it('names only real proto members', () => {
+    const members = new Set(PROTO_FIELDS)
+    expect(API_FIELD_RULES.map((r) => r.field).filter((f) => !members.has(f))).toEqual([])
+  })
+
+  it('names each field at most once', () => {
+    const names = API_FIELD_RULES.map((r) => r.field)
+    expect(new Set(names).size).toBe(names.length)
+  })
+
+  it('states a non-negative minimum and quotes its source', () => {
+    for (const rule of API_FIELD_RULES) {
+      expect(Number.isFinite(rule.minimumDelta) && rule.minimumDelta >= 0, rule.field).toBe(true)
+      expect(rule.source.length, rule.field).toBeGreaterThan(20)
+    }
+  })
+
+  /**
+   * A mandatory rule on a field we capture must be satisfied by the CATALOGUE,
+   * not merely by the builder: the builder throwing is the last line, and a
+   * catalogue that can only be built by luck is one edit from a failed push.
+   */
+  it('is satisfied by every catalogued field it binds', () => {
+    for (const rule of API_FIELD_RULES) {
+      if (rule.minimumDelta === 0) continue
+      const entry = TESLA_FIELDS.find((e) => e.field === rule.field)
+      if (!entry) continue
+      expect(`${rule.field}=${(entry.delta ?? 0) >= rule.minimumDelta}`)
+        .toBe(`${rule.field}=true`)
+    }
   })
 })
 

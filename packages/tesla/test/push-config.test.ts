@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { TESLA_FIELDS, TIER_INTERVAL_SECONDS, WITHHELD_FIELDS } from '../src/catalogue.js'
+import { TESLA_FIELDS, TIER_INTERVAL_SECONDS, WITHHELD_NAMES } from '../src/catalogue.js'
 import { TELEMETRY_HOSTNAME, TELEMETRY_PORT } from '../src/telemetry-config.js'
 
 /**
@@ -96,9 +96,9 @@ describe('the collector the push script sends the car to', () => {
  * The shim and the web app are ONE producer, so the script stops asking for a
  * withheld field at the same moment the app does - that is the property worth
  * pinning here, not the catalogue count. `PUSHED` is the catalogue minus the
- * names the Fleet API refuses today; see `WITHHELD_FIELDS`.
+ * names the Fleet API refuses today; see `WITHHELD_NAMES`.
  */
-const PUSHED = TESLA_FIELDS.filter((e) => !WITHHELD_FIELDS.fields.includes(e.field))
+const PUSHED = TESLA_FIELDS.filter((e) => !WITHHELD_NAMES.includes(e.field))
 
 describe('the field list the push script emits', () => {
   it('is exactly the pushable catalogue, in catalogue order', () => {
@@ -107,7 +107,7 @@ describe('the field list the push script emits', () => {
 
   it('emits none of the fields the Fleet API refuses', () => {
     const emittedNames = new Set(Object.keys(emitted()))
-    expect(WITHHELD_FIELDS.fields.filter((f) => emittedNames.has(f))).toEqual([])
+    expect(WITHHELD_NAMES.filter((f) => emittedNames.has(f))).toEqual([])
   })
 
   // The tier is the whole point of tiering: a field silently pushed at the

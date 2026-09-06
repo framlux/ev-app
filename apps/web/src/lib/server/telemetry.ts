@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { env } from '$env/dynamic/private'
 import {
+	TeslaApiError,
 	buildTelemetryConfig,
 	checkTelemetryPreconditions,
 	compareTelemetryConfig,
@@ -472,14 +473,42 @@ function productionDeps(accessToken: string): TelemetryDeps {
 /**
  * Tesla said the token is no longer good.
  *
- * Matched on the message because @ev/tesla throws a plain `Error` with the
- * status in its text and nothing structured to read. That is fragile in the
- * usual way — but the alternative is treating a dead consent as a server fault,
- * which shows the operator a 500 and leaves a token in memory that can never
- * work again.
+ * This used to match `/failed: 401\b/` against the message, because @ev/tesla
+ * threw a plain `Error` with the status in its text. It now throws
+ * `TeslaApiError`, so the status is read rather than parsed out of prose — the
+ * same judgement, no longer one error-message rewording away from treating a
+ * dead consent as a server fault.
  */
 export function isTeslaUnauthorized(e: unknown): boolean {
-	return e instanceof Error && /failed: 401\b/.test(e.message)
+	return e instanceof TeslaApiError && e.status === 401
+}
+
+/**
+ * What Tesla refused, in words the operator can act on.
+ *
+ * Both refusals this app has had were precise — `Unknown field
+ * BrickSocMinPercent`, and `SelfDrivingMilesSinceReset requires minimum delta
+ * be explicitly set and >= 1` — and both reached the operator as a 500 and a
+ * stack trace in a pod log, because an unrecognised error is rethrown and Kit
+ * turns that into "Internal Error". The sentence naming the exact problem was
+ * the one thing not on the screen.
+ *
+ * 502 rather than 500: the refusal is upstream's answer, not this server
+ * failing, and the page renders the message of a Kit error. The txid rides
+ * along because it is what Tesla asks for when reporting a problem, and it is
+ * useless if it only ever exists in a log nobody exports.
+ *
+ * A 401 is deliberately NOT handled here — it is a dead consent, handled above,
+ * and answering it with "Tesla refused" would leave a token in memory that can
+ * never work again.
+ */
+export function teslaRefusal(e: unknown): ApiProblem | null {
+	if (!(e instanceof TeslaApiError) || e.status === 401) return null
+	const detail = e.teslaError ?? e.message
+	const description =
+		e.teslaErrorDescription === null ? '' : ` (${e.teslaErrorDescription})`
+	const txid = e.txid === null ? '' : ` [Tesla txid ${e.txid}]`
+	return new ApiProblem(502, `Tesla refused the request: ${detail}${description}${txid}`)
 }
 
 /**
@@ -532,6 +561,8 @@ export async function withTeslaSession<T>(
 		}
 		const transport = teslaTransportProblem(e)
 		if (transport) throw transport
+		const refusal = teslaRefusal(e)
+		if (refusal) throw refusal
 		throw e
 	}
 }

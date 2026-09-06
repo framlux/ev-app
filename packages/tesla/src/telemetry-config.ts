@@ -26,7 +26,8 @@
  */
 
 import {
-  TESLA_FIELDS, TIER_INTERVAL_SECONDS, WITHHELD_FIELDS, type TeslaField,
+  API_FIELD_RULES, TESLA_FIELDS, TIER_INTERVAL_SECONDS, WITHHELD_NAMES,
+  type TeslaField,
 } from './catalogue.js'
 import type {
   AppliedTelemetryConfig, TelemetryConfigRequest, TelemetryFields,
@@ -79,7 +80,7 @@ export function buildTelemetryFields(
   // whole push, so the car keeps its old configuration - none, on a first push.
   // See `WITHHELD_FIELDS` for why the unit held back is a proto block and not
   // the single name the error happened to report.
-  const withheld = new Set<string>(WITHHELD_FIELDS.fields)
+  const withheld = new Set<string>(WITHHELD_NAMES)
   for (const entry of catalogue) {
     if (withheld.has(entry.field)) continue
     fields[entry.field] = {
@@ -90,6 +91,27 @@ export function buildTelemetryFields(
       // point is that absent means "the car decides", not "zero".
       ...(entry.delta !== null && { minimum_delta: entry.delta }),
     }
+  }
+
+  // THE THIRD GUARD, and the one added after a car taught it to us. The API has
+  // per-field rules the proto does not carry, and it enforces them by rejecting
+  // the ENTIRE push - so a rule broken here costs every signal, not one. Failing
+  // in the builder puts the violation in front of a test run instead.
+  const violations = API_FIELD_RULES.flatMap((rule) => {
+    const asked = fields[rule.field]
+    // Not asked for at all is not a violation: the field may be withheld, or
+    // simply not catalogued. The rule only binds what we actually send.
+    if (!asked || rule.minimumDelta === 0) return []
+    const delta = asked.minimum_delta
+    if (delta !== undefined && delta >= rule.minimumDelta) return []
+    return [`${rule.field}: minimum_delta must be set and >= ${rule.minimumDelta}, ` +
+      `but ${delta === undefined ? 'none is set' : `${delta} would be sent`}. ` +
+      `Tesla's field reference says: "${rule.source}"`]
+  })
+  if (violations.length > 0) {
+    throw new Error(
+      'the telemetry configuration breaks a documented Fleet API rule, and the ' +
+      'API rejects the whole push rather than the field:\n' + violations.join('\n'))
   }
 
   // A configuration with no fields is ACCEPTED by Tesla, reported as a success,

@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { isHttpError, isRedirect } from '@sveltejs/kit'
 import {
+	TeslaApiError,
 	buildTelemetryConfig,
 	type AppliedTelemetryConfig,
 	type TelemetryConfigRequest,
@@ -266,7 +267,7 @@ describe('who may call the telemetry actions', () => {
 		setTeslaToken(SUBJECT, { accessToken: 'stale', expiresAt: new Date(Date.now() + 3_600_000) })
 		const e = await thrownBy(() =>
 			withTeslaSession(SUBJECT, async () => {
-				throw new Error('/vehicles failed: 401 {"error":"token expired"}')
+				throw new TeslaApiError('/vehicles', 401, '{"error":"token expired"}')
 			})
 		)
 		expect(e).toMatchObject({ status: 409 })
@@ -279,7 +280,7 @@ describe('who may call the telemetry actions', () => {
 		setTeslaToken(SUBJECT, { accessToken: 'good', expiresAt: new Date(Date.now() + 3_600_000) })
 		await expect(
 			withTeslaSession(SUBJECT, async () => {
-				throw new Error('/vehicles failed: 503 upstream unavailable')
+				throw new TeslaApiError('/vehicles', 503, 'upstream unavailable')
 			})
 		).rejects.toThrow(/503/)
 		expect(getTeslaToken(SUBJECT)).not.toBeNull()
@@ -775,5 +776,52 @@ describe('a push Tesla accepted but did not apply', () => {
 		expect(String((e as Error).message)).toMatch(/no vehicle updated/)
 		// The observation may be recorded; a push time must not be.
 		expect(db.writes.some((w) => /pushed_at\)/.test(w.sql))).toBe(false)
+	})
+})
+
+/**
+ * §5 again, from the other end: what Tesla SAID must reach the operator.
+ *
+ * Two real pushes were refused with precise, actionable sentences - an unknown
+ * field name, and a rule with the value it wanted - and both arrived as a 500
+ * and a stack trace in a pod log, leaving the page showing nothing usable. The
+ * refusal is the most useful thing in the exchange, so it gets a status the
+ * page can render and the sentence survives verbatim.
+ */
+describe('what Tesla refused, in front of the operator', () => {
+	it('surfaces the refusal as a 502 carrying Tesla\'s own sentence', async () => {
+		setTeslaToken(SUBJECT, { accessToken: 'good', expiresAt: new Date(Date.now() + 3_600_000) })
+		const e = await thrownBy(() =>
+			withTeslaSession(SUBJECT, async () => {
+				throw new TeslaApiError(
+					'/vehicles/fleet_telemetry_config',
+					400,
+					JSON.stringify({
+						response: null,
+						error: 'Unknown field BrickSocMinPercent',
+						error_description: '',
+						txid: 'c9bdc44ab006aef5d700d8ad05410037',
+					})
+				)
+			})
+		)
+		expect(e).toMatchObject({ status: 502 })
+		expect((e as Error).message).toContain('Unknown field BrickSocMinPercent')
+		// The correlation id is what Tesla asks for when reporting a problem, so
+		// it must not be the thing that only exists in a log.
+		expect((e as Error).message).toContain('c9bdc44ab006aef5d700d8ad05410037')
+		// A refusal is not a dead consent: the token stays.
+		expect(getTeslaToken(SUBJECT)).not.toBeNull()
+	})
+
+	it('still drops the token on a 401, now that the error is typed', async () => {
+		setTeslaToken(SUBJECT, { accessToken: 'stale', expiresAt: new Date(Date.now() + 3_600_000) })
+		const e = await thrownBy(() =>
+			withTeslaSession(SUBJECT, async () => {
+				throw new TeslaApiError('/vehicles', 401, JSON.stringify({ error: 'token expired' }))
+			})
+		)
+		expect(e).toMatchObject({ status: 409 })
+		expect(getTeslaToken(SUBJECT)).toBeNull()
 	})
 })
