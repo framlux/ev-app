@@ -76,3 +76,40 @@ describe('EventSource is constructed in exactly one place', () => {
 		expect(offenders).toEqual([])
 	})
 })
+
+/**
+ * Getting to the telemetry settings without hunting for them.
+ *
+ * The header has carried a `Telemetry` link since the page existed, but it is
+ * 0.86rem of muted text beside the theme toggle, and it is not called
+ * "settings" — so the way to the one operational page in the app was to know it
+ * was there. The vehicle tab bar is where attention already is.
+ */
+describe('the settings link is reachable from a vehicle', () => {
+	const layout = readFileSync(
+		join(SRC, 'routes/vehicles/[id]/+layout.svelte'), 'utf8')
+
+	it('offers Settings in the vehicle tab bar', () => {
+		expect(layout).toMatch(/label: 'Settings'/)
+	})
+
+	/**
+	 * It must point AT the page that exists. A tab that 404s is worse than no
+	 * tab, and there is no per-vehicle settings route — this is a second door to
+	 * the global one, which is deliberate: the page is about this install's
+	 * plumbing (spec §3.8), not about the car.
+	 */
+	it('points at the telemetry settings page itself', () => {
+		expect(layout).toMatch(/href: '\/settings\/telemetry'/)
+	})
+
+	/**
+	 * Order is the request: after Charges and Battery. Pinned because a tab bar
+	 * is muscle memory, and a reordering is the kind of change nobody notices
+	 * they have made.
+	 */
+	it('puts it last, after Battery', () => {
+		const labels = [...layout.matchAll(/label: '([^']+)'/g)].map((m) => m[1])
+		expect(labels).toEqual(['Overview', 'Drives', 'Charges', 'Battery', 'Settings'])
+	})
+})

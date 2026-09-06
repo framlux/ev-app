@@ -22,11 +22,19 @@
 	let v = $derived(data.entry.vehicle)
 	let base = $derived(`/vehicles/${v.id}`)
 
+	// Settings is the odd one out and deliberately so: the other four switch the
+	// view of THIS car, while this one leaves for the install-wide telemetry page
+	// (spec §3.8 — it is about the plumbing, not the vehicle). It sits here
+	// because the header's `Telemetry` link is small, muted, not called
+	// "settings", and easy to never notice; the tab bar is where attention
+	// already is. It never highlights, because the active check compares against
+	// the current path and this one is never under /vehicles.
 	let tabs = $derived([
 		{ href: base, label: 'Overview' },
 		{ href: `${base}/drives`, label: 'Drives' },
 		{ href: `${base}/charges`, label: 'Charges' },
-		{ href: `${base}/battery`, label: 'Battery' }
+		{ href: `${base}/battery`, label: 'Battery' },
+		{ href: '/settings/telemetry', label: 'Settings' }
 	])
 
 	let subtitle = $derived(
