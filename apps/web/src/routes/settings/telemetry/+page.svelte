@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { PageData } from './$types.js'
+	import { errorMessageFrom } from '$lib/api-error.js'
 	import EmptyState from '$lib/components/EmptyState.svelte'
 	import StatTile from '$lib/components/StatTile.svelte'
 	import TelemetryOutcome from '$lib/components/TelemetryOutcome.svelte'
@@ -129,15 +130,20 @@
 		outcome = null
 		try {
 			const res = await fetch(`/api/v1/telemetry/${kind}`, { method: 'POST' })
-			const body: unknown = await res.json().catch(() => null)
 			if (!res.ok) {
-				// SvelteKit's error body is `{ message }`; a proxy in front of it
-				// might answer with something else entirely, hence the fallback.
-				const message =
-					(body as { message?: string } | null)?.message ?? `the request failed (${res.status})`
+				// Read as TEXT, not JSON. These endpoints answer errors with
+				// `content-type: text/plain` and the bare sentence, so the previous
+				// `res.json()` threw on every failure and threw away the message with
+				// it - including Tesla's own account of what it refused. See
+				// `errorMessageFrom`, which handles both shapes and refuses to put a
+				// gateway's HTML on the screen.
 				outcome = {
 					ok: false,
-					headline: message,
+					headline: errorMessageFrom(
+						res.status,
+						res.headers.get('content-type'),
+						await res.text().catch(() => '')
+					),
 					detail: null,
 					blockers: [],
 					warnings: [],
@@ -145,6 +151,7 @@
 				}
 				return
 			}
+			const body: unknown = await res.json()
 			clockOverride = Date.now()
 			if (kind === 'check') applyCheck(body as TelemetryCheckResult)
 			else applyPush(body as TelemetryPushResult)

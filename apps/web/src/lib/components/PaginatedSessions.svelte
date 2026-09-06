@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { untrack } from 'svelte'
 	import type { SessionListItem, SessionListResponse } from '$lib/api-types.js'
+	import { errorMessageFrom } from '$lib/api-error.js'
 	import { qs } from '$lib/api.js'
 	import EmptyState from './EmptyState.svelte'
 	import SessionList from './SessionList.svelte'
@@ -56,7 +57,17 @@
 				`/api/v1/vehicles/${encodeURIComponent(vehicleId)}/sessions` +
 					qs({ kind, limit: PAGE_SIZE, cursor, from, to })
 			)
-			if (!res.ok) throw new Error(`request failed (${res.status})`)
+			// The same defect the telemetry page had: these endpoints answer errors
+			// as text/plain, so a status on its own was all this ever showed.
+			if (!res.ok) {
+				throw new Error(
+					errorMessageFrom(
+						res.status,
+						res.headers.get('content-type'),
+						await res.text().catch(() => '')
+					)
+				)
+			}
 			const page = (await res.json()) as SessionListResponse
 			sessions = [...sessions, ...page.sessions]
 			cursor = page.nextCursor
