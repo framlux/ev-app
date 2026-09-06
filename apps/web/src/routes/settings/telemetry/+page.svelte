@@ -113,7 +113,7 @@
 		busy = kind
 		outcome = null
 		try {
-			const res = await fetch(`/settings/telemetry/${kind}`, { method: 'POST' })
+			const res = await fetch(`/api/v1/telemetry/${kind}`, { method: 'POST' })
 			const body: unknown = await res.json().catch(() => null)
 			if (!res.ok) {
 				// SvelteKit's error body is `{ message }`; a proxy in front of it

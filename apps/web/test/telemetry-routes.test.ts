@@ -12,8 +12,8 @@ import {
 import type { DbClient } from '@ev/db'
 import { GET as callback } from '../src/routes/settings/telemetry/callback/+server.js'
 import { GET as connect } from '../src/routes/settings/telemetry/connect/+server.js'
-import { POST as check } from '../src/routes/settings/telemetry/check/+server.js'
-import { POST as push } from '../src/routes/settings/telemetry/push/+server.js'
+import { POST as check } from '../src/routes/api/v1/telemetry/check/+server.js'
+import { POST as push } from '../src/routes/api/v1/telemetry/push/+server.js'
 import { TESLA_FLOW_COOKIE } from '../src/lib/server/tesla-flow.js'
 import { clearTeslaToken, getTeslaToken, setTeslaToken } from '../src/lib/server/tesla-session.js'
 import type { TeslaClient } from '../src/lib/server/tesla-client.js'
@@ -428,6 +428,24 @@ describe('the Tesla consent callback', () => {
  * ------------------------------------------------------------------ */
 
 describe('checking what the car has applied', () => {
+	/**
+	 * The cached row is what §3.7 exists for: the page has to be useful with no
+	 * Tesla session, which means the check must record what the car said even
+	 * when we cannot work out whether it matches. The telemetry CA is a file
+	 * mount, so "cannot work out" is a real state — an empty or mis-projected
+	 * mount makes buildTelemetryConfig throw by design.
+	 */
+	it('still records what the car said when the CA is unusable', async () => {
+		const tesla = fakeTesla({ applied: { synced: true, config: { ...DESIRED } } })
+		const db = fakeDb()
+		const result = await checkTelemetry(makeDeps(tesla.client, db, 'not a certificate'))
+
+		expect(db.writes).toHaveLength(1)
+		expect(result.status.checkedAt).toBe(NOW.toISOString())
+		expect(result.matches).toBe(false)
+		expect(result.differences[0]).toMatch(/cannot build the configuration/)
+	})
+
 	it('records the check and hands back the cached row', async () => {
 		const tesla = fakeTesla({
 			applied: { synced: true, config: { ...DESIRED, ca: CA_REFORMATTED } }

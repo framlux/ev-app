@@ -77,7 +77,7 @@ export const fleetStatus = (t: string, vins: string[], opts?: FleetApiOptions) =
 // present would put an undefined behind a type that promises otherwise.
 export const getTelemetryConfig = (t: string, vin: string, opts?: FleetApiOptions) =>
   get<{ synced: boolean; config?: AppliedTelemetryConfig }>(
-    `/vehicles/${vin}/fleet_telemetry_config`, t, opts)
+    `/vehicles/${encodeURIComponent(vin)}/fleet_telemetry_config`, t, opts)
 
 /**
  * The one write this module is allowed to make.

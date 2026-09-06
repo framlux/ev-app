@@ -11,6 +11,14 @@ import { checkTelemetry, withTeslaSession } from '$lib/server/telemetry.js'
  * calls and writes a row — and because a GET would be prefetched by anything
  * that walks links.
  *
+ * UNDER /api/ ON PURPOSE, though it is an action of the settings page rather
+ * than part of the read contract. gate.ts refuses an unauthenticated /api/
+ * path with a 401 and everything else with a 302 to the IdP — and its own
+ * comment records why that matters here: a 302 reaches fetch() as a CORS
+ * failure or as an HTML body parsed as JSON. A session that expires behind an
+ * open settings page would have shown "Failed to fetch" instead of "sign in
+ * again".
+ *
  * The refusals are ordered by what they cost: no app session is 401 from the
  * gate and again here, and no Tesla consent is 409 with a sentence that names
  * the fix. Neither reaches Tesla.

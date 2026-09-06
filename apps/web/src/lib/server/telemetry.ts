@@ -232,15 +232,25 @@ async function writeAndRead(
  */
 export async function checkTelemetry(deps: TelemetryDeps): Promise<TelemetryCheckResult> {
 	const observed = await observe(deps)
-	const desired = buildTelemetryConfig({ vin: observed.vin, ca: deps.telemetryCa() }).config
-	const comparison = compareTelemetryConfig(observed.applied, desired)
 	const checkedAt = deps.now()
 
+	// RECORD FIRST, COMPARE SECOND, and the order is the point.
+	//
+	// The comparison needs the telemetry CA, which is a file mount that can be
+	// missing, empty or mis-projected — and building the desired config throws
+	// on exactly that (§3.5's guard). If that throw happened before the write,
+	// a bad CA would turn "Check now" into a 500 that records nothing, and the
+	// cached row in §3.7 is precisely what has to survive for the page to be
+	// useful with no Tesla session. What the car reported is worth keeping even
+	// when we cannot say whether it matches. The push path defers its CA read
+	// past the preflight for the same reason.
 	const status = await writeAndRead(
 		deps,
 		(c) => recordTelemetryCheck(c, toCheck(observed, checkedAt)),
 		observed.vehicleId
 	)
+
+	const comparison = compareAgainstCatalogue(deps, observed)
 
 	return {
 		vin: observed.vin,
@@ -249,8 +259,39 @@ export async function checkTelemetry(deps: TelemetryDeps): Promise<TelemetryChec
 		warnings: observed.preflight.warnings,
 		matches: comparison.matches,
 		differences: comparison.differences,
-		desiredFieldCount: Object.keys(desired.fields).length
+		desiredFieldCount: comparison.desiredFieldCount
 	}
+}
+
+/**
+ * What the catalogue would push, compared with what the car has.
+ *
+ * Returns a NEGATIVE answer rather than throwing when the desired config
+ * cannot be built at all — a missing or malformed telemetry CA mount, which
+ * `buildTelemetryConfig` refuses (§3.5). "We cannot tell" is reported as "does
+ * not match", with the reason as the difference, because the alternative is a
+ * check that fails wholesale and records nothing. A push in that state refuses
+ * on the same error, which is the honest outcome: a config we cannot build is
+ * a config we must not send.
+ */
+function compareAgainstCatalogue(
+	deps: TelemetryDeps,
+	observed: Observed
+): { matches: boolean; differences: string[]; desiredFieldCount: number } {
+	let desired
+	try {
+		desired = buildTelemetryConfig({ vin: observed.vin, ca: deps.telemetryCa() }).config
+	} catch (err) {
+		return {
+			matches: false,
+			differences: [
+				`cannot build the configuration to compare against: ${err instanceof Error ? err.message : String(err)}`
+			],
+			desiredFieldCount: 0
+		}
+	}
+	const comparison = compareTelemetryConfig(observed.applied, desired)
+	return { ...comparison, desiredFieldCount: Object.keys(desired.fields).length }
 }
 
 /* ------------------------------------------------------------------ *

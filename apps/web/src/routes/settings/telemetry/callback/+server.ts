@@ -45,6 +45,13 @@ export const GET: RequestHandler = async ({ cookies, locals, url }) => {
 	// this is the line that says the browser asking for it is the one that
 	// started the consent (§5).
 	if (!flow || !state || state !== flow.s) {
+		// Logged, because this is the CSRF boundary of the consent flow and a
+		// silent refusal is one nobody ever notices. Deliberately says which
+		// half was wrong and NOT what either value was: the state is a secret
+		// this browser was given, and a log line is the wrong place for it.
+		console.warn(
+			`tesla consent: refused a callback with ${flow ? 'a mismatched' : 'no'} state; no code was exchanged`
+		)
 		error(400, 'the Tesla consent could not be verified; start again')
 	}
 	if (!code) error(400, 'Tesla returned no authorization code')
