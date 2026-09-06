@@ -8,6 +8,8 @@
 	let message = $derived(page.error?.message ?? 'Something went wrong')
 </script>
 
+<svelte:head><title>{status} · Coulomb</title></svelte:head>
+
 <div class="page">
 	<div class="card box">
 		<p class="code num">{status}</p>
