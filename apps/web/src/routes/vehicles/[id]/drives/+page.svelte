@@ -10,7 +10,7 @@
 </script>
 
 <svelte:head>
-	<title>Drives · {data.entry.vehicle.displayName} · EV</title>
+	<title>Drives · {data.entry.vehicle.displayName} · Coulomb</title>
 </svelte:head>
 
 <div class="bar">

@@ -4,6 +4,18 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<meta name="text-scale" content="scale" />
+
+		<!-- The browser chrome can only follow the OS preference; an explicit
+		     in-app theme choice lives in a cookie the chrome never sees. Matching
+		     the system is the closest honest approximation. -->
+		<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f6f7f8" />
+		<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0d1013" />
+
+		<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+		<meta name="apple-mobile-web-app-title" content="Coulomb" />
+		<link rel="manifest" href="/site.webmanifest" />
+
+		<title>Coulomb</title>
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">

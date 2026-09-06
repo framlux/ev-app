@@ -67,7 +67,7 @@
 </script>
 
 <svelte:head>
-	<title>Battery · {data.entry.vehicle.displayName} · EV</title>
+	<title>Battery · {data.entry.vehicle.displayName} · Coulomb</title>
 </svelte:head>
 
 <section>

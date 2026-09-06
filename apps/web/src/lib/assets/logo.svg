@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none" role="img" aria-label="Coulomb">
+  <defs>
+    <linearGradient id="coulomb-brand" x1="128" y1="39" x2="128" y2="217" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6EE7B7"/>
+      <stop offset="100%" stop-color="#10B981"/>
+    </linearGradient>
+
+    <!-- Node cores are cut out, not filled with a background colour, so the mark
+         is correct on light and dark alike. -->
+    <mask id="coulomb-cores">
+      <rect width="256" height="256" fill="#fff"/>
+      <circle cx="195.10" cy="92.32" r="10" fill="#000"/>
+      <circle cx="60.90" cy="163.68" r="10" fill="#000"/>
+    </mask>
+  </defs>
+
+  <g mask="url(#coulomb-cores)" stroke-width="26" stroke-linecap="round">
+    <!-- Two 136-degree arcs, gaps on the diagonal, closing one ring. -->
+    <path d="M195.10 92.32 A76 76 0 0 1 104.51 200.28" stroke="url(#coulomb-brand)"/>
+    <path d="M60.90 163.68 A76 76 0 0 1 151.49 55.72" stroke="url(#coulomb-brand)"/>
+
+    <!-- Seam nodes, at each arc's leading end. -->
+    <circle cx="195.10" cy="92.32" r="27" fill="url(#coulomb-brand)"/>
+    <circle cx="60.90" cy="163.68" r="27" fill="url(#coulomb-brand)"/>
+  </g>
+</svg>

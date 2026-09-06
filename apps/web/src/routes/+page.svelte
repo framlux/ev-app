@@ -32,7 +32,7 @@
 	)
 </script>
 
-<svelte:head><title>Garage</title></svelte:head>
+<svelte:head><title>Garage · Coulomb</title></svelte:head>
 
 <header class="page-head">
 	<div class="title">

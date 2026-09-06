@@ -51,7 +51,7 @@
 </script>
 
 <svelte:head>
-	<title>Charge {formatDateTime(s.startedAt)} · EV</title>
+	<title>Charge {formatDateTime(s.startedAt)} · Coulomb</title>
 </svelte:head>
 
 <div class="page">

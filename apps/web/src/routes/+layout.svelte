@@ -1,5 +1,6 @@
 <script lang="ts">
 	import favicon from '$lib/assets/favicon.svg'
+	import BrandMark from '$lib/components/BrandMark.svelte'
 	import ThemeToggle from '$lib/components/ThemeToggle.svelte'
 	import '../app.css'
 
@@ -13,8 +14,8 @@
 <div class="shell">
 	<nav>
 		<a class="brand" href="/">
-			<span class="mark" aria-hidden="true">⬢</span>
-			<span>EV</span>
+			<BrandMark size={22} />
+			<span class="wordmark">Coulomb</span>
 		</a>
 		<div class="spacer"></div>
 		<!-- The one operational page on a site that is otherwise about driving.
@@ -48,15 +49,16 @@
 	.brand {
 		display: inline-flex;
 		align-items: center;
-		gap: 0.5rem;
-		font-weight: 650;
-		letter-spacing: -0.01em;
+		gap: 0.55rem;
 		color: var(--text);
 		text-decoration: none;
 	}
 
-	.mark {
-		color: var(--accent);
+	.wordmark {
+		font-family: var(--font-display);
+		font-size: 1.06rem;
+		font-weight: 600;
+		letter-spacing: -0.015em;
 	}
 
 	.spacer {

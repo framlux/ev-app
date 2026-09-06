@@ -1,3 +1,5 @@
+@import '@fontsource-variable/dm-sans';
+
 /*
  * The whole palette, in one place.
  *
@@ -43,7 +45,16 @@
 
   --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, Helvetica, Arial,
     sans-serif;
+  /* Headings and the wordmark only. Body text and anything in .num stays on the
+     system stack, whose tabular figures beat DM Sans's for columns of numbers. */
+  --font-display: 'DM Sans Variable', var(--font);
   --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* The mark's gradient. Deliberately not --accent: this is the same emerald
+     VordFleet uses, which ties the two products together, and it is too light
+     on white to be legal for text. It is only ever a graphic fill. */
+  --brand-from: #6ee7b7;
+  --brand-to: #10b981;
 
   --page-max: 1140px;
 }
@@ -147,6 +158,7 @@ h1,
 h2,
 h3 {
   margin: 0;
+  font-family: var(--font-display);
   font-weight: 620;
   letter-spacing: -0.015em;
 }

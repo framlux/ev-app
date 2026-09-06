@@ -35,7 +35,7 @@
 </script>
 
 <svelte:head>
-	<title>{v.displayName} · EV</title>
+	<title>{v.displayName} · Coulomb</title>
 </svelte:head>
 
 <div class="page">

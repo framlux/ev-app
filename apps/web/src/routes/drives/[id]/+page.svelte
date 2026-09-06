@@ -70,7 +70,7 @@
 </script>
 
 <svelte:head>
-	<title>Drive {formatDateTime(s.startedAt)} · EV</title>
+	<title>Drive {formatDateTime(s.startedAt)} · Coulomb</title>
 </svelte:head>
 
 <div class="page">
