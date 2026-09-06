@@ -954,7 +954,9 @@ describe('the telemetry outcome panel', () => {
 		expect(body).toContain('Blockers')
 		expect(body).toContain('virtual key is not paired')
 		expect(body).toContain('Warnings')
-		expect(body).toContain('bad')
+		// The warning's own text, not the CSS class name: `toContain('bad')` also
+		// passed on `class="bad"`, which is to say on nothing at all.
+		expect(body).toContain('third-party data streaming is disabled on the car.')
 		assertNoBrokenValues(body)
 	})
 })

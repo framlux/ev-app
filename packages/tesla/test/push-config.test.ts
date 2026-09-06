@@ -4,6 +4,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { TESLA_FIELDS, TIER_INTERVAL_SECONDS } from '../src/catalogue.js'
+import { TELEMETRY_HOSTNAME, TELEMETRY_PORT } from '../src/telemetry-config.js'
 
 /**
  * The third drift test (spec §5): what we ASK THE CAR FOR equals what we
@@ -52,8 +53,44 @@ const emitted = (): Record<string, EmittedField> => {
       `\`pnpm --filter @ev/tesla build\` - it reads dist, because the shell has ` +
       `no TypeScript.\n${String(err)}`)
   }
-  return (cached = JSON.parse(out))
+  const parsed = JSON.parse(out) as {
+    hostname: string; port: number; fields: Record<string, EmittedField>
+  }
+  cachedEnvelope = { hostname: parsed.hostname, port: parsed.port }
+  return (cached = parsed.fields)
 }
+
+/**
+ * The shim prints the collector's hostname and port alongside the fields, and
+ * the shell script reads them from there rather than declaring its own.
+ *
+ * That is the drift this whole module exists to close, and it was open in
+ * exactly this dimension: the constants lived in telemetry-config.ts for the
+ * web app AND in the shell script for the operator, so changing the collector
+ * would have had the two pushers sending different configurations, with every
+ * later check reporting a hostname difference nobody could account for.
+ */
+let cachedEnvelope: { hostname: string; port: number } | undefined
+const envelope = (): { hostname: string; port: number } => {
+  emitted()
+  return cachedEnvelope!
+}
+
+describe('the collector the push script sends the car to', () => {
+  it('comes from the catalogue module, not from the shell script', () => {
+    expect(envelope()).toEqual({ hostname: TELEMETRY_HOSTNAME, port: TELEMETRY_PORT })
+  })
+
+  it('is not also declared in the shell script, where it could drift', () => {
+    // A LITERAL assignment is the drift; reading it back out of the emitted
+    // JSON is the fix, and both lines start with the same token.
+    expect(pushScript).not.toMatch(/^HOSTNAME_=[\w.-]+$/m)
+    expect(pushScript).not.toMatch(/^PORT=\d+$/m)
+    // Read from the emitted JSON instead.
+    expect(pushScript).toMatch(/HOSTNAME_=\$\(python3 .*\["hostname"\]/)
+    expect(pushScript).toMatch(/PORT=\$\(python3 .*\["port"\]/)
+  })
+})
 
 describe('the field list the push script emits', () => {
   it('is exactly the catalogue, in catalogue order', () => {

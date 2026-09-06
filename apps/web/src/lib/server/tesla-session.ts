@@ -16,7 +16,10 @@
  * than data loss. If this were ever scaled out, a consent would apply only to
  * the pod that served the callback. That is noted, not solved.
  *
- * There is deliberately no renewal path. Without a refresh token there is
+ * The three ways the credential dies are real, not aspirational: expiry is
+ * enforced on read AND swept on write, disconnect is `POST
+ * /api/v1/telemetry/disconnect`, and a restart empties the process. There is
+ * deliberately no renewal path. Without a refresh token there is
  * nothing to renew with, and a flow that cannot renew itself cannot quietly
  * become the standing credential this design exists to remove. The page shows
  * the expiry and offers "Connect to Tesla" again.
@@ -50,6 +53,17 @@ const tokens = new Map<string, TeslaToken>()
  * behind a live one.
  */
 export function setTeslaToken(subject: string, token: TeslaToken): void {
+	// Sweep first. Expiry was enforced on READ alone, which is enough for the
+	// subject who comes back and does nothing at all for one who does not: an
+	// operator who consents, closes the tab and never returns left a dead
+	// credential in the pod's memory until the next deploy. The map holds one
+	// entry per allowed subject, so a full pass costs nothing and makes the
+	// promise in this file's header — the token dies when it expires — true
+	// without needing someone to ask for it.
+	const at = token.expiresAt.getTime()
+	for (const [key, held] of tokens) {
+		if (held.expiresAt.getTime() <= at) tokens.delete(key)
+	}
 	tokens.set(subject, token)
 }
 

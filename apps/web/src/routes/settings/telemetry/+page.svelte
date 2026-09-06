@@ -102,6 +102,21 @@
 		status?.fieldCount != null && status.fieldCount !== data.catalogue.fieldCount
 	)
 
+	/** Hand the consent back now rather than waiting for it to run out. */
+	async function disconnect() {
+		if (busy !== null) return
+		busy = 'check'
+		try {
+			await fetch('/api/v1/telemetry/disconnect', { method: 'POST' })
+			// A reload rather than local state: the connection banner, both
+			// buttons and the expiry all read from the load, and re-deriving them
+			// by hand here is how two sources of truth start.
+			location.reload()
+		} finally {
+			busy = null
+		}
+	}
+
 	async function act(kind: 'check' | 'push') {
 		if (busy !== null) return
 		// The API refuses independently of this (§5) — the button being enabled is
@@ -343,6 +358,12 @@
 			<a class="connect" href="/settings/telemetry/connect">
 				{connected ? 'Reconnect to Tesla' : 'Connect to Tesla'}
 			</a>
+			{#if connected}
+				<!-- The design says the credential dies on expiry, on disconnect, or
+				     on a restart. Without this the earliest of those was eight hours
+				     away, which made "disconnect" a sentence rather than a thing. -->
+				<button class="link" onclick={disconnect} disabled={busy !== null}>Disconnect</button>
+			{/if}
 			{#if busy}<span class="faint">working…</span>{/if}
 		</div>
 

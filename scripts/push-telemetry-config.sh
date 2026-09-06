@@ -26,8 +26,11 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 NS=ev
 POD=ev-teslacmd-push
-HOSTNAME_=ev-telemetry.framlux.io
-PORT=443
+# hostname and port are NOT set here. They come from the catalogue via
+# telemetry-fields.mjs, because the web app pushes the same configuration and a
+# second copy of a value both pushers must agree on is drift waiting to happen:
+# change the collector and this script would go on sending the old one, and
+# every check afterwards would report a difference nobody could explain.
 MIN_FW_YEAR=2024
 MIN_FW_WEEK=26
 
@@ -166,17 +169,20 @@ info "ca: $(grep -c 'BEGIN CERTIFICATE' "$TMP/ca.pem") certificate(s) from ev-te
 # is given.
 node "$ROOT/scripts/telemetry-fields.mjs" > "$TMP/fields.json" \
   || fail "could not build the field list - run: pnpm --filter @ev/tesla build"
-COUNT=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$TMP/fields.json")
+COUNT=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["fields"]))' "$TMP/fields.json")
+HOSTNAME_=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hostname"])' "$TMP/fields.json")
+PORT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["port"])' "$TMP/fields.json")
 # A config with no fields is accepted and stops the car streaming ANYTHING, which
 # looks exactly like a car that is asleep. Refuse rather than push it.
 [ "$COUNT" -gt 0 ] || fail "the catalogue emitted no fields"
 info "$COUNT fields from packages/tesla/src/catalogue.ts"
+info "collector $HOSTNAME_:$PORT, from packages/tesla/src/telemetry-config.ts"
 
 python3 - "$TMP/ca.pem" "$VIN" "$HOSTNAME_" "$PORT" "$TMP/fields.json" > "$TMP/config.json" <<'EOF'
 import json,sys
 ca=open(sys.argv[1]).read()
 vin, host, port = sys.argv[2], sys.argv[3], int(sys.argv[4])
-fields=json.load(open(sys.argv[5]))
+fields=json.load(open(sys.argv[5]))["fields"]
 cfg = {
     "vins": [vin],
     "config": {

@@ -302,7 +302,16 @@ function compareAgainstCatalogue(
  * Reconfigure the car — but only after establishing that it can apply the
  * configuration and does not already have it.
  *
- * Two of the three outcomes send NOTHING and write nothing:
+ * Two of the three outcomes send NOTHING. All three WRITE, because the
+ * observation is worth keeping whatever the outcome: migration 006 justifies
+ * the firmware, key_paired and streaming_enabled columns on the grounds that
+ * "the page can say WHY it will not push before anyone consents to Tesla
+ * again", and a refusal that discarded the very observation that produced it
+ * would leave the page showing a preflight from some earlier check — or three
+ * dashes, on day one. §3.7 says the row is written on every check and every
+ * push.
+ *
+ * The two that send nothing:
  *
  *  - A preflight blocker (§3.6). Tesla ACCEPTS a configuration a car cannot
  *    apply, reports no error, and leaves `synced: false` indefinitely — which
@@ -320,6 +329,14 @@ export async function pushTelemetry(deps: TelemetryDeps): Promise<TelemetryPushR
 	const observed = await observe(deps)
 
 	if (!observed.preflight.ok) {
+		// Recorded before the refusal: this observation is the diagnosis, and it
+		// is the answer to "why will it not push" that the page must be able to
+		// give with no Tesla session at all.
+		await writeAndRead(
+			deps,
+			(c) => recordTelemetryCheck(c, toCheck(observed, deps.now())),
+			observed.vehicleId
+		)
 		throw new ApiProblem(
 			409,
 			`the car cannot apply a telemetry configuration: ${observed.preflight.blockers.join(
@@ -334,7 +351,17 @@ export async function pushTelemetry(deps: TelemetryDeps): Promise<TelemetryPushR
 	const comparison = compareTelemetryConfig(observed.applied, request.config)
 	const desiredFieldCount = Object.keys(request.config.fields).length
 
-	if (comparison.matches) {
+	// Only when the car SAYS it has applied it. `synced: false` with a matching
+	// config is the state where Tesla has taken a configuration the car has not
+	// yet acknowledged, and reporting "already applied" there would be the
+	// too-loose half of §3.6: a push silently declined over a car that never
+	// received one. Matching-but-unsynced therefore pushes.
+	if (comparison.matches && observed.synced) {
+		const status = await writeAndRead(
+			deps,
+			(c) => recordTelemetryCheck(c, toCheck(observed, deps.now())),
+			observed.vehicleId
+		)
 		return {
 			vin: observed.vin,
 			pushed: false,
@@ -343,7 +370,7 @@ export async function pushTelemetry(deps: TelemetryDeps): Promise<TelemetryPushR
 			warnings: observed.preflight.warnings,
 			differences: [],
 			pushedAt: null,
-			status: null
+			status
 		}
 	}
 
@@ -359,6 +386,17 @@ export async function pushTelemetry(deps: TelemetryDeps): Promise<TelemetryPushR
 		throw new ApiProblem(
 			502,
 			`Tesla accepted the request but skipped ${observed.vin}: ${refused.join(', ')}`
+		)
+	}
+
+	// A 200 that updated nothing and skipped nothing is not a success either.
+	// It is the same failure as a skip — a push that "worked" and changed
+	// nothing — arriving without the courtesy of a reason, so it must not be
+	// recorded as a push.
+	if (result.updated_vehicles === 0) {
+		throw new ApiProblem(
+			502,
+			`Tesla accepted the request but reported no vehicle updated, and gave no reason. ${observed.vin} may not have been reconfigured.`
 		)
 	}
 

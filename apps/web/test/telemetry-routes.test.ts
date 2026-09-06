@@ -110,13 +110,41 @@ const CACHED_ROW = {
 	pushed_at: null
 }
 
+/**
+ * A stand-in for the telemetry_status table that actually STORES.
+ *
+ * It returned a canned row for every SELECT to begin with, which quietly made
+ * every assertion about `result.status` an assertion about the fake: delete the
+ * body of `recordTelemetryCheck` and they all still passed. It now applies the
+ * insert the way the upsert does — check writes the observation columns, push
+ * writes `pushed_at` onto whatever is there — so reading the row back means
+ * what the tests say it means.
+ */
 function fakeDb(opts: { vehicleId?: string | null } = {}) {
 	const writes: Call[] = []
 	const reads: Call[] = []
+	let stored: Record<string, unknown> | undefined
 	const client = {
 		async query(sql: string, values: unknown[] = []) {
 			if (/^\s*INSERT/i.test(sql)) {
 				writes.push({ sql, values })
+				if (/pushed_at\)/.test(sql)) {
+					stored = { ...(stored ?? CACHED_ROW), pushed_at: values[1] }
+				} else {
+					const [, synced, fieldCount, caPresent, firmware, keyPaired, streaming, checkedAt] =
+						values
+					stored = {
+						...(stored ?? {}),
+						synced,
+						field_count: fieldCount,
+						ca_present: caPresent,
+						firmware,
+						key_paired: keyPaired,
+						streaming_enabled: streaming,
+						checked_at: checkedAt,
+						pushed_at: (stored as { pushed_at?: unknown } | undefined)?.pushed_at ?? null
+					}
+				}
 				return { rows: [] }
 			}
 			reads.push({ sql, values })
@@ -124,7 +152,7 @@ function fakeDb(opts: { vehicleId?: string | null } = {}) {
 				const id = opts.vehicleId === undefined ? VEHICLE_ID : opts.vehicleId
 				return { rows: id === null ? [] : [{ id }] }
 			}
-			if (/FROM telemetry_status/.test(sql)) return { rows: [CACHED_ROW] }
+			if (/FROM telemetry_status/.test(sql)) return { rows: [stored ?? CACHED_ROW] }
 			return { rows: [] }
 		}
 	}
@@ -565,7 +593,7 @@ describe('pushing the configuration to the car', () => {
 		expect(db.writes[1]!.values).toEqual([VEHICLE_ID, NOW])
 	})
 
-	it('REFUSES on a preflight blocker, sending nothing and writing nothing', async () => {
+	it('REFUSES on a preflight blocker, sending nothing but recording why', async () => {
 		// Tesla accepts a configuration a car cannot apply, reports no error, and
 		// leaves synced:false indefinitely - which is indistinguishable from a
 		// sleeping car. Pushing anyway replaces a diagnosis with a silent wait.
@@ -577,7 +605,13 @@ describe('pushing the configuration to the car', () => {
 		expect(e).toMatchObject({ status: 409 })
 		expect(String((e as Error).message)).toMatch(/virtual key not paired/)
 		expect(tesla.pushed).toEqual([])
-		expect(db.writes).toEqual([])
+		// Nothing SENT, but the observation is recorded: migration 006 keeps the
+		// preflight columns so the page can say why it will not push before
+		// anyone consents to Tesla again, and discarding the very observation
+		// that produced the refusal is what would make that impossible.
+		expect(db.writes).toHaveLength(1)
+		expect(db.writes[0]!.sql).toMatch(/INSERT INTO telemetry_status/)
+		expect(db.writes[0]!.sql).not.toMatch(/pushed_at\)/)
 	})
 
 	it('refuses on firmware below the floor, with the version in the message', async () => {
@@ -592,7 +626,8 @@ describe('pushing the configuration to the car', () => {
 		// Numerically below 2024.26, not lexically: "2024.9" sorts above it.
 		expect(String((e as Error).message)).toMatch(/2024\.9\.1 is below the 2024\.26 floor/)
 		expect(tesla.pushed).toEqual([])
-		expect(db.writes).toEqual([])
+		// Recorded, for the same reason as the unpaired-key refusal above.
+		expect(db.writes).toHaveLength(1)
 	})
 
 	it('reports "already applied" and pushes nothing when the car has this config', async () => {
@@ -607,7 +642,25 @@ describe('pushing the configuration to the car', () => {
 		expect(result.alreadyApplied).toBe(true)
 		expect(result.pushed).toBe(false)
 		expect(tesla.pushed).toEqual([])
-		expect(db.writes).toEqual([])
+		// Recorded: this outcome refreshes `synced` and `checked_at` at the cost
+		// of two Fleet API calls, and throwing that away leaves the page showing
+		// a staler row than the one we just paid for.
+		expect(db.writes).toHaveLength(1)
+		expect(result.status?.checkedAt).toBe(NOW.toISOString())
+	})
+
+	/**
+	 * "Already applied" is a claim about the CAR, and the car is the thing that
+	 * says whether it has applied anything. A config Tesla is holding for a
+	 * vehicle that has not acknowledged it comes back matching but unsynced, and
+	 * reporting that as already applied is §3.6's too-loose failure: a push
+	 * silently declined over a car that never received one.
+	 */
+	it('pushes a matching config the car has NOT acknowledged', async () => {
+		const tesla = fakeTesla({ applied: { synced: false, config: { ...DESIRED } } })
+		const result = await pushTelemetry(makeDeps(tesla.client, fakeDb()))
+		expect(result.alreadyApplied).toBe(false)
+		expect(tesla.pushed).toHaveLength(1)
 	})
 
 	it('pushes when a single interval has changed', async () => {
@@ -696,5 +749,31 @@ describe('the telemetry CA', () => {
 
 	it('refuses loudly when it is not configured at all', () => {
 		expect(() => telemetryCa()).toThrow(/TELEMETRY_CA_FILE/)
+	})
+})
+
+/**
+ * Tesla answers 200 to a push it did not apply, in two different ways: by
+ * listing the vehicle under `skipped_vehicles`, and — this one — by simply
+ * reporting that nothing was updated and saying nothing about why.
+ *
+ * Recording `pushed_at` for either is the silent success this feature exists to
+ * remove: the page would show a push time for a car that was never
+ * reconfigured, and the columns it was meant to fill would stay empty with
+ * nothing to explain it.
+ */
+describe('a push Tesla accepted but did not apply', () => {
+	it('is a failure when no vehicle was updated, even with no reason given', async () => {
+		const tesla = fakeTesla({
+			applied: { synced: false },
+			pushResult: { updated_vehicles: 0 }
+		})
+		const db = fakeDb()
+		const e = await thrownBy(() => pushTelemetry(makeDeps(tesla.client, db)))
+
+		expect(e).toMatchObject({ status: 502 })
+		expect(String((e as Error).message)).toMatch(/no vehicle updated/)
+		// The observation may be recorded; a push time must not be.
+		expect(db.writes.some((w) => /pushed_at\)/.test(w.sql))).toBe(false)
 	})
 })

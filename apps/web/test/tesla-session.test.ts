@@ -98,10 +98,26 @@ describe('the in-memory Tesla token store', () => {
 	 * "the operator is connected" — and it would be the wrong model the moment
 	 * this app had a second operator.
 	 */
-	it('shares one consent across every browser signed in as the same subject', () => {
+	it('keys by subject alone, so a second subject shares nothing', () => {
+		// The consequence above is only safe because the KEY is the subject: the
+		// same person's two browsers share a consent, and two subjects never do.
+		// That second half is the part worth a test — the first is a property of
+		// a Map with no browser dimension in it.
 		setTeslaToken(SUBJECT, { accessToken: 'tok', expiresAt: later(3600) })
-		// A second browser presents a different cookie carrying the same subject;
-		// the store has no browser dimension for it to differ in.
-		expect(getTeslaToken(SUBJECT, T0)?.accessToken).toBe('tok')
+		expect(getTeslaToken('someone-else', T0)).toBeNull()
+	})
+
+	/**
+	 * Expiry used to be enforced on read alone, which did nothing for a consent
+	 * whose subject never came back: an operator who connects, closes the tab
+	 * and walks away left a live credential in the pod until the next deploy.
+	 */
+	it('sweeps an expired consent when any consent is stored, without a read', () => {
+		setTeslaToken('gone-away', { accessToken: 'stale', expiresAt: later(1) })
+		setTeslaToken(SUBJECT, { accessToken: 'fresh', expiresAt: later(3600) })
+		// Read with a clock BEFORE the stale token's expiry: if it were still
+		// held, this would return it. The sweep is why it does not.
+		expect(getTeslaToken('gone-away', T0)).toBeNull()
+		expect(getTeslaToken(SUBJECT, T0)?.accessToken).toBe('fresh')
 	})
 })

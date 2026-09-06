@@ -75,7 +75,15 @@ describe('buildTelemetryConfig', () => {
         `could not run ${emitterPath}: it reads dist, because the shell has no ` +
         `TypeScript - run \`pnpm --filter @ev/tesla build\`.\n${String(err)}`)
     }
-    expect(JSON.parse(out)).toEqual(buildTelemetryConfig({ vin: VIN, ca: CA }).config.fields)
+    // The shim prints the catalogue's half of the envelope — the fields, and
+    // the collector both pushers must agree on. The script's python assembles
+    // the rest (vin, ca, prefer_typed) around it.
+    const config = buildTelemetryConfig({ vin: VIN, ca: CA }).config
+    expect(JSON.parse(out)).toEqual({
+      hostname: config.hostname,
+      port: config.port,
+      fields: config.fields
+    })
   })
 
   it('wraps the config in the vins the push body takes', () => {
@@ -254,8 +262,8 @@ describe('compareTelemetryConfig', () => {
 })
 
 describe('buildTelemetryFields', () => {
-  // The shim prints this and nothing else, which is what keeps push-config's
-  // four text assertions - and the script's python assembly - untouched.
+  // The script's python still assembles the envelope around what the shim
+  // prints, which is what keeps push-config's text assertions untouched.
   it('is the field-map half of the builder, on its own', () => {
     const fields: TelemetryFields = buildTelemetryFields()
     expect(fields).toEqual(buildTelemetryConfig({ vin: VIN, ca: CA }).config.fields)

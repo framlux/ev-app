@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Prints the `fields` map of the Fleet Telemetry configuration, as JSON.
+ * Prints the parts of the Fleet Telemetry configuration that live in the
+ * catalogue: the `fields` map, and the collector's hostname and port.
  *
  *   pnpm --filter @ev/tesla build
  *   node scripts/telemetry-fields.mjs
@@ -39,7 +40,11 @@
 // A relative path, not the `@ev/tesla` specifier: the workspace root has no
 // node_modules/@ev, so a bare specifier does not resolve from scripts/. dist,
 // not src, because this is plain node - build the package first.
-import { buildTelemetryFields } from '../packages/tesla/dist/telemetry-config.js'
+import {
+  buildTelemetryFields,
+  TELEMETRY_HOSTNAME,
+  TELEMETRY_PORT,
+} from '../packages/tesla/dist/telemetry-config.js'
 
 // Throws on an empty catalogue rather than printing `{}`: a configuration with
 // no fields is accepted by Tesla and stops the car streaming anything. The
@@ -50,4 +55,6 @@ const fields = buildTelemetryFields()
 // Pretty-printed: the push script echoes the file on a failure, and a 204-key
 // object on one line is unreadable in a terminal at the exact moment someone is
 // trying to work out what was about to be sent to their car.
-process.stdout.write(`${JSON.stringify(fields, null, 2)}\n`)
+process.stdout.write(
+  `${JSON.stringify({ hostname: TELEMETRY_HOSTNAME, port: TELEMETRY_PORT, fields }, null, 2)}\n`
+)

@@ -213,9 +213,11 @@ The remaining exposure is a compromise of `ev-web` *while an operator is consent
 ## 7. What changes outside this repo
 
 **`framlux/stack`:**
-- Mount `ev-tesla-oauth`'s `CLIENT_ID` and `CLIENT_SECRET` into `ev-web` — **not** `REFRESH_TOKEN`, which is the point of the design and should be called out in the manifest comment.
+- Mount `ev-tesla-oauth`'s `CLIENT_ID` and `CLIENT_SECRET` into `ev-web` **as `TESLA_CLIENT_ID` and `TESLA_CLIENT_SECRET`** — the code requires those names, because `POCKETID_CLIENT_ID` already occupies the unprefixed namespace and two OAuth clients in one process must not share a variable. Mount **not** `REFRESH_TOKEN`, which is the point of the design and should be called out in the manifest comment.
 - Mount the telemetry CA (`ev-telemetry-ca`, `tls.crt`) and the proxy CA (`ev-teslaproxy-tls`, `ca.crt`) read-only, **each with an explicit `items:` projection** — never a bare `secret:` volume. Both Secrets are cert-manager CA secrets and therefore also contain `tls.key`: `ev-telemetry-ca` holds the private key of the ten-year root **the car pins**, carrying `rotationPolicy: Never` precisely because rotating it means re-pushing config to a physical vehicle. Projecting the whole Secret into the one internet-facing pod in the namespace would be strictly worse than the refresh-token exposure this design removes. `deployment-teslaproxy.yaml` already does exactly this projection for the signing key, with the reasoning attached; copy that shape.
-- Add `TESLAPROXY_URL`, `TESLA_REDIRECT_URI` and `NODE_EXTRA_CA_CERTS` (pointing at the projected proxy CA) to the web Deployment.
+- Add to the web Deployment: `TESLAPROXY_URL` (the base the client appends `/api/1` to), `TESLA_REDIRECT_URI`, `TELEMETRY_CA_FILE` (the path of the projected telemetry CA — §3.3 says the application does not read a CA, which is true of the PROXY's and false of this one: the telemetry CA travels *inside* the configuration the car is sent, so the app must read it), and `NODE_EXTRA_CA_CERTS` pointing at the projected proxy CA.
+
+**Every one of these names is required by code that throws without it.** Deploying to an earlier draft of this list produces a pod that answers "Connect to Tesla" with a 500 saying `TESLA_CLIENT_ID is not set`, and Push with `TELEMETRY_CA_FILE is not set`.
 - No NetworkPolicy change: `ev-web` is already admitted to `ev-teslaproxy:4443`, and the comment there anticipated this.
 - `SECRETS.md` §7 gains a note that `REFRESH_TOKEN` is now used only by the break-glass scripts.
 

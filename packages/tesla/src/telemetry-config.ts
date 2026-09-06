@@ -7,17 +7,22 @@
  * web app now pushes the same configuration, and two producers of the same JSON
  * is precisely the drift the field catalogue exists to prevent — so the
  * assembly moved here and the shim became a caller. The script keeps its python
- * (its four pinned text assertions in `test/push-config.test.ts` say so), but
- * the only thing it can still decide about the configuration is the VIN.
+ * (its pinned text assertions in `test/push-config.test.ts` say so), so what it
+ * still decides for itself is the VIN and the CA it reads from the cluster —
+ * the fields, the hostname and the port all come from here, through the shim.
  *
- * `hostname` and `port` are CONSTANTS here rather than arguments. They were
- * hard-coded in the shell script, and a value both callers must agree on is
- * exactly what a shared module is for: passing them in would put the drift back
- * one level up.
+ * `hostname` and `port` are CONSTANTS here rather than arguments, and the shim
+ * prints them so the script uses these and not its own: a value both pushers
+ * must agree on is exactly what a shared module is for, and it was declared
+ * twice until that was noticed.
  *
- * The two guards below moved out of the script with the assembly. They are the
- * reason this is not a one-liner, and both defend against a push that SUCCEEDS
- * and then silently stops the data.
+ * The guards below moved out of the script with the assembly, and both defend
+ * against a push that SUCCEEDS and then silently stops the data. One caveat
+ * worth stating rather than implying: the empty-field guard reaches both
+ * callers, because both go through `buildTelemetryFields`. The CA guard does
+ * not — the shim never sees a CA, so the shell script keeps its own
+ * `grep -q "BEGIN CERTIFICATE"`. Two implementations of one rule, agreeing
+ * today, and the script's is the one a human reads at 2am.
  */
 
 import { TESLA_FIELDS, TIER_INTERVAL_SECONDS, type TeslaField } from './catalogue.js'
