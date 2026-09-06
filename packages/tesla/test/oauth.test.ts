@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest'
+import { TESLA_FIELDS, WITHHELD_NAMES } from '../src/catalogue.js'
 import { SCOPES, WEB_SCOPES, authorizeUrl, exchangeCode } from '../src/oauth.js'
 
 it('always requests offline_access, or there is no refresh token at all', () => {
@@ -56,8 +57,47 @@ it('requires the full requested scope set, so a partial grant fails loudly', () 
  * minted a refresh token - a standing, vehicle-capable credential living in a
  * pod, which is the single thing the web consent flow exists to avoid.
  */
-it('the web flow requests exactly openid and vehicle_device_data', () => {
-  expect([...WEB_SCOPES]).toEqual(['openid', 'vehicle_device_data'])
+it('the web flow requests exactly openid, vehicle_device_data and vehicle_location', () => {
+  expect([...WEB_SCOPES]).toEqual(['openid', 'vehicle_device_data', 'vehicle_location'])
+})
+
+/**
+ * THE SCOPE THE PUSH ACTUALLY NEEDS, and the reason four releases were spent
+ * looking somewhere else.
+ *
+ * Tesla refused every push from the web app with:
+ *
+ *   Unauthorized missing scopes vehicle_location for vehicle data access
+ *
+ * A telemetry configuration that names Location cannot be applied by a token
+ * without `vehicle_location` - and this catalogue names it, because a driving
+ * history without position is not the product. The break-glass script never hit
+ * this because it mints its token from SCOPES, which has carried the scope all
+ * along; only the interactive flow was short.
+ *
+ * So the two lists are pinned against each other here: whatever the web flow
+ * asks for must cover what a pushed configuration requires.
+ */
+it('asks for every scope the pushed configuration needs', () => {
+  expect(WEB_SCOPES).toContain('vehicle_location')
+  expect(SCOPES).toContain('vehicle_location')
+})
+
+/**
+ * The same rule, DERIVED rather than restated, so it holds from both ends: drop
+ * `vehicle_location` from the consent and this fails, and it fails just as
+ * loudly if someone adds another position field to the catalogue while the
+ * consent stays as it is. A hand-written list of "scopes we need" would have to
+ * be remembered; this one cannot be forgotten because it reads the catalogue
+ * that decides what is pushed.
+ */
+it('derives the location scope from the configuration it would push', () => {
+  const withheld = new Set<string>(WITHHELD_NAMES)
+  const pushesPosition = TESLA_FIELDS.some(
+    (e) => !withheld.has(e.field) &&
+      (Array.isArray(e.column) ? e.column : [e.column]).some((c) => c === 'lat' || c === 'lon'))
+  expect(pushesPosition, 'the catalogue no longer pushes position: revisit this').toBe(true)
+  expect(WEB_SCOPES).toContain('vehicle_location')
 })
 
 it('the web flow never requests offline_access, so no refresh token can exist', () => {

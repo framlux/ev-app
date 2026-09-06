@@ -330,7 +330,12 @@ describe('starting the Tesla consent', () => {
 		expect(`${url.origin}${url.pathname}`).toBe('https://auth.tesla.com/oauth2/v3/authorize')
 		// The whole point of WEB_SCOPES: no offline_access means Tesla issues no
 		// refresh token, so this flow cannot mint a standing credential (§2).
-		expect(url.searchParams.get('scope')).toBe('openid vehicle_device_data')
+		// `vehicle_location` is here because Tesla refuses to apply a telemetry
+		// configuration naming Location without it - the read scope is required,
+		// the standing credential still is not.
+		expect(url.searchParams.get('scope'))
+			.toBe('openid vehicle_device_data vehicle_location')
+		expect(url.searchParams.get('scope')).not.toContain('offline_access')
 		expect(url.searchParams.get('redirect_uri')).toBe(process.env.TESLA_REDIRECT_URI)
 
 		const cookie = cookies.sets[0]

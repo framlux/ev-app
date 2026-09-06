@@ -49,8 +49,25 @@ export const SCOPES = [
  * already carries the command scopes, so a fresh authorize may hand back a
  * token with them regardless of what was requested. What actually holds that
  * line is that no function in this repo sends a command.
+ *
+ * `vehicle_location` IS REQUIRED, and was missing here until a push finally
+ * said so:
+ *
+ *   400 Unauthorized missing scopes vehicle_location for vehicle data access
+ *
+ * Tesla will not apply a telemetry configuration that names `Location` unless
+ * the token carries that scope, and this catalogue names it - a driving history
+ * without position is not the product. The scope is about what the token may
+ * READ, which is data this app already stores from the stream; it mints no
+ * standing credential, so it takes nothing away from the design above. Note
+ * `require_requested_scopes=true` in `authorizeUrl`: a consent where the
+ * operator unticks location fails loudly here rather than producing a token
+ * that cannot push.
+ *
+ * `scripts/push-telemetry-config.sh` never hit this, which is why it went
+ * unnoticed for so long - it mints from SCOPES, which has always had it.
  */
-export const WEB_SCOPES = ['openid', 'vehicle_device_data'] as const
+export const WEB_SCOPES = ['openid', 'vehicle_device_data', 'vehicle_location'] as const
 
 export function authorizeUrl(
   clientId: string, redirectUri: string, state: string,
