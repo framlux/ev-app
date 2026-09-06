@@ -1,6 +1,83 @@
 const BASE = 'https://fleet-api.prd.na.vn.cloud.tesla.com/api/1'
 
 /**
+ * How long any one Fleet API call may take before this app gives up.
+ *
+ * NOTHING IN A REQUEST PATH MAY WAIT FOREVER, and both calls below used a bare
+ * `fetch`, which has no timeout at all. A hung Tesla or proxy call therefore
+ * held the browser's request open indefinitely, and the first thing to give up
+ * was something outside this app: Cloudflare sits in front of it and answers
+ * with its own HTML `502 Bad gateway`, which knows nothing about what was being
+ * attempted, while the pod that did know logged nothing because the request
+ * never finished. That is the worst possible failure to debug, and it is the
+ * one that actually happened.
+ *
+ * 15 seconds for a READ. A healthy Fleet API read is well under two seconds;
+ * this is a bound on pathology, not a budget.
+ */
+export const TESLA_TIMEOUT_MS = 15_000
+
+/**
+ * The config push gets its own, much longer bound.
+ *
+ * The two 400s this endpoint returned came back instantly, because rejecting a
+ * field name is cheap. A configuration Tesla ACCEPTS is not the same operation
+ * - it is stored against the vehicle and acknowledged - and the evidence says
+ * it is slower: the reads still succeed (the page's Check button works today)
+ * while only the push dies at the gateway. Bounding the write at a read's
+ * timeout would turn a slow success into a permanent failure, which is worse
+ * than the problem.
+ *
+ * The ceiling is not ours to choose: Cloudflare fronts this app and gives up at
+ * 100 seconds, answering with HTML that says nothing about what was attempted.
+ * 15 + 15 + 60 leaves ten seconds of headroom, so OUR message wins that race
+ * and the operator is told what happened by the app rather than by a CDN.
+ */
+export const TESLA_WRITE_TIMEOUT_MS = 60_000
+
+/**
+ * A Fleet API call that never answered.
+ *
+ * Deliberately NOT a `TeslaApiError`: Tesla did not refuse anything, and saying
+ * "Tesla refused the request" about a timeout would send someone looking for a
+ * rule they broke. The distinction matters most for the push, where a timeout
+ * leaves the outcome genuinely unknown - the configuration may have been
+ * applied - and the operator needs to be told that rather than reassured.
+ */
+export class TeslaTimeoutError extends Error {
+  readonly path: string
+  readonly timeoutMs: number
+
+  constructor(path: string, timeoutMs: number) {
+    super(`Tesla did not respond to ${path} within ${Math.round(timeoutMs / 1000)}s`)
+    this.name = 'TeslaTimeoutError'
+    this.path = path
+    this.timeoutMs = timeoutMs
+  }
+}
+
+/**
+ * One fetch, bounded, with the abort turned back into something readable.
+ *
+ * `AbortSignal.timeout` rejects with a DOMException whose name is
+ * `TimeoutError` and whose message says nothing about Tesla or the path, so it
+ * is translated here rather than left to surface as "signal timed out".
+ */
+async function fetchBounded(
+  target: string, init: RequestInit, path: string, timeoutMs: number,
+): Promise<Response> {
+  try {
+    return await fetch(target, { ...init, signal: AbortSignal.timeout(timeoutMs) })
+  } catch (e) {
+    const name = (e as { name?: string } | null)?.name
+    if (name === 'TimeoutError' || name === 'AbortError') {
+      throw new TeslaTimeoutError(path, timeoutMs)
+    }
+    throw e
+  }
+}
+
+/**
  * A non-2xx from the Fleet API, with Tesla's own refusal kept as data.
  *
  * Tesla's refusals are the most useful thing this integration receives. Both
@@ -75,6 +152,8 @@ export class TeslaApiError extends Error {
  */
 export interface FleetApiOptions {
   baseUrl?: string
+  /** Overridable so a test can bound a hang in milliseconds, not seconds. */
+  timeoutMs?: number
 }
 
 /** The `fields` map in Tesla's shape: names to interval and optional delta. */
@@ -110,9 +189,11 @@ const url = (path: string, opts?: FleetApiOptions) =>
   `${(opts?.baseUrl ?? BASE).replace(/\/+$/, '')}${path}`
 
 async function get<T>(path: string, accessToken: string, opts?: FleetApiOptions): Promise<T> {
-  const res = await fetch(url(path, opts), {
-    headers: { authorization: `Bearer ${accessToken}` },
-  })
+  const res = await fetchBounded(
+    url(path, opts),
+    { headers: { authorization: `Bearer ${accessToken}` } },
+    path,
+    opts?.timeoutMs ?? TESLA_TIMEOUT_MS)
   if (!res.ok) throw new TeslaApiError(path, res.status, await res.text())
   return (await res.json() as { response: T }).response
 }
@@ -157,11 +238,15 @@ export const setTelemetryConfig = (
 async function post<T>(
   path: string, accessToken: string, body: unknown, opts?: FleetApiOptions,
 ): Promise<T> {
-  const res = await fetch(url(path, opts), {
-    method: 'POST',
-    headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  })
+  const res = await fetchBounded(
+    url(path, opts),
+    {
+      method: 'POST',
+      headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+    path,
+    opts?.timeoutMs ?? TESLA_WRITE_TIMEOUT_MS)
   if (!res.ok) throw new TeslaApiError(path, res.status, await res.text())
   return (await res.json() as { response: T }).response
 }

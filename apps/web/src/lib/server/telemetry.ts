@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { env } from '$env/dynamic/private'
 import {
 	TeslaApiError,
+	TeslaTimeoutError,
 	buildTelemetryConfig,
 	checkTelemetryPreconditions,
 	compareTelemetryConfig,
@@ -385,7 +386,7 @@ export async function pushTelemetry(deps: TelemetryDeps): Promise<TelemetryPushR
 		.map(([reason]) => reason)
 	if (refused.length > 0) {
 		throw new ApiProblem(
-			502,
+			409,
 			`Tesla accepted the request but skipped ${observed.vin}: ${refused.join(', ')}`
 		)
 	}
@@ -396,7 +397,7 @@ export async function pushTelemetry(deps: TelemetryDeps): Promise<TelemetryPushR
 	// recorded as a push.
 	if (result.updated_vehicles === 0) {
 		throw new ApiProblem(
-			502,
+			409,
 			`Tesla accepted the request but reported no vehicle updated, and gave no reason. ${observed.vin} may not have been reconfigured.`
 		)
 	}
@@ -484,6 +485,29 @@ export function isTeslaUnauthorized(e: unknown): boolean {
 }
 
 /**
+ * Tesla never answered, which is NOT the same as Tesla saying no.
+ *
+ * A refusal names a rule and the fix is in the configuration. A timeout leaves
+ * the outcome genuinely unknown — the push may have been applied — and the one
+ * thing that must not happen is reassuring the operator either way. So it says
+ * what it does not know, and names the action that settles it: Check reads back
+ * what the car actually has.
+ *
+ * 503, not the 504 this is: Cloudflare replaces an origin 504 exactly as it
+ * replaces a 502, and the replacement drops the body. 503 still separates a
+ * dependency that did not answer from a refusal that did (409, above), and it
+ * reaches the browser intact.
+ */
+export function teslaTimeout(e: unknown): ApiProblem | null {
+	if (!(e instanceof TeslaTimeoutError)) return null
+	return new ApiProblem(
+		503,
+		`${e.message}. Whether the configuration was applied is unknown — press ` +
+			'Check to read back what the car has.'
+	)
+}
+
+/**
  * What Tesla refused, in words the operator can act on.
  *
  * Both refusals this app has had were precise — `Unknown field
@@ -493,10 +517,18 @@ export function isTeslaUnauthorized(e: unknown): boolean {
  * turns that into "Internal Error". The sentence naming the exact problem was
  * the one thing not on the screen.
  *
- * 502 rather than 500: the refusal is upstream's answer, not this server
- * failing, and the page renders the message of a Kit error. The txid rides
- * along because it is what Tesla asks for when reporting a problem, and it is
- * useless if it only ever exists in a log nobody exports.
+ * 409, AND NOT THE 502 THIS OBVIOUSLY WANTS TO BE. Cloudflare fronts this app,
+ * and an origin that answers with a standard 502 or 504 does not get that
+ * response forwarded: Cloudflare substitutes its own branded "Bad gateway" page
+ * and discards the body. So the honest status silently ate the sentence it
+ * existed to deliver, for three releases — the operator saw a generic failure,
+ * and the pod logged nothing, because nothing had gone wrong. The status is not
+ * the message; a code that carries the message beats a code that describes the
+ * situation. 409 is what the rest of this module already uses for "the request
+ * cannot be completed as things stand".
+ *
+ * The txid rides along because it is what Tesla asks for when reporting a
+ * problem, and it is useless if it only ever exists in a log nobody exports.
  *
  * A 401 is deliberately NOT handled here — it is a dead consent, handled above,
  * and answering it with "Tesla refused" would leave a token in memory that can
@@ -508,7 +540,7 @@ export function teslaRefusal(e: unknown): ApiProblem | null {
 	const description =
 		e.teslaErrorDescription === null ? '' : ` (${e.teslaErrorDescription})`
 	const txid = e.txid === null ? '' : ` [Tesla txid ${e.txid}]`
-	return new ApiProblem(502, `Tesla refused the request: ${detail}${description}${txid}`)
+	return new ApiProblem(409, `Tesla refused the request: ${detail}${description}${txid}`)
 }
 
 /**
@@ -524,13 +556,13 @@ export function teslaTransportProblem(e: unknown): ApiProblem | null {
 	if (typeof code !== 'string') return null
 	if (/^(UNABLE_TO_VERIFY_LEAF_SIGNATURE|SELF_SIGNED_CERT_IN_CHAIN|DEPTH_ZERO_SELF_SIGNED_CERT|CERT_HAS_EXPIRED|ERR_TLS_CERT_ALTNAME_INVALID)$/.test(code)) {
 		return new ApiProblem(
-			502,
+			503,
 			`the signing proxy's certificate could not be verified (${code}): NODE_EXTRA_CA_CERTS ` +
 				'must point at the proxy CA on this pod'
 		)
 	}
 	if (/^(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|EHOSTUNREACH)$/.test(code)) {
-		return new ApiProblem(502, `the signing proxy could not be reached (${code})`)
+		return new ApiProblem(503, `the signing proxy could not be reached (${code})`)
 	}
 	return null
 }
@@ -561,6 +593,8 @@ export async function withTeslaSession<T>(
 		}
 		const transport = teslaTransportProblem(e)
 		if (transport) throw transport
+		const timeout = teslaTimeout(e)
+		if (timeout) throw timeout
 		const refusal = teslaRefusal(e)
 		if (refusal) throw refusal
 		throw e

@@ -1,10 +1,11 @@
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { isHttpError, isRedirect } from '@sveltejs/kit'
 import {
 	TeslaApiError,
+	TeslaTimeoutError,
 	buildTelemetryConfig,
 	type AppliedTelemetryConfig,
 	type TelemetryConfigRequest,
@@ -22,6 +23,7 @@ import {
 	checkTelemetry,
 	pushTelemetry,
 	telemetryCa,
+	teslaTransportProblem,
 	withTeslaSession,
 	type TelemetryDeps
 } from '../src/lib/server/telemetry.js'
@@ -301,7 +303,7 @@ describe('who may call the telemetry actions', () => {
 				throw tlsFailure
 			})
 		)
-		expect(first).toMatchObject({ status: 502 })
+		expect(first).toMatchObject({ status: 503 })
 		expect(String((first as Error).message)).toMatch(/certificate could not be verified/)
 
 		const second = await thrownBy(() =>
@@ -309,7 +311,7 @@ describe('who may call the telemetry actions', () => {
 				throw unreachable
 			})
 		)
-		expect(second).toMatchObject({ status: 502 })
+		expect(second).toMatchObject({ status: 503 })
 		expect(String((second as Error).message)).toMatch(/could not be reached/)
 	})
 })
@@ -686,7 +688,7 @@ describe('pushing the configuration to the car', () => {
 		})
 		const db = fakeDb()
 		const e = await thrownBy(() => pushTelemetry(makeDeps(tesla.client, db)))
-		expect(e).toMatchObject({ status: 502 })
+		expect(e).toMatchObject({ status: 409 })
 		expect(String((e as Error).message)).toMatch(/missing_key/)
 		expect(db.writes).toEqual([])
 	})
@@ -772,7 +774,7 @@ describe('a push Tesla accepted but did not apply', () => {
 		const db = fakeDb()
 		const e = await thrownBy(() => pushTelemetry(makeDeps(tesla.client, db)))
 
-		expect(e).toMatchObject({ status: 502 })
+		expect(e).toMatchObject({ status: 409 })
 		expect(String((e as Error).message)).toMatch(/no vehicle updated/)
 		// The observation may be recorded; a push time must not be.
 		expect(db.writes.some((w) => /pushed_at\)/.test(w.sql))).toBe(false)
@@ -789,7 +791,7 @@ describe('a push Tesla accepted but did not apply', () => {
  * page can render and the sentence survives verbatim.
  */
 describe('what Tesla refused, in front of the operator', () => {
-	it('surfaces the refusal as a 502 carrying Tesla\'s own sentence', async () => {
+	it('surfaces the refusal with a status that carries Tesla\'s own sentence', async () => {
 		setTeslaToken(SUBJECT, { accessToken: 'good', expiresAt: new Date(Date.now() + 3_600_000) })
 		const e = await thrownBy(() =>
 			withTeslaSession(SUBJECT, async () => {
@@ -805,7 +807,10 @@ describe('what Tesla refused, in front of the operator', () => {
 				)
 			})
 		)
-		expect(e).toMatchObject({ status: 502 })
+		// 409, not the 502 this obviously is: Cloudflare replaces an origin 502
+		// and drops the body with it, which is how this message stayed invisible
+		// for three releases. See the CDN describe-block below.
+		expect(e).toMatchObject({ status: 409 })
 		expect((e as Error).message).toContain('Unknown field BrickSocMinPercent')
 		// The correlation id is what Tesla asks for when reporting a problem, so
 		// it must not be the thing that only exists in a log.
@@ -823,5 +828,84 @@ describe('what Tesla refused, in front of the operator', () => {
 		)
 		expect(e).toMatchObject({ status: 409 })
 		expect(getTeslaToken(SUBJECT)).toBeNull()
+	})
+})
+
+/**
+ * A timeout is not a refusal, and the difference is the operator's next move.
+ *
+ * Tesla refusing names a rule that was broken; the fix is in the config. Tesla
+ * not answering leaves the outcome UNKNOWN - the configuration may well have
+ * been applied - and the only honest thing to say is so, along with the one
+ * action that settles it: Check reads back what the car actually has.
+ */
+describe('a Tesla call that never answered', () => {
+	it('is reported as a timeout, not as a refusal, and says the outcome is unknown', async () => {
+		setTeslaToken(SUBJECT, { accessToken: 'good', expiresAt: new Date(Date.now() + 3_600_000) })
+		const e = await thrownBy(() =>
+			withTeslaSession(SUBJECT, async () => {
+				throw new TeslaTimeoutError('/vehicles/fleet_telemetry_config', 60_000)
+			})
+		)
+		expect(e).toMatchObject({ status: 503 })
+		const message = (e as Error).message
+		expect(message).toMatch(/did not respond/i)
+		expect(message).not.toMatch(/refused/i)
+		// It must say the outcome is UNKNOWN. Either reassurance is a lie here.
+		expect(message).toMatch(/unknown/i)
+		expect(message).not.toMatch(/nothing was (changed|applied)/i)
+		expect(message).toMatch(/check/i)
+		// Not a dead consent: a timeout says nothing about the token.
+		expect(getTeslaToken(SUBJECT)).not.toBeNull()
+	})
+})
+
+/**
+ * 502 AND 504 ARE UNUSABLE STATUSES FOR THIS APP, and this is the test that
+ * remembers why.
+ *
+ * Cloudflare fronts ev.framlux.io, and when an origin answers with a standard
+ * 502 or 504 it does not pass that response through — it substitutes its own
+ * branded "Bad gateway" page and discards the body. So the app spent three
+ * releases correctly returning `502 Tesla refused the request: <sentence>` in a
+ * text/plain body that no operator could ever see, while the page showed a
+ * generic failure and the pod logged nothing, because nothing had gone wrong.
+ *
+ * The status is not the message. Anything whose whole purpose is to carry a
+ * sentence to a person must use a code the CDN forwards.
+ */
+describe('statuses that survive the CDN in front of this app', () => {
+	const source = readFileSync(
+		new URL('../src/lib/server/telemetry.ts', import.meta.url), 'utf8')
+
+	it('never answers with 502 or 504', () => {
+		const offending = [...source.matchAll(/ApiProblem\(\s*(50[24])\b/g)].map((m) => m[1])
+		expect(offending, 'Cloudflare replaces these and drops the body').toEqual([])
+	})
+
+	it('reports a Tesla refusal with a status that carries its message', async () => {
+		setTeslaToken(SUBJECT, { accessToken: 'good', expiresAt: new Date(Date.now() + 3_600_000) })
+		const e = await thrownBy(() =>
+			withTeslaSession(SUBJECT, async () => {
+				throw new TeslaApiError('/vehicles/fleet_telemetry_config', 400,
+					JSON.stringify({ error: 'Unknown field Whatever', txid: 'abc' }))
+			})
+		)
+		expect(e).toMatchObject({ status: 409 })
+		expect((e as Error).message).toContain('Unknown field Whatever')
+	})
+
+	it('reports a timeout and a dead proxy without a rewritten status', async () => {
+		setTeslaToken(SUBJECT, { accessToken: 'good', expiresAt: new Date(Date.now() + 3_600_000) })
+		const timedOut = await thrownBy(() =>
+			withTeslaSession(SUBJECT, async () => {
+				throw new TeslaTimeoutError('/vehicles/fleet_telemetry_config', 60_000)
+			})
+		)
+		expect(timedOut).toMatchObject({ status: 503 })
+
+		const unreachable = teslaTransportProblem(
+			Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }))
+		expect(unreachable?.status).toBe(503)
 	})
 })

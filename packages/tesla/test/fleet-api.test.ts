@@ -29,7 +29,8 @@ import * as fleet from '../src/fleet-api.js'
  */
 it('exposes no vehicle-data or command helper, so neither happens by accident', () => {
   expect(Object.keys(fleet).sort()).toEqual(
-    ['TeslaApiError', 'fleetStatus', 'getTelemetryConfig', 'listVehicles',
+    ['TESLA_TIMEOUT_MS', 'TESLA_WRITE_TIMEOUT_MS', 'TeslaApiError',
+      'TeslaTimeoutError', 'fleetStatus', 'getTelemetryConfig', 'listVehicles',
       'setTelemetryConfig'])
 })
 
@@ -169,4 +170,69 @@ it('keeps the body when Tesla answers with something that is not its error shape
   expect(thrown.teslaError).toBeNull()
   // Unparseable is not the same as empty: an operator still needs the bytes.
   expect(thrown.message).toContain('gateway timeout')
+})
+
+/**
+ * NOTHING IN A REQUEST PATH MAY WAIT FOREVER.
+ *
+ * Both calls here used a bare `fetch`, which has no timeout. A Tesla or proxy
+ * call that hangs therefore held the HTTP request open indefinitely, and the
+ * first thing to give up was something outside this app - Traefik, or
+ * Cloudflare, which answers with its own HTML `502 Bad gateway`. That page has
+ * no idea what was being attempted, and the pod that did know logged nothing
+ * because the request never finished. An operator is left with a status code
+ * and no way to tell a hung upstream from a crashed one.
+ *
+ * A bounded wait turns that into our error, with the path in it.
+ */
+it('gives up on a Tesla call that never answers, rather than hanging', async () => {
+  vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) =>
+    new Promise((_resolve, reject) => {
+      // Exactly how fetch behaves on an aborted signal: reject with the
+      // signal's reason. Never resolves otherwise, which is the case under test.
+      const signal = (init as RequestInit | undefined)?.signal
+      signal?.addEventListener('abort', () => { reject(signal.reason as Error) })
+    }))
+
+  const thrown = await fleet.fleetStatus('token', ['5YJYGDEE0MF000000'], { timeoutMs: 20 })
+    .catch((e: unknown) => e) as InstanceType<typeof fleet.TeslaTimeoutError>
+
+  expect(thrown).toBeInstanceOf(fleet.TeslaTimeoutError)
+  expect(thrown.path).toBe('/vehicles/fleet_status')
+  expect(thrown.timeoutMs).toBe(20)
+  expect(thrown.message).toMatch(/did not respond/i)
+})
+
+it('bounds the write as well as the reads', async () => {
+  vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) =>
+    new Promise((_resolve, reject) => {
+      const signal = (init as RequestInit | undefined)?.signal
+      signal?.addEventListener('abort', () => { reject(signal.reason as Error) })
+    }))
+
+  const thrown = await fleet.setTelemetryConfig('token', {
+    vins: ['5YJYGDEE0MF000000'],
+    config: {
+      hostname: 'h', port: 443, ca: 'x', prefer_typed: true,
+      fields: { Soc: { interval_seconds: 60 } },
+    },
+  }, { timeoutMs: 20 }).catch((e: unknown) => e)
+
+  expect(thrown).toBeInstanceOf(fleet.TeslaTimeoutError)
+})
+
+it('has a default bound, so a caller cannot forget one', () => {
+  expect(fleet.TESLA_TIMEOUT_MS).toBeGreaterThan(0)
+  expect(fleet.TESLA_WRITE_TIMEOUT_MS).toBeGreaterThan(fleet.TESLA_TIMEOUT_MS)
+})
+
+/**
+ * The race this exists to win. A push is two reads and a write, and Cloudflare
+ * gives up at 100 seconds with HTML that says nothing about what was attempted.
+ * If our bounds ever exceed that budget, the gateway answers first and the
+ * operator is back to reading a CDN error page.
+ */
+it('finishes a whole push inside the 100s the gateway allows', () => {
+  const worstCase = fleet.TESLA_TIMEOUT_MS * 2 + fleet.TESLA_WRITE_TIMEOUT_MS
+  expect(worstCase).toBeLessThan(100_000)
 })
