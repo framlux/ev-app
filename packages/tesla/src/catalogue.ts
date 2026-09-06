@@ -651,6 +651,47 @@ export const EXCLUDED_FIELDS: readonly ExclusionGroup[] = [
   },
 ]
 
+/**
+ * Catalogued fields we do NOT ask the car for yet, because the Fleet API
+ * REFUSES THE NAME.
+ *
+ * Upstream added members 260-269 to `vehicle_data.proto` on 2026-08-28
+ * (teslamotors/fleet-telemetry 8fbaa10, "Add new streamable fields 260-269"),
+ * commented in the proto as first available in firmware 2026.32 / device client
+ * 1.3.0. The proto lands when the firmware is written; the Fleet API's
+ * `fleet_telemetry_config` validator accepts the names some time later. Pushing
+ * this build on 2026-09-06 returned:
+ *
+ *   400 {"error":"Unknown field BrickSocMinPercent"}
+ *
+ * WHY THE WHOLE BLOCK AND NOT JUST THAT ONE NAME. A rejected name does not cost
+ * one signal — Tesla validates before applying anything, so the push fails
+ * whole and the car keeps whatever configuration it had, which on a first push
+ * is none at all. That makes withholding one field at a time a series of failed
+ * pushes against a physical car, and the error names only ONE unknown field:
+ * the API is Go, a Go map iterates in randomised order, so the name it reports
+ * is an arbitrary member of the unknown set, not the first. The proto groups
+ * 260-269 as a single availability unit, which is the boundary the API is
+ * behind, so the block is the honest unit to hold back.
+ *
+ * These stay IN `TESLA_FIELDS` on purpose: the columns exist, the decoders
+ * exist, and the drift test still accounts for them. Only the pushed config
+ * omits them, so re-enabling is deleting a name from this list once a push
+ * proves the API knows it.
+ */
+export const WITHHELD_FIELDS: ExclusionGroup = {
+  reason:
+    'Proto members 260-269 (firmware 2026.32, device client 1.3.0). The Fleet ' +
+    'API rejected BrickSocMinPercent on 2026-09-06 and one unknown name fails ' +
+    'the entire push, so the block is held back until the API accepts it.',
+  fields: [
+    'GpsAccuracyMeters', 'LifetimeEnergyChargedKwh', 'BrickSocMinPercent',
+    'NominalFullPackEnergyKwh', 'GradeEstimatePercent',
+    'MaxSpeedToReachDestinationMph', 'SoftwareUpdateAvailable',
+    'SoftwareUpdateInProgress', 'RemoteStartActive', 'SemiCruiseSpeedLimitMph',
+  ],
+}
+
 /** Days in the billing month the projection below is quoted in. */
 const DAYS_PER_MONTH = 30
 

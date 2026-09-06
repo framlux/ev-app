@@ -7,6 +7,7 @@ import {
   EXCLUDED_FIELDS,
   TESLA_FIELDS,
   TIER_INTERVAL_SECONDS,
+  WITHHELD_FIELDS,
   columnsOf,
   projectMonthlySignals,
   slotsOf,
@@ -114,6 +115,54 @@ describe('exclusions', () => {
   it('accounts for every proto member', () => {
     const accounted = new Set([...CATALOGUED_NAMES, ...EXCLUDED_NAMES])
     expect(PROTO_FIELDS.filter((f) => !accounted.has(f))).toEqual([])
+  })
+})
+
+/**
+ * The withheld block is the one place the catalogue and the pushed config
+ * disagree, so it gets the same by-name treatment as an exclusion: it may only
+ * name real proto members, it may only name fields we DO still catalogue (the
+ * column and the decoder stay), and it may never overlap the exclusions, which
+ * mean the opposite thing - we never want those at all.
+ */
+describe('withheld fields', () => {
+  it('names only real proto members', () => {
+    const members = new Set(PROTO_FIELDS)
+    expect(WITHHELD_FIELDS.fields.filter((f) => !members.has(f))).toEqual([])
+  })
+
+  it('names only fields the catalogue still captures', () => {
+    const catalogued = new Set(CATALOGUED_NAMES)
+    expect(WITHHELD_FIELDS.fields.filter((f) => !catalogued.has(f))).toEqual([])
+  })
+
+  it('never names something already excluded outright', () => {
+    const excluded = new Set(EXCLUDED_NAMES)
+    expect(WITHHELD_FIELDS.fields.filter((f) => excluded.has(f))).toEqual([])
+  })
+
+  it('holds back the whole 260-269 block, with a reason', () => {
+    expect(WITHHELD_FIELDS.fields).toHaveLength(10)
+    expect(new Set(WITHHELD_FIELDS.fields).size).toBe(10)
+    expect(WITHHELD_FIELDS.reason.length).toBeGreaterThan(20)
+  })
+
+  /**
+   * The reason this is a test and not a comment. The proto's own availability
+   * comment is the boundary the API lags behind, so the withheld set must be
+   * exactly the members declared after it - no more (we would be dropping
+   * signals the API accepts) and no fewer (one unknown name 400s everything).
+   */
+  it('is exactly the members the proto gates behind device client 1.3.0', () => {
+    const src = readFileSync(
+      new URL('../protos/vehicle_data.proto', import.meta.url), 'utf8')
+    // Within `enum Field` only: the same availability comment style appears
+    // nowhere else, but the enums that follow would otherwise be swept in.
+    const block = /enum Field \{([\s\S]*?)\n\}/.exec(src)![1]!
+    const tail = block.slice(block.indexOf('device client version 1.3.0'))
+    const gated = [...tail.matchAll(/^\s+([A-Za-z_0-9]+)\s*=\s*\d+;/gm)].map((m) => m[1]!)
+    expect(gated.length).toBeGreaterThan(0)
+    expect([...WITHHELD_FIELDS.fields].sort()).toEqual([...gated].sort())
   })
 })
 

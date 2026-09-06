@@ -7,7 +7,8 @@
  *   node scripts/telemetry-fields.mjs
  *
  * `push-telemetry-config.sh` used to carry this list as a python dict of 21
- * names. It is 204 now, and more to the point it has to AGREE with three other
+ * names. It is 194 now (204 catalogued, less the 10 the Fleet API refuses -
+ * see `WITHHELD_FIELDS`), and more to the point it has to AGREE with three other
  * things — the normaliser's decoders, the column catalogue and the schema —
  * none of which the shell can see. So the list lives in
  * `packages/tesla/src/catalogue.ts` with everything else that must agree.
@@ -52,7 +53,7 @@ import {
 // what a human reads at 2am.
 const fields = buildTelemetryFields()
 
-// Pretty-printed: the push script echoes the file on a failure, and a 204-key
+// Pretty-printed: the push script echoes the file on a failure, and a 194-key
 // object on one line is unreadable in a terminal at the exact moment someone is
 // trying to work out what was about to be sent to their car.
 process.stdout.write(

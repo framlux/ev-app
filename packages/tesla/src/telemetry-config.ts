@@ -25,7 +25,9 @@
  * today, and the script's is the one a human reads at 2am.
  */
 
-import { TESLA_FIELDS, TIER_INTERVAL_SECONDS, type TeslaField } from './catalogue.js'
+import {
+  TESLA_FIELDS, TIER_INTERVAL_SECONDS, WITHHELD_FIELDS, type TeslaField,
+} from './catalogue.js'
 import type {
   AppliedTelemetryConfig, TelemetryConfigRequest, TelemetryFields,
 } from './fleet-api.js'
@@ -72,7 +74,14 @@ export function buildTelemetryFields(
   catalogue: readonly TeslaField[] = TESLA_FIELDS,
 ): TelemetryFields {
   const fields: TelemetryFields = {}
+  // The one place the catalogue and the pushed config are allowed to differ.
+  // A name the Fleet API does not know is not one missing signal: it 400s the
+  // whole push, so the car keeps its old configuration - none, on a first push.
+  // See `WITHHELD_FIELDS` for why the unit held back is a proto block and not
+  // the single name the error happened to report.
+  const withheld = new Set<string>(WITHHELD_FIELDS.fields)
   for (const entry of catalogue) {
+    if (withheld.has(entry.field)) continue
     fields[entry.field] = {
       interval_seconds: TIER_INTERVAL_SECONDS[entry.tier],
       // Conditional spread rather than an assignment of `undefined`: an

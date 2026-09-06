@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { TESLA_FIELDS, TIER_INTERVAL_SECONDS } from '../src/catalogue.js'
+import { TESLA_FIELDS, TIER_INTERVAL_SECONDS, WITHHELD_FIELDS } from '../src/catalogue.js'
 import type { AppliedTelemetryConfig, TelemetryFields } from '../src/fleet-api.js'
 import {
   TELEMETRY_HOSTNAME,
@@ -17,6 +17,14 @@ const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '
 const emitterPath = path.join(repoRoot, 'scripts', 'telemetry-fields.mjs')
 
 const VIN = '5YJYGDEE0MF000000'
+
+/**
+ * The catalogue minus the names the Fleet API refuses today. Everything that
+ * asserts over "what we push" iterates THIS, not `TESLA_FIELDS`: the two were
+ * the same set until the API rejected `BrickSocMinPercent`, and the difference
+ * between them is now a decision the catalogue records rather than an accident.
+ */
+const PUSHED = TESLA_FIELDS.filter((e) => !WITHHELD_FIELDS.fields.includes(e.field))
 
 /** The captured `fleet_telemetry_config` response §3.6's rule is pinned against. */
 const captured = JSON.parse(readFileSync(
@@ -106,10 +114,10 @@ describe('buildTelemetryConfig', () => {
     expect(buildTelemetryConfig({ vin: VIN, ca: CA }).config.ca).toBe(CA)
   })
 
-  it('asks for every catalogued field at its tier interval, in catalogue order', () => {
+  it('asks for every pushable catalogued field at its tier interval, in catalogue order', () => {
     const fields = buildTelemetryConfig({ vin: VIN, ca: CA }).config.fields
-    expect(Object.keys(fields)).toEqual(TESLA_FIELDS.map((e) => e.field))
-    for (const entry of TESLA_FIELDS) {
+    expect(Object.keys(fields)).toEqual(PUSHED.map((e) => e.field))
+    for (const entry of PUSHED) {
       expect(`${entry.field}=${fields[entry.field]?.interval_seconds}`)
         .toBe(`${entry.field}=${TIER_INTERVAL_SECONDS[entry.tier]}`)
     }
@@ -117,7 +125,7 @@ describe('buildTelemetryConfig', () => {
 
   it('sends minimum_delta exactly where the catalogue sets a delta', () => {
     const fields = buildTelemetryConfig({ vin: VIN, ca: CA }).config.fields
-    for (const entry of TESLA_FIELDS) {
+    for (const entry of PUSHED) {
       expect(`${entry.field}=${fields[entry.field]?.minimum_delta}`)
         .toBe(`${entry.field}=${entry.delta ?? undefined}`)
       expect(`${entry.field}=${'minimum_delta' in (fields[entry.field] ?? {})}`)
@@ -267,5 +275,27 @@ describe('buildTelemetryFields', () => {
   it('is the field-map half of the builder, on its own', () => {
     const fields: TelemetryFields = buildTelemetryFields()
     expect(fields).toEqual(buildTelemetryConfig({ vin: VIN, ca: CA }).config.fields)
+  })
+})
+
+/**
+ * The 400 that started this: `Unknown field BrickSocMinPercent`, and with it no
+ * configuration on the car at all. One name the Fleet API does not know fails
+ * the WHOLE push, so this is not "one signal missing" — it is every signal.
+ */
+describe('fields the Fleet API does not accept yet', () => {
+  it('asks for none of the 1.3.0 block', () => {
+    const asked = Object.keys(buildTelemetryFields())
+    expect(asked.filter((f) => WITHHELD_FIELDS.fields.includes(f))).toEqual([])
+  })
+
+  it('asks for nothing named BrickSocMinPercent', () => {
+    expect(buildTelemetryFields()).not.toHaveProperty('BrickSocMinPercent')
+  })
+
+  it('still asks for everything else the catalogue captures', () => {
+    const withheld = new Set<string>(WITHHELD_FIELDS.fields)
+    expect(Object.keys(buildTelemetryFields()).sort())
+      .toEqual(TESLA_FIELDS.map((e) => e.field).filter((f) => !withheld.has(f)).sort())
   })
 })

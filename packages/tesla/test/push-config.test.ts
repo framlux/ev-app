@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { TESLA_FIELDS, TIER_INTERVAL_SECONDS } from '../src/catalogue.js'
+import { TESLA_FIELDS, TIER_INTERVAL_SECONDS, WITHHELD_FIELDS } from '../src/catalogue.js'
 import { TELEMETRY_HOSTNAME, TELEMETRY_PORT } from '../src/telemetry-config.js'
 
 /**
@@ -92,16 +92,29 @@ describe('the collector the push script sends the car to', () => {
   })
 })
 
+/**
+ * The shim and the web app are ONE producer, so the script stops asking for a
+ * withheld field at the same moment the app does - that is the property worth
+ * pinning here, not the catalogue count. `PUSHED` is the catalogue minus the
+ * names the Fleet API refuses today; see `WITHHELD_FIELDS`.
+ */
+const PUSHED = TESLA_FIELDS.filter((e) => !WITHHELD_FIELDS.fields.includes(e.field))
+
 describe('the field list the push script emits', () => {
-  it('is exactly the catalogue, in catalogue order', () => {
-    expect(Object.keys(emitted())).toEqual(TESLA_FIELDS.map((e) => e.field))
+  it('is exactly the pushable catalogue, in catalogue order', () => {
+    expect(Object.keys(emitted())).toEqual(PUSHED.map((e) => e.field))
+  })
+
+  it('emits none of the fields the Fleet API refuses', () => {
+    const emittedNames = new Set(Object.keys(emitted()))
+    expect(WITHHELD_FIELDS.fields.filter((f) => emittedNames.has(f))).toEqual([])
   })
 
   // The tier is the whole point of tiering: a field silently pushed at the
   // wrong interval is either a cost we did not model (§3.5's budget) or a
   // resolution we think we have and do not.
   it('asks for each field at its tier interval', () => {
-    for (const entry of TESLA_FIELDS) {
+    for (const entry of PUSHED) {
       expect(`${entry.field}=${emitted()[entry.field]?.interval_seconds}`)
         .toBe(`${entry.field}=${TIER_INTERVAL_SECONDS[entry.tier]}`)
     }
@@ -111,14 +124,14 @@ describe('the field list the push script emits', () => {
   // (§3.5), so an omitted one is a cost, and one on a field the catalogue left
   // null is suppression nobody decided on.
   it('sends minimum_delta exactly where the catalogue sets a delta', () => {
-    for (const entry of TESLA_FIELDS) {
+    for (const entry of PUSHED) {
       const has = 'minimum_delta' in (emitted()[entry.field] ?? {})
       expect(`${entry.field}=${has}`).toBe(`${entry.field}=${entry.delta !== null}`)
     }
   })
 
   it('sends the catalogue delta unchanged, in wire units', () => {
-    for (const entry of TESLA_FIELDS.filter((e) => e.delta !== null)) {
+    for (const entry of PUSHED.filter((e) => e.delta !== null)) {
       expect(`${entry.field}=${emitted()[entry.field]?.minimum_delta}`)
         .toBe(`${entry.field}=${entry.delta}`)
     }
