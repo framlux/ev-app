@@ -95,7 +95,11 @@ SELECT … FROM energy_rate WHERE effective_from <= $1
  ORDER BY effective_from DESC, (source = 'manual') DESC LIMIT 1
 ```
 
-A manual override needs no further precedence rule: it is a row like any other, and inserting one with today's date makes it win from today.
+**A manual override suspends the fetch for as long as it stands.** This is a correction to the design, not a detail of it: review reproduced the original rule silently defeating itself. Ordering on the date first means a fetched row does not *tie* with an override typed this morning — it beats it outright the next day, and the "insert only when the value differs" guard can never save it, because an override exists precisely when the operator disagrees with URDB's number. The escape hatch for URDB's lag would have survived until the next tick, or the next pod restart, which fires one immediately. A 41.2 kWh charge would then price at $8.20 against an operator tariff saying $10.30, with nothing logged and the settings page showing the fetched row as in effect.
+
+So §3.3's fetch asks what rate is in force before it asks OpenEI, and declines — without making the call — while that answer is `manual`. Fetching resumes when a human says so, by entering a newer manual row. The worker logs one line a day while an override stands, so a rate that has stopped moving is explicable from the pod log rather than mysterious.
+
+The lookup's ordering is deliberately left alone. A `urdb` row already sitting later on the same day as a manual one still wins the lookup; post-fix nothing can create that state, and making a manual row outrank every later fetched row forever is a decision about how long an override should live, which is the owner's to make and not a defect to fix.
 
 **`price_per_kwh` must be coerced to a number inside `rateAt`**, and the interface must type it `number`. `pg` returns NUMERIC as a string, and this repo installs no `setTypeParser` — the only coercion that exists (`queries.ts:118`) is in the web tier, which the worker never goes through. `energyKwh * rate` would coerce by luck; `rate + x` would concatenate. The test asserts `typeof` explicitly, because `toBeCloseTo` passes on a coerced string and would hide it.
 
@@ -113,6 +117,8 @@ The parser picks the Residential Schedule 7 entry by `label`, then reads `energy
 A fetch inserts a row only when the value differs from the newest existing row, with `effective_from = now()` — URDB's own `startdate` describes when the tariff took effect, but we cannot honestly claim to have known it then, and back-dating would silently re-price sessions already closed at the old rate. Same value, no row.
 
 Runs daily from a **second, coarse** `setInterval` in the worker — *not* the tick at `main.ts:103`, which is the accumulator flush at roughly 1 Hz (`FLUSH_INTERVAL_MS`, `main.ts:38`) and would hammer OpenEI ~86,400 times a day. The new timer is `unref()`d like its neighbour and cleared in `shutdown` beside the existing `clearInterval(timer)`, or SIGTERM will not drain. The worker owns database writes; the web tier makes no outbound HTTP from a request path.
+
+The fetch is also skipped entirely while a manual override is in force (§3.2) — the check is on the rate in force, before the HTTP call, so an override costs no request at all.
 
 Config: `OPENEI_API_KEY` — free from NREL's signup form at `openei.org/services/api/signup`, no cost and no commercial-use restriction. Whatever their published limit is, one call a day is not near it. Absent, the fetch is skipped entirely and manual rows are the whole story — the feature degrades to "type your rate in", which is a working product, not a broken one.
 
@@ -199,7 +205,7 @@ The existing invariant — `costCurrency` null whenever `cost` is null, enforced
 
 `formatCost` already returns an em dash when the currency is missing even with an amount present (`format.test.ts:192`), and a genuine $0.00 must still render (`format.test.ts:201`) — so "never render unpriced as free" branches on `costBasis`, never on treating 0 as missing. The per-kWh formatter sets min/max fraction digits explicitly, or `Intl` rounds $0.199/kWh to $0.20.
 
-A `costSource === 'backfill-estimate'` figure renders with an *estimated* marker and a title saying it was priced at a later rate than it was charged at.
+A `costSource === 'backfill-estimate'` figure renders with an *estimated* marker — an approximation sign before the figure — and a title saying it was priced at a later rate than it was charged at. This applies on **both** surfaces: an estimate on the list rendered as a plain figure would be indistinguishable from a real price at exactly the moment a reader is scanning for one.
 
 ### 3.8 Configuration
 
@@ -218,6 +224,8 @@ No test constrains these names: `env-names.test.ts` greps `apps/web/src` only, a
 ## 4. Settings surface
 
 A rates section on the settings page: the current rate, the history behind it with each row's source and date, and a form to add a manual rate. Reads and one insert — no outbound HTTP, no scheduling. Adding a row is the override; nothing is ever edited or deleted, because a rate someone charged at is a historical fact.
+
+A second manual rate on an instant that already carries one is a **409 naming the date and the price already recorded**, not a silent success. `insertRate` is `ON CONFLICT DO NOTHING` against `UNIQUE (effective_from, source)`, so the original route answered 201 Created with the old price still in the table — a correction that looked accepted and changed nothing. An identical resubmission still answers 201 with the stored row, because that one is genuinely idempotent.
 
 ---
 
