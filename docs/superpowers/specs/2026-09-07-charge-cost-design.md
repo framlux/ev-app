@@ -102,7 +102,7 @@ A fetch inserts a row only when the value differs from the newest existing row, 
 
 Runs from the ingest worker's existing periodic tick (`main.ts:103`), daily. The worker owns database writes; the web tier makes no outbound HTTP from a request path.
 
-Config: `OPENEI_API_KEY`. Absent, the fetch is skipped entirely and manual rows are the whole story — the feature degrades to "type your rate in", which is a working product, not a broken one.
+Config: `OPENEI_API_KEY` — free from NREL's signup form at `openei.org/services/api/signup`, no cost and no commercial-use restriction. Whatever their published limit is, one call a day is not near it. Absent, the fetch is skipped entirely and manual rows are the whole story — the feature degrades to "type your rate in", which is a working product, not a broken one.
 
 ### 3.4 Pricing at close
 
