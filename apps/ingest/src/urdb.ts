@@ -1,4 +1,4 @@
-import { insertRate, listRates, withTransaction, type DbPool } from '@ev/db'
+import { insertRate, rateAt, withTransaction, type DbPool } from '@ev/db'
 
 /**
  * The one outbound HTTP call this system makes on its own initiative.
@@ -53,13 +53,21 @@ export type FetchLike = (url: string) => Promise<ResponseLike>
 /**
  * The two things a fetch does to the rate table.
  *
- * Narrower than the repo layer on purpose: this module may read the newest
- * price and add a row, and there is deliberately no way for it to change or
+ * Narrower than the repo layer on purpose: this module may read the rate in
+ * force and add a row, and there is deliberately no way for it to change or
  * remove one. A rate someone charged at is a historical fact (spec §4), and the
  * seam is where that is enforced rather than remembered.
  */
 export interface RateStore {
-  latestRate(): Promise<{ pricePerKwh: number; currency: string } | null>
+  /**
+   * The rate a charge starting at `at` would be priced by — the same lookup
+   * the pipeline uses, tiebreak and all, rather than "the newest row". The
+   * source comes with it because what this module is allowed to do depends on
+   * who wrote the number it is about to disagree with.
+   */
+  rateInForce(
+    at: Date,
+  ): Promise<{ pricePerKwh: number; currency: string; source: 'urdb' | 'manual' } | null>
   insertRate(r: {
     effectiveFrom: Date
     pricePerKwh: number
@@ -83,6 +91,7 @@ export interface UrdbOptions {
  */
 export type UrdbOutcome =
   | { kind: 'skipped' }
+  | { kind: 'overridden'; pricePerKwh: number }
   | { kind: 'unchanged'; pricePerKwh: number }
   | { kind: 'inserted'; pricePerKwh: number }
 
@@ -118,16 +127,35 @@ export async function refreshEnergyRate(
   const http = opts.fetch ?? ((url: string) => fetch(url))
   const now = opts.now ?? (() => new Date())
 
+  // A manual override in force is a standing instruction, not a stale value, so
+  // the fetch stops here — before the request, since an answer that can only be
+  // discarded is not worth asking a third party for.
+  //
+  // Nothing else can enforce this. The row written below is dated `now()` and
+  // `rateAt` sorts on the date first, so a fetched row does not TIE with an
+  // override typed this morning, it beats it outright; and the price comparison
+  // below can never save it either, because an override exists precisely when
+  // the operator disagrees with URDB's number. Left in, the escape hatch for
+  // URDB's lag (spec §3.2) survived until the next tick — or the next pod
+  // restart, which fires one immediately.
+  //
+  // So the fetch resumes when a human says so, by typing the rate they now want
+  // in as a newer manual row. That is the same shape as everything else here: a
+  // rate is a fact somebody is accountable for, and nothing overwrites one.
+  const inForce = await store.rateInForce(now())
+  if (inForce !== null && inForce.source === 'manual') {
+    return { kind: 'overridden', pricePerKwh: inForce.pricePerKwh }
+  }
+
   const document = await readJson(http, requestUrl(opts.apiKey))
   const { pricePerKwh, label } = parseScheduleRate(document)
 
-  // Compared against the newest row whatever its source, so a value we already
-  // hold costs no row. The comparison is exact rather than approximate: these
-  // are five-decimal figures out of a JSON document and a NUMERIC(10,5) column,
-  // so a tolerance would only be able to hide a genuine change of a hundredth
-  // of a cent — which over a year of charging is a real amount of money.
-  const latest = await store.latestRate()
-  if (latest !== null && latest.pricePerKwh === pricePerKwh) {
+  // Compared against the rate in force, so a value we already hold costs no
+  // row. The comparison is exact rather than approximate: these are
+  // five-decimal figures out of a JSON document and a NUMERIC(10,5) column, so
+  // a tolerance would only be able to hide a genuine change of a hundredth of a
+  // cent — which over a year of charging is a real amount of money.
+  if (inForce !== null && inForce.pricePerKwh === pricePerKwh) {
     return { kind: 'unchanged', pricePerKwh }
   }
 
@@ -174,15 +202,21 @@ export async function runRateRefresh(
  * timer with no message in flight, and holding a connection across an HTTP call
  * to a third party is how a pool of ten becomes a pool of none during someone
  * else's outage. The read and the write are separate transactions for the same
- * reason, and the race that opens — a manual rate inserted between them — is
- * harmless, because `insertRate` does nothing on a conflicting key and a manual
- * row wins `rateAt`'s tiebreak regardless.
+ * reason, and the race that opens — a manual override typed between them —
+ * costs one fetched row dated a moment before the override, which the override
+ * then outranks by date for the rest of its life.
+ *
+ * The read is `rateAt`, not the newest row: "what is in force" is the question
+ * the decision above turns on, and it is the same question the pipeline asks
+ * when it prices a charge. Two answers to it would be one too many.
  */
 export function pgRateStore(pool: DbPool): RateStore {
   return {
-    latestRate: async () => {
-      const [newest] = await withTransaction(pool, (c) => listRates(c, 1))
-      return newest ? { pricePerKwh: newest.pricePerKwh, currency: newest.currency } : null
+    rateInForce: async (at) => {
+      const current = await withTransaction(pool, (c) => rateAt(c, at))
+      return current
+        ? { pricePerKwh: current.pricePerKwh, currency: current.currency, source: current.source }
+        : null
     },
     insertRate: async (r) => {
       await withTransaction(pool, (c) => insertRate(c, r))

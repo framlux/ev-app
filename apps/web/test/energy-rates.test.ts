@@ -225,6 +225,56 @@ describe('POST /api/v1/energy-rates', () => {
 		expect(input['urdbLabel'] ?? null).toBeNull()
 	})
 
+	it('refuses a correction to a date that already carries a manual rate', async () => {
+		// The insert is ON CONFLICT DO NOTHING and the form's date field lands
+		// every entry for a day on the same midnight, so a typo noticed a minute
+		// later collides with the row it meant to replace. Ignoring the null and
+		// reading back through `rateAt` answered 201 Created with the OLD price,
+		// and the page — which treats any ok response as success and reloads —
+		// showed the number the operator had just tried to correct, as though
+		// that were what they typed.
+		insertRate.mockResolvedValue(null)
+		rateAt.mockResolvedValue(
+			row({
+				id: 'already',
+				pricePerKwh: 0.199,
+				currency: 'USD',
+				source: 'manual',
+				effectiveFrom: new Date(VALID.effectiveFrom)
+			})
+		)
+
+		const e = await thrownBy(() => post(VALID))
+		expect(isHttpError(e, 409)).toBe(true)
+		// The sentence has to carry the date and the number that is in the way,
+		// or it is a refusal the operator cannot act on: the page prints it
+		// verbatim and there is no edit and no delete to reach for.
+		const message = (e as { body: { message: string } }).body.message
+		expect(message).toContain('2026-09-07')
+		expect(message).toContain('0.199')
+		expect(message).toMatch(/later date/i)
+	})
+
+	it('answers a repeated submission of the same rate with the row already stored', async () => {
+		// A double-clicked button is not a correction, and refusing it would
+		// teach the operator that the form is broken. Same price, same currency,
+		// same day: nothing to say beyond the row that is there.
+		insertRate.mockResolvedValue(null)
+		rateAt.mockResolvedValue(
+			row({
+				id: 'already',
+				pricePerKwh: 0.2314,
+				currency: 'USD',
+				source: 'manual',
+				effectiveFrom: new Date(VALID.effectiveFrom)
+			})
+		)
+
+		const res = await post(VALID)
+		expect(res.status).toBe(201)
+		expect(await res.json()).toMatchObject({ pricePerKwh: 0.2314, source: 'manual' })
+	})
+
 	it('refuses a price that is not a number', async () => {
 		expect(await refusal({ ...VALID, pricePerKwh: 'cheap' })).toMatch(/price/i)
 	})

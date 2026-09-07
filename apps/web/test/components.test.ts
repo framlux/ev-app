@@ -812,6 +812,27 @@ describe('an unpriced charge reads as unpriced, never as free', () => {
 		assertNoBrokenValues(body)
 	})
 
+	it('marks a backfilled figure on the charges list, where there is no room for words', () => {
+		// The list renders a figure and nothing else, so an invented number was
+		// pixel-identical to a measured one: a year of backfilled history read as
+		// a year of prices someone was actually charged. The marker is what says
+		// otherwise at a glance, and the title is what says it in words.
+		const body = list([
+			chargeRow({
+				id: 'chg-b',
+				cost: 8.2,
+				costCurrency: 'USD',
+				costBasis: 'home',
+				costSource: 'backfill-estimate',
+				costRatePerKwh: 0.199,
+				energyKwh: 41.2
+			})
+		])
+		expect(body).toContain('≈US$8.20')
+		expect(body).toContain('priced at a later rate')
+		assertNoBrokenValues(body)
+	})
+
 	it('the charge page shows a home charge with the arithmetic that produced it', () => {
 		// 41.2 kWh at 19.9c is $8.20, and printing the multiplication under the
 		// figure is the whole reason the rate is stored on the session: a cost
@@ -872,6 +893,10 @@ describe('an unpriced charge reads as unpriced, never as free', () => {
 		})
 		expect(body).toContain('US$8.20')
 		expect(body).toContain('estimated')
+		// The same sentence the list hangs off its marker, so hovering the figure
+		// answers the question in either place rather than only where the hint
+		// happened to fit.
+		expect(body).toContain('priced at a later rate')
 		assertNoBrokenValues(body)
 	})
 })

@@ -18,7 +18,7 @@
 // with it, none of which belongs in a page bundle. This file is pure string
 // handling over the vendored proto's enum names.
 import { teslaEnumLabel } from '@ev/tesla/enum-labels'
-import type { CostBasis } from './api-types.js'
+import type { CostBasis, CostSource } from './api-types.js'
 
 /** The single "not recorded" glyph. Never '0', never 'N/A', never blank. */
 export const DASH = '—'
@@ -227,6 +227,35 @@ export function formatUnpricedCost(
   }
   if (basis === 'pending') return 'Awaiting Tesla invoice'
   return 'Not priced'
+}
+
+/**
+ * What a backfilled figure is, hovered.
+ *
+ * A backfill prices an old charge at the rate in force when the backfill RAN
+ * (spec §5), so for anything older than the last tariff change the number is
+ * arithmetic rather than a record of money. One sentence in one place because
+ * the list and the charge page both have to say it and must not drift: the
+ * list has room for a marker and nothing else, the page has room for words,
+ * and this is what they agree on.
+ */
+export const ESTIMATED_COST_TITLE = 'Estimated: priced at a later rate than it was charged at'
+
+/**
+ * A cost that was estimated rather than measured, marked as one.
+ *
+ * The marker goes on the figure itself because the charges list is a column of
+ * numbers with nowhere to put a caveat — rendered plain, an invented cost is
+ * indistinguishable from one that was actually paid. A dash is left alone:
+ * "≈—" is not an approximation of anything.
+ */
+export function formatEstimatedCost(
+  cost: Maybe,
+  currency: string | null | undefined,
+  source: CostSource | null | undefined,
+): string {
+  const figure = formatCost(cost, currency)
+  return source === 'backfill-estimate' && figure !== DASH ? `≈${figure}` : figure
 }
 
 function unit(formatted: string, suffix: string): string {

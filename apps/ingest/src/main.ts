@@ -203,6 +203,14 @@ function startRateFetch(pool: DbPool, apiKey: string): NodeJS.Timeout {
         if (out.kind === 'inserted') {
           console.log(`energy rate updated from URDB: ${out.pricePerKwh}/kWh`)
         }
+        // One line a day while an override stands, because the alternative is
+        // an operator watching URDB's number move on the news and nothing move
+        // here, with nothing anywhere saying why.
+        if (out.kind === 'overridden') {
+          console.log(
+            `energy rate left alone: a manual override of ${out.pricePerKwh}/kWh is in force`,
+          )
+        }
       },
       onError: (err) => console.error('energy rate fetch failed', err),
     })

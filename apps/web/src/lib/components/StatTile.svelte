@@ -4,13 +4,19 @@
 		/** Already formatted by $lib/format — tiles never round or dash-check. */
 		value: string
 		hint?: string | null
+		/**
+		 * Hovered, for a value that is not what it appears to be — an estimate
+		 * rather than a measurement. Null on every ordinary tile, so a tooltip
+		 * anywhere on this page means something.
+		 */
+		title?: string | null
 		tone?: 'default' | 'accent' | 'charging' | 'driving'
 	}
 
-	let { label, value, hint = null, tone = 'default' }: Props = $props()
+	let { label, value, hint = null, title = null, tone = 'default' }: Props = $props()
 </script>
 
-<div class="tile {tone}">
+<div class="tile {tone}" {title}>
 	<div class="label">{label}</div>
 	<div class="value num">{value}</div>
 	{#if hint}<div class="hint">{hint}</div>{/if}

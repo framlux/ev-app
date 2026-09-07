@@ -3,7 +3,7 @@
 	import {
 		DASH,
 		formatCoords,
-		formatCost,
+		formatEstimatedCost,
 		formatDateTime,
 		formatDuration,
 		formatDistance,
@@ -12,7 +12,8 @@
 		formatPct,
 		formatTime,
 		formatEfficiency,
-		formatUnpricedCost
+		formatUnpricedCost,
+		ESTIMATED_COST_TITLE
 	} from '$lib/format.js'
 
 	interface Props {
@@ -39,6 +40,11 @@
 
 	function place(lat: number | null, lon: number | null): string {
 		return formatCoords(lat, lon)
+	}
+
+	function costTitle(s: SessionListItem): string | null {
+		if (s.cost == null) return formatUnpricedCost(s.costBasis, s.energyKwh)
+		return s.costSource === 'backfill-estimate' ? ESTIMATED_COST_TITLE : null
 	}
 
 	function socRange(s: SessionListItem): string {
@@ -108,15 +114,17 @@
 						<td class="r num hide-sm">{socRange(s)}</td>
 						<td class="r num">{formatKw(s.maxChargePowerKw)}</td>
 						{#if showCost}
-							<!-- The title carries the reason, and only when there is no
-							     figure: a dash on its own is ambiguous between a charge
-							     that was free and one we cannot price, and those are
-							     opposite facts. A priced row gets no title, so hovering
-							     one is never a dead end. -->
-							<td
-								class="r num"
-								title={s.cost == null ? formatUnpricedCost(s.costBasis, s.energyKwh) : null}
-								>{formatCost(s.cost, s.costCurrency)}</td
+							<!-- The title carries the reason, and only when there is
+							     something to say: a dash on its own is ambiguous between a
+							     charge that was free and one we cannot price, and those
+							     are opposite facts. A backfilled figure is the third
+							     thing that needs explaining — it was priced at a later
+							     rate than it was charged at, and the column has room for
+							     the marker but not the sentence. A figure that was
+							     actually paid gets no title, so hovering one is never a
+							     dead end. -->
+							<td class="r num" title={costTitle(s)}
+								>{formatEstimatedCost(s.cost, s.costCurrency, s.costSource)}</td
 							>
 						{/if}
 					{/if}

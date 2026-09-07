@@ -41,8 +41,16 @@ export const POST: RequestHandler = async ({ locals, request }) => {
 	const parsed = parseManualRate(body)
 	if (!parsed.ok) error(400, parsed.message)
 
+	// 409 rather than 400: the body is fine, the day is taken. The insert is ON
+	// CONFLICT DO NOTHING on (effective_from, source) and the form dates a row
+	// at midnight, so a second price for today is a write that cannot land —
+	// and answering 201 with the row already there told the operator their
+	// correction had been saved when the old number was what stayed.
+	const added = await addManualRate(parsed.value)
+	if (!added.ok) error(409, added.message)
+
 	// 201 rather than 200: this created a row, and the row it created is what
 	// comes back, so the page could show it without a reload if it ever stopped
 	// reloading.
-	return json(await addManualRate(parsed.value), { status: 201 })
+	return json(added.rate, { status: 201 })
 }

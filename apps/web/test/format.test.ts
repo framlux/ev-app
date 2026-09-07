@@ -5,6 +5,7 @@ import {
 	cToF,
 	formatCoords,
 	formatCost,
+	formatEstimatedCost,
 	formatDate,
 	formatDateTime,
 	formatDistance,
@@ -206,6 +207,27 @@ describe('formatCost', () => {
 
 	it('survives an unknown ISO code instead of taking the page down', () => {
 		expect(formatCost(3, 'NOTACURRENCY')).toBe('3.00 NOTACURRENCY')
+	})
+})
+
+describe('formatEstimatedCost', () => {
+	it('marks a backfilled figure, which is arithmetic rather than money paid', () => {
+		// The charges list is a column of numbers and nothing else, so without
+		// the marker an estimate computed at today's tariff reads exactly like a
+		// price that was actually charged.
+		expect(formatEstimatedCost(8.2, 'USD', 'backfill-estimate')).toBe('≈US$8.20')
+	})
+
+	it('leaves a measured figure alone whatever priced it', () => {
+		for (const source of ['urdb', 'manual', 'tesla-invoice', null] as const) {
+			expect(formatEstimatedCost(8.2, 'USD', source)).toBe('US$8.20')
+		}
+	})
+
+	it('never approximates a dash', () => {
+		// "≈—" would be a marker on the absence of a figure, which is not an
+		// estimate of anything.
+		expect(formatEstimatedCost(null, null, 'backfill-estimate')).toBe(DASH)
 	})
 })
 

@@ -55,7 +55,14 @@ function ok(text: string) {
  * compares against and the rows it writes.
  */
 class FakeRates implements RateStore {
-  latest: { pricePerKwh: number; currency: string } | null = null
+  /**
+   * The row `rateAt` would return, source and all. The source is not
+   * decoration: a manual row in force is a standing instruction the fetch is
+   * not allowed to write past, so a fake that cannot say which kind of row is
+   * in force cannot express the case that matters most.
+   */
+  inForce: { pricePerKwh: number; currency: string; source: 'urdb' | 'manual' } | null = null
+  readonly asked: Date[] = []
   readonly inserted: {
     effectiveFrom: Date
     pricePerKwh: number
@@ -64,8 +71,11 @@ class FakeRates implements RateStore {
     urdbLabel: string | null
   }[] = []
 
-  async latestRate(): Promise<{ pricePerKwh: number; currency: string } | null> {
-    return this.latest
+  async rateInForce(
+    at: Date,
+  ): Promise<{ pricePerKwh: number; currency: string; source: 'urdb' | 'manual' } | null> {
+    this.asked.push(at)
+    return this.inForce
   }
 
   async insertRate(r: {
@@ -256,7 +266,7 @@ describe('what a fetch writes', () => {
     // per fetch would turn the settings page's rate history into a log and make
     // a genuine rate change impossible to spot in it.
     const rates = new FakeRates()
-    rates.latest = { pricePerKwh: 0.11256, currency: 'USD' }
+    rates.inForce = { pricePerKwh: 0.11256, currency: 'USD', source: 'urdb' }
     const { fetchLike } = ok(body(entry()))
 
     const out = await refreshEnergyRate(rates, { apiKey: KEY, fetch: fetchLike, now: () => NOW })
@@ -267,13 +277,44 @@ describe('what a fetch writes', () => {
 
   it('writes a row when the number moves', async () => {
     const rates = new FakeRates()
-    rates.latest = { pricePerKwh: 0.10412, currency: 'USD' }
+    rates.inForce = { pricePerKwh: 0.10412, currency: 'USD', source: 'urdb' }
     const { fetchLike } = ok(body(entry()))
 
     const out = await refreshEnergyRate(rates, { apiKey: KEY, fetch: fetchLike, now: () => NOW })
 
     expect(out).toMatchObject({ kind: 'inserted', pricePerKwh: 0.11256 })
     expect(rates.inserted).toHaveLength(1)
+  })
+
+  it('leaves a manual override alone, and does not even ask OpenEI', async () => {
+    // The override is the escape hatch for URDB lag (spec §3.2), and it exists
+    // precisely for the days the two numbers disagree — so a fetch that wrote
+    // whenever they disagreed would delete the feature within a day of anyone
+    // using it. The fetch dates its row `now()` and `rateAt` sorts on the date
+    // first, so a written row does not tie with the override, it beats it.
+    // Nothing is fetched either: a request whose answer can only be discarded
+    // is a request to a third party for nothing.
+    const rates = new FakeRates()
+    rates.inForce = { pricePerKwh: 0.31, currency: 'USD', source: 'manual' }
+    const { urls, fetchLike } = ok(body(entry()))
+
+    const out = await refreshEnergyRate(rates, { apiKey: KEY, fetch: fetchLike, now: () => NOW })
+
+    expect(out).toEqual({ kind: 'overridden', pricePerKwh: 0.31 })
+    expect(rates.inserted).toEqual([])
+    expect(urls).toEqual([])
+  })
+
+  it('asks what is in force at the clock it was given, not at the newest row', async () => {
+    // A row dated next month is in the history and is not in force, and the
+    // question this fetch has to answer is "what would a charge cost right
+    // now" — the same question the pricing path asks.
+    const rates = new FakeRates()
+    const { fetchLike } = ok(body(entry()))
+
+    await refreshEnergyRate(rates, { apiKey: KEY, fetch: fetchLike, now: () => NOW })
+
+    expect(rates.asked).toEqual([NOW])
   })
 
   it('writes the first row into an empty table', async () => {

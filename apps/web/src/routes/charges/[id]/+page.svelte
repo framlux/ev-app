@@ -13,7 +13,8 @@
 		formatTime,
 		formatUnpricedCost,
 		formatVolts,
-		hasCoords
+		hasCoords,
+		ESTIMATED_COST_TITLE
 	} from '$lib/format.js'
 	import ChargeCurve from '$lib/components/ChargeCurve.svelte'
 	import Map from '$lib/components/Map.svelte'
@@ -126,6 +127,7 @@
 				formatCost(s.cost, s.costCurrency)
 			:	formatUnpricedCost(s.costBasis, s.energyKwh)}
 			hint={costHint}
+			title={priced && s.costSource === 'backfill-estimate' ? ESTIMATED_COST_TITLE : null}
 		/>
 	</div>
 

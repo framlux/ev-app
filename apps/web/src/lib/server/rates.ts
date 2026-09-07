@@ -63,6 +63,15 @@ export type ParseResult =
 	| { ok: false; message: string }
 
 /**
+ * What an append did. The refusal is a value rather than a throw for the same
+ * reason `parseManualRate`'s is: the route owns the status code, and the
+ * message is the sentence the page puts on screen.
+ */
+export type AddRateResult =
+	| { ok: true; rate: EnergyRateDto }
+	| { ok: false; message: string }
+
+/**
  * Enough history to see the shape of a tariff without pretending to paginate.
  *
  * PSE changes its residential rate once or twice a year and the URDB fetch
@@ -101,10 +110,21 @@ export async function readEnergyRates(): Promise<EnergyRatesResponse> {
  * leaves the wrong price visible next to the charges that were priced by it,
  * where an edit would silently re-price closed history and leave nothing to
  * notice.
+ *
+ * Which makes `insertRate`'s null return the whole substance of this function.
+ * It is ON CONFLICT DO NOTHING on (effective_from, source), the form's date
+ * field puts every entry for a day on the same midnight, and the read-back
+ * below happily returns the row that was already there — so a second, DIFFERENT
+ * price for today used to answer 201 Created describing the first one. The page
+ * reloads on any ok response, so the operator saw the number they had just
+ * tried to correct sitting where they typed the correction.
+ *
+ * A repeat of the SAME price is not that. It is a double-clicked button, and
+ * the honest answer to it is the row that is already there.
  */
-export async function addManualRate(input: ManualRateInput): Promise<EnergyRateDto> {
-	const stored = await withTransaction(getPool(), async (c) => {
-		await insertRate(c, {
+export async function addManualRate(input: ManualRateInput): Promise<AddRateResult> {
+	const { written, stored } = await withTransaction(getPool(), async (c) => {
+		const id = await insertRate(c, {
 			effectiveFrom: input.effectiveFrom,
 			pricePerKwh: input.pricePerKwh,
 			currency: input.currency,
@@ -124,7 +144,7 @@ export async function addManualRate(input: ManualRateInput): Promise<EnergyRateD
 		// just written returns exactly this row (a manual row wins its own tie),
 		// which means the page shows what a charge at that moment would be priced
 		// at rather than what was typed.
-		return await rateAt(c, input.effectiveFrom)
+		return { written: id !== null, stored: await rateAt(c, input.effectiveFrom) }
 	})
 	if (!stored) {
 		// Unreachable short of the row being deleted inside the transaction that
@@ -132,7 +152,29 @@ export async function addManualRate(input: ManualRateInput): Promise<EnergyRateD
 		// describing a rate that is not there.
 		throw new Error('the rate was written but could not be read back')
 	}
-	return toDto(stored)
+	if (!written && !isSameRate(stored, input)) {
+		// The date and the price that is in the way are both in the sentence
+		// because the page prints it verbatim, and there is no edit and no delete
+		// for the operator to reach for once they have read it.
+		return {
+			ok: false,
+			message:
+				`A manual rate of ${stored.pricePerKwh} ${stored.currency} is already recorded for ` +
+				`${day(stored.effectiveFrom)}, and a rate is never edited — it is what the charges ` +
+				'on that day were priced at. Enter the correction against a later date.'
+		}
+	}
+	return { ok: true, rate: toDto(stored) }
+}
+
+/** Same day, same money: a resubmission rather than a correction. */
+function isSameRate(stored: EnergyRate, input: ManualRateInput): boolean {
+	return Number(stored.pricePerKwh) === input.pricePerKwh && stored.currency === input.currency
+}
+
+/** The date as the operator typed it, out of the instant it was stored as. */
+function day(v: Date | string): string {
+	return instant(v).slice(0, 10)
 }
 
 /**
