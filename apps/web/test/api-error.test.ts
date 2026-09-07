@@ -84,7 +84,12 @@ describe('the message shown when an action fails', () => {
 describe('every failed-request path goes through it', () => {
 	const files = [
 		'src/routes/settings/telemetry/+page.svelte',
-		'src/lib/components/PaginatedSessions.svelte'
+		'src/lib/components/PaginatedSessions.svelte',
+		// The energy-rate form posts a rate and shows the refusal verbatim — a
+		// 400 saying which field is wrong is the entire value of that endpoint's
+		// messages, and reading it as JSON would replace all of them with
+		// "request failed (400)".
+		'src/routes/settings/energy/+page.svelte'
 	]
 
 	it('reads failed responses as text, never as JSON', () => {

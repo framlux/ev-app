@@ -34,6 +34,14 @@ const INFORMATION_SCHEMA_TYPE: Record<SqlType, string> = {
  */
 const hasDb = Boolean(process.env['PGHOST'])
 
+/**
+ * The instant every `energy_rate` fixture below is written at. That table has
+ * no vehicle column, so unlike everything else here its rows cannot be scoped
+ * to a test vehicle — they are scoped to one implausible instant instead, so
+ * afterAll can delete exactly what this file wrote and nothing else.
+ */
+const RATE_AT = new Date('2019-05-05T05:05:05.000Z')
+
 if (!hasDb && process.env['CI']) {
   throw new Error(
     'PGHOST is unset in CI: the schema tests must run against a real Postgres. ' +
@@ -78,6 +86,7 @@ describe.skipIf(!hasDb)('migrations', () => {
     // look like the index is broken.
     const p = getPool()
     await p.query("DELETE FROM session WHERE vehicle_id='v1'")
+    await p.query('DELETE FROM energy_rate WHERE effective_from=$1', [RATE_AT])
     await p.query("DELETE FROM vehicle WHERE id='v1'")
     await closePool()
   })
@@ -175,5 +184,93 @@ describe.skipIf(!hasDb)('migrations', () => {
     await expect(
       p.query(`INSERT INTO telemetry_status (vehicle_id) VALUES ('no-such-vehicle')`),
     ).rejects.toThrow(/foreign key/)
+  })
+
+  /**
+   * Spec §3.1's tariff history. Asserted against the applied schema rather than
+   * against 007's text, for the reason at the top of migration-004.test.ts: a
+   * migration is history, and what matters is what came out of it.
+   *
+   * Three things here are load-bearing and none of them fails loudly. The
+   * `gen_random_uuid()` default is used nowhere else in this repo, so nothing
+   * else would notice if `pgcrypto` turned out to be required after all — the
+   * failure would be a NOT NULL violation on the first rate anyone ever saved.
+   * The UNIQUE is on the PAIR so a manual override can sit at the same instant
+   * as the URDB row it contradicts; on `effective_from` alone the override
+   * would be refused, which is the one write it exists to make. And
+   * `price_per_kwh` keeps five decimals because a residential rate is around
+   * $0.199 — at NUMERIC(10,2) the tariff itself rounds to $0.20 before it is
+   * ever multiplied by anything.
+   */
+  it('creates energy_rate, keyed by an instant and a source', async () => {
+    const p = getPool()
+    const { rows } = await p.query<{
+      column_name: string, data_type: string, is_nullable: string,
+    }>(
+      `SELECT column_name, data_type, is_nullable FROM information_schema.columns
+       WHERE table_name = 'energy_rate' ORDER BY ordinal_position`)
+
+    expect(rows.map((r) => `${r.column_name}: ${r.data_type}`)).toEqual([
+      'id: uuid',
+      'effective_from: timestamp with time zone',
+      'price_per_kwh: numeric',
+      'currency: text',
+      'source: text',
+      'urdb_label: text',
+      'fetched_at: timestamp with time zone',
+    ])
+    // Only the URDB label is optional: a rate with no price, no instant or no
+    // provenance is not a rate.
+    expect(rows.filter((r) => r.is_nullable === 'YES').map((r) => r.column_name))
+      .toEqual(['urdb_label'])
+
+    const inserted = await p.query(
+      `INSERT INTO energy_rate (effective_from, price_per_kwh, source)
+       VALUES ($1, 0.19912, 'urdb') RETURNING id, currency, price_per_kwh`,
+      [RATE_AT])
+    // Minted by the database, because neither writer of this table — a daily
+    // fetch and a settings form — has an id in hand at the point it inserts.
+    expect(inserted.rows[0]?.id).toMatch(/^[0-9a-f-]{36}$/)
+    expect(inserted.rows[0]?.currency).toBe('USD')
+    expect(Number(inserted.rows[0]?.price_per_kwh)).toBeCloseTo(0.19912, 5)
+
+    // The override, at the same instant. It must be allowed in, or §3.2's
+    // tiebreak has nothing to break a tie between.
+    await p.query(
+      `INSERT INTO energy_rate (effective_from, price_per_kwh, source)
+       VALUES ($1, 0.31, 'manual')`, [RATE_AT])
+
+    // And the same source twice is the daily fetch finding what it already
+    // knows: refused here so the repository's DO NOTHING has a rule to lean on.
+    await expect(
+      p.query(`INSERT INTO energy_rate (effective_from, price_per_kwh, source)
+               VALUES ($1, 0.22, 'urdb')`, [RATE_AT]),
+    ).rejects.toThrow(/energy_rate_effective_from_source_key/)
+  })
+
+  /**
+   * The three columns §3.4 writes beside the `cost` that 003 created and
+   * nothing ever filled in.
+   *
+   * `SESSION_COLUMNS` in the web tier selects these by name, and a DTO field
+   * whose column is missing reads back `undefined` — which renders as the
+   * string "undefined" rather than raising. This is the test that catches it,
+   * and only this one: the web tier's fake database stub answers happily for
+   * columns that do not exist.
+   */
+  it('gives session the three columns a price needs beside the figure', async () => {
+    const { rows } = await getPool().query<{ column_name: string, data_type: string }>(
+      `SELECT column_name, data_type FROM information_schema.columns
+       WHERE table_name = 'session'
+         AND column_name IN ('cost','cost_currency','cost_rate_per_kwh',
+                             'cost_basis','cost_source')
+       ORDER BY column_name`)
+    expect(rows.map((r) => `${r.column_name}: ${r.data_type}`)).toEqual([
+      'cost: numeric',
+      'cost_basis: text',
+      'cost_currency: text',
+      'cost_rate_per_kwh: numeric',
+      'cost_source: text',
+    ])
   })
 })

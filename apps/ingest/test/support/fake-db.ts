@@ -1,7 +1,8 @@
 import type { RawMessage, SessionKind, SessionSummary, VehicleSample } from '@ev/core'
 import type {
-  BatteryHealthWrite, MeasuredCapacityWrite, Store, StoreRunner,
+  BatteryHealthWrite, MeasuredCapacityWrite, SessionCostWrite, Store, StoreRunner,
 } from '../../src/pipeline.js'
+import type { EnergyPrice } from '../../src/pricing.js'
 
 /**
  * An in-memory stand-in for the Postgres side of the worker.
@@ -17,6 +18,9 @@ import type {
  *    existing one instead.
  *  - `run()` is a transaction: writes are only visible once it resolves, and a
  *    throw rolls everything back.
+ *  - `rateAt` applies `energy_rate`'s real ORDER BY, tiebreak included, so a
+ *    test can seed a manual override beside a URDB row and get the answer
+ *    Postgres would give.
  */
 export interface FakeSession {
   id: string
@@ -25,6 +29,11 @@ export interface FakeSession {
   startedAt: Date
   isOpen: boolean
   summary: SessionSummary | null
+}
+
+/** A seeded row of `energy_rate`. Order does not matter; `rateAt` sorts. */
+export interface FakeRate extends EnergyPrice {
+  effectiveFrom: Date
 }
 
 export interface FakeState {
@@ -36,12 +45,24 @@ export interface FakeState {
   measured: MeasuredCapacityWrite[]
   partitions: string[]
   cursor: Date | null
+  /** Seeded by the test. Nothing in the pipeline writes rates. */
+  rates: FakeRate[]
+  costs: SessionCostWrite[]
+  /**
+   * Every instant `rateAt` was asked about.
+   *
+   * Recorded rather than counted because both halves matter: that the lookup
+   * happens at all only for a charge that could be priced, and that the instant
+   * is the session's own start rather than the wall clock.
+   */
+  rateLookups: Date[]
 }
 
 function emptyState(): FakeState {
   return {
     raw: [], samples: [], sessions: [], points: [],
     battery: [], measured: [], partitions: [], cursor: null,
+    rates: [], costs: [], rateLookups: [],
   }
 }
 
@@ -111,6 +132,27 @@ export class FakeDb implements StoreRunner {
         session.summary = summary
       },
       recordBatteryHealth: async (row) => { s.battery.push(row) },
+      rateAt: async (at) => {
+        s.rateLookups.push(at)
+        // effective_from DESC, then manual before urdb — the tiebreak exists
+        // because a human typing a rate is contradicting the fetch on purpose,
+        // and without it the winner would be whichever row the planner reached
+        // first.
+        const covering = s.rates
+          .filter((r) => r.effectiveFrom.getTime() <= at.getTime())
+          .sort((a, b) =>
+            b.effectiveFrom.getTime() - a.effectiveFrom.getTime() ||
+            Number(b.source === 'manual') - Number(a.source === 'manual'))
+        return covering[0] ?? null
+      },
+      recordSessionCost: async (row) => {
+        // `priceSession` matches on kind='charge' as well as the id, so a price
+        // aimed at a drive changes nothing rather than contradicting the read
+        // API's promise that drives have none.
+        const session = s.sessions.find((x) => x.id === row.sessionId)
+        if (session?.kind !== 'charge') return
+        s.costs.push(row)
+      },
       recordMeasuredCapacity: async (row) => { s.measured.push(row) },
       advanceCursor: async (at) => {
         if (!s.cursor || at.getTime() > s.cursor.getTime()) s.cursor = at

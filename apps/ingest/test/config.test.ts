@@ -51,6 +51,75 @@ describe('loadConfig', () => {
   })
 })
 
+describe('loadConfig: the home location', () => {
+  const AT_HOME = { EV_HOME_LAT: '47.6062', EV_HOME_LON: '-122.3321' }
+
+  it('leaves the coordinate fallback off when neither coordinate is set', () => {
+    // Absent is a working configuration, not a broken one: the car's own
+    // `locatedAtHome` is then the only test, which is the better signal anyway.
+    expect(loadConfig({ ...BASE }).home).toBeNull()
+    expect(loadConfig({ ...BASE }).openEiApiKey).toBeNull()
+  })
+
+  it('accepts a western longitude', () => {
+    // The reason `positiveNumber` cannot be reused. Seattle is at about -122,
+    // and every longitude in the western hemisphere is negative — a validator
+    // that rejects them rejects half the planet.
+    const home = loadConfig({ ...BASE, ...AT_HOME }).home
+    expect(home).toEqual({ lat: 47.6062, lon: -122.3321, radiusKm: 0.1 })
+  })
+
+  it.each(['EV_HOME_LAT', 'EV_HOME_LON'])('refuses %s on its own', (name) => {
+    // Half a coordinate is not a location. Silently ignoring the half that was
+    // set would disable the fallback the operator was trying to switch on, and
+    // the only symptom would be charges classified `unknown` months later.
+    expect(() => loadConfig({ ...BASE, [name]: AT_HOME[name as keyof typeof AT_HOME] }))
+      .toThrow(/EV_HOME_LAT.*EV_HOME_LON|EV_HOME_LON.*EV_HOME_LAT/)
+  })
+
+  it.each([
+    ['EV_HOME_LAT', ''],
+    ['EV_HOME_LAT', '   '],
+    ['EV_HOME_LAT', 'north'],
+    ['EV_HOME_LAT', '91'],
+    ['EV_HOME_LAT', '-91'],
+    ['EV_HOME_LON', ''],
+    ['EV_HOME_LON', '-181'],
+    ['EV_HOME_LON', '181'],
+  ])('%s of %s fails startup', (name, value) => {
+    // Number('') is 0, so an empty value does not disable the fallback — it
+    // moves home to 0°N 0°E, a point in the Gulf of Guinea about 12,000 km from
+    // any real driveway. Every charge would then classify as not-home and be
+    // priced as unknown, and nothing anywhere would say why. Crashing the pod
+    // at startup is the only symptom an operator can act on.
+    expect(() => loadConfig({ ...BASE, ...AT_HOME, [name]: value })).toThrow(new RegExp(name))
+  })
+
+  it('accepts the equator and the prime meridian when they are meant', () => {
+    // The flip side of the rule above: 0 is a legitimate coordinate, so the
+    // check is on the text being present and numeric, never on the value being
+    // truthy.
+    expect(loadConfig({ ...BASE, EV_HOME_LAT: '0', EV_HOME_LON: '0' }).home)
+      .toMatchObject({ lat: 0, lon: 0 })
+  })
+
+  it('takes a wider radius when one is configured, and refuses a broken one', () => {
+    // 100 m by default: a driveway, not a postcode. The radius decides which
+    // charges get the domestic rate, so a garbled value must not quietly become
+    // zero — that would switch the fallback off while looking configured.
+    expect(loadConfig({ ...BASE, ...AT_HOME, EV_HOME_RADIUS_KM: '0.25' }).home?.radiusKm)
+      .toBe(0.25)
+    for (const bad of ['', '0', '-1', 'wide']) {
+      expect(() => loadConfig({ ...BASE, ...AT_HOME, EV_HOME_RADIUS_KM: bad }))
+        .toThrow(/EV_HOME_RADIUS_KM/)
+    }
+  })
+
+  it('carries the OpenEI key through when there is one', () => {
+    expect(loadConfig({ ...BASE, OPENEI_API_KEY: 'k-123' }).openEiApiKey).toBe('k-123')
+  })
+})
+
 /**
  * These live here, not in a metrics test file of their own, because this change
  * owns `config.test.ts` and may not add files: `apps/ingest/test/metrics.test.ts`

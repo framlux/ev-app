@@ -153,11 +153,20 @@ describe.skipIf(!hasDb)('read API against Postgres', () => {
 		// V4: one charge, samples inside it carrying the charger columns, and
 		// two battery days of the kind ingest writes daily — a measurement with
 		// no qualifying charge to estimate from.
+		// c4 also carries a priced home charge, and c5 a Supercharger stop still
+		// waiting on its invoice. Both matter because SESSION_COLUMNS is the
+		// only thing standing between the DTO and a column that does not exist,
+		// and the stub in api.test.ts answers a query with whatever it was
+		// handed rather than with what the SQL asked for.
 		await p.query(
 			`INSERT INTO session (id, vehicle_id, kind, started_at, ended_at, is_open,
-			                      start_soc_pct, end_soc_pct, energy_kwh)
-			 VALUES ('web-test-c4',$1,'charge',$2,$3,false, 20, 80, 30.0)`,
-			[V4, at(0), at(60)]
+			                      start_soc_pct, end_soc_pct, energy_kwh,
+			                      cost, cost_currency, cost_rate_per_kwh, cost_basis, cost_source)
+			 VALUES ('web-test-c4',$1,'charge',$2,$3,false, 20, 80, 30.0,
+			         5.97, 'USD', 0.19900, 'home', 'urdb'),
+			        ('web-test-c5',$1,'charge',$4,$5,false, 20, 45, 18.0,
+			         NULL, NULL, NULL, 'pending', NULL)`,
+			[V4, at(0), at(60), at(120), at(150)]
 		)
 		await p.query(
 			`INSERT INTO sample (vehicle_id, ts, soc_pct, charger_voltage, charger_phases,
@@ -260,10 +269,61 @@ describe.skipIf(!hasDb)('read API against Postgres', () => {
 		expect(open?.isOpen).toBe(true)
 		expect(closed?.durationS).toBe(120 * 60)
 		expect(closed?.efficiencyWhPerKm).toBe(150)
-		// Nothing writes cost yet, but the key exists so the UI can render the
-		// column as absent rather than as a zero cost.
+		// A drive is never priced, and every cost key on it is null rather than
+		// absent, so the charges page can render the column as absent instead
+		// of as a zero cost.
 		expect(closed?.cost).toBeNull()
 		expect(closed?.costCurrency).toBeNull()
+		expect(closed?.costBasis).toBeNull()
+		expect(closed?.costSource).toBeNull()
+		expect(closed?.costRatePerKwh).toBeNull()
+	})
+
+	it('reads every cost column back through both callers of SESSION_COLUMNS', async () => {
+		// The failure this catches is a DTO field whose column was never added
+		// to SESSION_COLUMNS: the row comes back without the key, str() renders
+		// the literal word "undefined" into the page and num() throws. The stub
+		// in api.test.ts cannot see it, and the two callers share one list, so
+		// both are checked here.
+		const listed = (await listSessions(V4, { limit: 50 })).sessions.find(
+			(s) => s.id === 'web-test-c4'
+		)
+		const detail = (await getSessionDetail('web-test-c4')).session
+		for (const priced of [listed, detail]) {
+			expect(priced?.cost).toBe(5.97)
+			expect(priced?.costCurrency).toBe('USD')
+			// NUMERIC(10,5) arrives from pg as the string '0.19900'.
+			expect(priced?.costRatePerKwh).toBe(0.199)
+			expect(priced?.costBasis).toBe('home')
+			expect(priced?.costSource).toBe('urdb')
+		}
+	})
+
+	it('carries the basis of an unpriced charge, which is the whole point of it', async () => {
+		// A pending Supercharger stop has no figure and no currency, and the
+		// basis is the only thing that lets the page say why. Gating it on the
+		// cost the way the other three are gated would blank it here.
+		const { sessions } = await listSessions(V4, { limit: 50 })
+		const pending = sessions.find((s) => s.id === 'web-test-c5')
+		expect(pending?.cost).toBeNull()
+		expect(pending?.costCurrency).toBeNull()
+		expect(pending?.costSource).toBeNull()
+		expect(pending?.costRatePerKwh).toBeNull()
+		expect(pending?.costBasis).toBe('pending')
+	})
+
+	it('leaves no session field undefined, whatever the row holds', async () => {
+		// Exhaustive rather than field-by-field: any future DTO key that gains
+		// no column lands here as undefined, before it reaches a page as the
+		// word "undefined".
+		const { sessions } = await listSessions(V4, { limit: 50 })
+		for (const s of sessions) {
+			for (const [key, value] of Object.entries(s)) {
+				expect(`${key}=${value === undefined ? 'undefined' : 'defined'}`).toBe(
+					`${key}=defined`
+				)
+			}
+		}
 	})
 
 	it('decimates a long series in SQL, keeping the first and last point', async () => {

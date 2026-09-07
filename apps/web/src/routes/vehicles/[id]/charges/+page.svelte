@@ -33,7 +33,7 @@
 		emptyTitle={filtered ? 'No charges in that range' : 'No charges recorded yet'}
 		emptyDetail={filtered
 			? 'Nothing was recorded between those dates. Widen the range, or clear the filter to see everything.'
-			: 'A charge is segmented from the sample stream when the car reports charging. Cost stays blank until tariffs are configured — it is never shown as zero.'}
+			: 'A charge is segmented from the sample stream when the car reports charging. One at home is priced at the energy rate in force when it started; a Supercharger stop waits on Tesla to invoice it. A charge with no figure says which — it is never shown as zero.'}
 	/>
 {/key}
 

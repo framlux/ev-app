@@ -846,7 +846,10 @@ describe('session mapping', () => {
 		end_lat: null,
 		end_lon: null,
 		cost: null,
-		cost_currency: null
+		cost_currency: null,
+		cost_rate_per_kwh: null,
+		cost_basis: null,
+		cost_source: null
 	}
 
 	it('reports a null duration for an open session rather than measuring to now', async () => {
@@ -879,6 +882,67 @@ describe('session mapping', () => {
 		expect(res.sessions[0]?.cost).toBe(12.34)
 		expect(res.sessions[0]?.costCurrency).toBe('GBP')
 	})
+
+	it('never reports a source or a rate without an amount either', async () => {
+		// Same reason as the currency: a rate and a provenance hanging off a
+		// row with no figure describe arithmetic that never happened, and the
+		// charge page would render "$0.199/kWh" under a tile showing no cost.
+		const orphaned: Row = {
+			...OPEN_DRIVE,
+			cost: null,
+			cost_source: 'urdb',
+			cost_rate_per_kwh: '0.19900'
+		}
+		const res = await listSessions('v1', { limit: 50 }, fakeDb([[/FROM session/, [orphaned]]]))
+		expect(res.sessions[0]?.costSource).toBeNull()
+		expect(res.sessions[0]?.costRatePerKwh).toBeNull()
+	})
+
+	it('keeps the basis when there is no cost, because it is what the page shows instead', async () => {
+		// The one field of the four that must NOT be gated on `cost`. Gating all
+		// four together is a two-character change that still passes every other
+		// assertion in this file, and it silently makes every unpriced state
+		// unreachable: a Supercharger stop awaiting its invoice and a charge we
+		// could not place both collapse into a blank cell meaning nothing.
+		for (const basis of ['home', 'pending', 'unknown'] as const) {
+			const row: Row = { ...OPEN_DRIVE, kind: 'charge', cost: null, cost_basis: basis }
+			const res = await listSessions('v1', { limit: 50 }, fakeDb([[/FROM session/, [row]]]))
+			expect(res.sessions[0]?.costBasis).toBe(basis)
+			expect(res.sessions[0]?.cost).toBeNull()
+		}
+	})
+
+	it('reads the rate back as a number at the precision the column stores', async () => {
+		// NUMERIC arrives as a string, and a rate that stayed a string would
+		// concatenate the moment anything multiplied it out.
+		const priced: Row = {
+			...OPEN_DRIVE,
+			kind: 'charge',
+			cost: '8.20',
+			cost_currency: 'USD',
+			cost_rate_per_kwh: '0.19900',
+			cost_basis: 'home',
+			cost_source: 'urdb'
+		}
+		const res = await listSessions('v1', { limit: 50 }, fakeDb([[/FROM session/, [priced]]]))
+		expect(res.sessions[0]?.costRatePerKwh).toBe(0.199)
+		expect(res.sessions[0]?.costBasis).toBe('home')
+		expect(res.sessions[0]?.costSource).toBe('urdb')
+	})
+
+	it('asks for every cost column the DTO promises', async () => {
+		// listSessions and getSessionDetail share one column list, so a field
+		// added to the DTO without its column reads back undefined from the row
+		// -- which str() renders as the literal word "undefined" and num()
+		// throws on. Only api-db.test.ts sees that; the stub here answers
+		// whatever it is asked for, so this asserts the SQL text instead.
+		const db = fakeDb([])
+		await listSessions('v1', { limit: 50 }, db)
+		const sql = db.calls[0]?.sql ?? ''
+		for (const column of ['cost', 'cost_currency', 'cost_rate_per_kwh', 'cost_basis', 'cost_source']) {
+			expect(sql).toMatch(new RegExp(`\\b${column}\\b`))
+		}
+	})
 })
 
 describe('session pagination', () => {
@@ -904,7 +968,10 @@ describe('session pagination', () => {
 			end_lat: null,
 			end_lon: null,
 			cost: null,
-			cost_currency: null
+			cost_currency: null,
+			cost_rate_per_kwh: null,
+			cost_basis: null,
+			cost_source: null
 		}
 	}
 
@@ -987,7 +1054,10 @@ describe('session detail', () => {
 		end_lat: null,
 		end_lon: null,
 		cost: null,
-		cost_currency: null
+		cost_currency: null,
+		cost_rate_per_kwh: null,
+		cost_basis: null,
+		cost_source: null
 	}
 
 	const CHARGE: Row = { ...SESSION, kind: 'charge' }

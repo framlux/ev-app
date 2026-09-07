@@ -18,6 +18,14 @@ const VIN = '5YJ3E1EA1JF000001'
 /** 40 mph. The segmenter's moving threshold is 1 kph and Tesla streams mph. */
 const MOVING = 40
 const t = (iso: string) => new Date(iso)
+/** The driveway, 100 m across. Seattle, hence the negative longitude. */
+const HOME = { lat: 47.6062, lon: -122.3321, radiusKm: 0.1 }
+const OLD_RATE = {
+  id: 'r-old', effectiveFrom: t('2026-01-01T00:00:00.000Z'), pricePerKwh: 0.1,
+  currency: 'USD', source: 'urdb' as const, urdbLabel: 'PSE Schedule 7',
+  fetchedAt: t('2026-01-01T00:00:00.000Z'),
+}
+const NEW_RATE = { ...OLD_RATE, id: 'r-new', effectiveFrom: t('2026-09-05T00:00:00.000Z'), pricePerKwh: 0.2 }
 
 /**
  * One fleet-telemetry MQTT message: ONE FIELD of one vehicle, the value alone,
@@ -593,6 +601,169 @@ describe('Pipeline.recoverOpenSession', () => {
 
     expect(openSessions(db)).toHaveLength(0)
     expect(db.state.sessions[0]?.summary?.endOdometerKm).toBe(1010)
+  })
+
+  it('re-prices a recovered charge at the rate its own start was under', async () => {
+    // `finish()` has two callers, so a session the worker recovers after a
+    // crash is priced here rather than on the sample path. That is correct
+    // rather than merely tolerated, and it is worth pinning: the lookup is by
+    // the session's own start, not by now, so a crash that straddles a rate
+    // change cannot make last week's charge cost this week's money. A
+    // `rateAt(new Date())` would pass every other test in this file.
+    const db = new FakeDb()
+    db.state.rates = [OLD_RATE, NEW_RATE]
+    const pipeline = new Pipeline(db, OPTS, HOME)
+    db.state.sessions.push({
+      id: 's-old', vehicleId: 'veh-1', kind: 'charge',
+      startedAt: t('2026-09-04T20:00:00.000Z'), isOpen: true, summary: null,
+    })
+
+    await pipeline.recoverOpenSession('s-old', 'charge', [
+      makeSample({ vehicleId: 'veh-1', ts: t('2026-09-04T20:00:00.000Z'),
+        chargeState: 'charging', chargeEnergyAddedKwh: 0, locatedAtHome: true }),
+      makeSample({ vehicleId: 'veh-1', ts: t('2026-09-04T20:45:00.000Z'),
+        chargeState: 'charging', chargeEnergyAddedKwh: 20, locatedAtHome: true }),
+      makeSample({ vehicleId: 'veh-1', ts: t('2026-09-04T20:50:00.000Z'),
+        chargeState: 'disconnected' }),
+    ])
+
+    expect(openSessions(db)).toHaveLength(0)
+    // Looked up at 20:00 on the 4th, so the 5th's increase never applies:
+    // 20 kWh x $0.10, not x $0.20.
+    expect(db.state.rateLookups).toEqual([t('2026-09-04T20:00:00.000Z')])
+    expect(db.state.costs).toEqual([{
+      sessionId: 's-old', cost: 2, costCurrency: 'USD', costRatePerKwh: 0.1,
+      costBasis: 'home', costSource: 'urdb',
+    }])
+  })
+})
+
+describe('Pipeline: pricing a charge as it closes', () => {
+  /** A charge from 30% to 60%, ending disconnected, with `over` on every burst. */
+  async function chargeAt(
+    pipeline: Pipeline, over: Record<string, unknown> = {},
+  ): Promise<void> {
+    await burst(pipeline, '2026-09-04T20:00:00.000Z', {
+      DetailedChargeState: 'DetailedChargeStateCharging',
+      Soc: 30, ACChargingPower: 7.4, ACChargingEnergyIn: 0, ...over,
+    })
+    await burst(pipeline, '2026-09-04T20:45:00.000Z', {
+      DetailedChargeState: 'DetailedChargeStateCharging',
+      Soc: 60, ACChargingPower: 7.4, ACChargingEnergyIn: 25, ...over,
+    })
+    await burst(pipeline, '2026-09-04T20:50:00.000Z', {
+      DetailedChargeState: 'DetailedChargeStateDisconnected', Soc: 60,
+    })
+    await pipeline.flush(t('2026-09-04T20:50:05.000Z'))
+  }
+
+  it('prices a charge at home from the rate in force when it started', async () => {
+    const db = new FakeDb()
+    db.state.rates = [OLD_RATE, NEW_RATE]
+    const pipeline = new Pipeline(db, OPTS, HOME)
+
+    await chargeAt(pipeline, { LocatedAtHome: true })
+
+    // 25 kWh x $0.10. The rate is stored beside the figure, so the charge page
+    // can print the arithmetic and a later PSE increase cannot re-price history.
+    expect(db.state.costs).toEqual([{
+      sessionId: 's1', cost: 2.5, costCurrency: 'USD', costRatePerKwh: 0.1,
+      costBasis: 'home', costSource: 'urdb',
+    }])
+  })
+
+  it('leaves a charge unpriced, but still at home, when no rate covers it', async () => {
+    const db = new FakeDb()
+    db.state.rates = [NEW_RATE]
+    const pipeline = new Pipeline(db, OPTS, HOME)
+
+    await chargeAt(pipeline, { LocatedAtHome: true })
+
+    // The charge predates every row in `energy_rate`. Reaching for the newest
+    // one would price a year of charging at today's money and call it a
+    // measurement; the basis survives so the page can say "no rate for this
+    // date" rather than showing a blank that reads as free.
+    expect(db.state.costs).toEqual([{
+      sessionId: 's1', cost: null, costCurrency: null, costRatePerKwh: null,
+      costBasis: 'home', costSource: null,
+    }])
+  })
+
+  it('files a Supercharger stop as pending without looking a rate up', async () => {
+    const db = new FakeDb()
+    db.state.rates = [OLD_RATE]
+    const pipeline = new Pipeline(db, OPTS, HOME)
+
+    await chargeAt(pipeline, { FastChargerPresent: true })
+
+    expect(db.state.costs).toEqual([{
+      sessionId: 's1', cost: null, costCurrency: null, costRatePerKwh: null,
+      costBasis: 'pending', costSource: null,
+    }])
+    // The domestic rate has nothing to say about a Supercharger, and `rateAt`
+    // is a SELECT inside the message transaction — the one read through a seam
+    // that is otherwise write-only. It runs only when it can change an answer.
+    expect(db.state.rateLookups).toEqual([])
+  })
+
+  it('files an unidentifiable charger as unknown, never as free', async () => {
+    const db = new FakeDb()
+    db.state.rates = [OLD_RATE]
+    const pipeline = new Pipeline(db, OPTS, HOME)
+
+    await chargeAt(pipeline)
+
+    expect(db.state.costs[0]?.costBasis).toBe('unknown')
+    expect(db.state.costs[0]?.cost).toBeNull()
+  })
+
+  it('prices a charge and records its battery health in the same close', async () => {
+    // Both hang off `kind === 'charge'`, and the battery block used to own the
+    // early return that guard sits on. Appending pricing after it would have
+    // put every price behind an unconditional `return` — and, worse, a charge
+    // too narrow for a capacity estimate returns early from that block too, so
+    // the failure would only show on some sessions.
+    const db = new FakeDb()
+    db.state.rates = [OLD_RATE]
+    const pipeline = new Pipeline(db, OPTS, HOME)
+
+    await chargeAt(pipeline, { LocatedAtHome: true })
+
+    expect(db.state.battery).toHaveLength(1)
+    expect(db.state.costs).toHaveLength(1)
+  })
+
+  it('never prices a drive', async () => {
+    // `cost_basis` is null on drives and idles, and the read API promises it.
+    // A price on a drive would be derived from a nameplate capacity rather than
+    // from a meter — an invented number wearing a measured one's clothes.
+    const db = new FakeDb()
+    db.state.rates = [OLD_RATE]
+    const pipeline = new Pipeline(db, OPTS, HOME)
+
+    await burst(pipeline, '2026-09-04T09:00:00.000Z',
+      { VehicleSpeed: MOVING, Location: { latitude: 47.6062, longitude: -122.3321 }, Soc: 80 })
+    await burst(pipeline, '2026-09-04T09:20:00.000Z', { VehicleSpeed: 0, Soc: 74 })
+    await burst(pipeline, '2026-09-04T09:30:00.000Z', { VehicleSpeed: 0, Soc: 74 })
+    await pipeline.flush(t('2026-09-04T09:30:05.000Z'))
+
+    expect(db.state.sessions[0]?.kind).toBe('drive')
+    expect(db.state.costs).toEqual([])
+    expect(db.state.rateLookups).toEqual([])
+  })
+
+  it('places a charge at home by coordinate when the car never says so', async () => {
+    // Old sessions predate the `locatedAtHome` field, and a car that has not
+    // pushed the hourly `static` tier yet reports nothing either. The start
+    // coordinate is the fallback, and without a configured home there is none.
+    const db = new FakeDb()
+    db.state.rates = [OLD_RATE]
+    const pipeline = new Pipeline(db, OPTS, HOME)
+
+    await chargeAt(pipeline, { Location: { latitude: 47.60665, longitude: -122.3321 } })
+
+    expect(db.state.costs[0]?.costBasis).toBe('home')
+    expect(db.state.costs[0]?.cost).toBeCloseTo(2.5, 5)
   })
 })
 

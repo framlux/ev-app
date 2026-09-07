@@ -10,8 +10,10 @@ import { insertRaw, streamRaw } from '../src/repo/raw.js'
 import { ensurePartitions, insertSample, upsertSample } from '../src/repo/samples.js'
 import { ensureVehicle, findVehicleIdByVendorId } from '../src/repo/vehicles.js'
 import {
-  appendPoint, closeSession, deleteDerived, findOpenSession, openSession,
+  appendPoint, closeSession, deleteDerived, findOpenSession, giveUpPendingCharges,
+  hasPendingCharges, openSession, pendingChargesSince, priceSession,
 } from '../src/repo/sessions.js'
+import { insertRate, listRates, rateAt } from '../src/repo/energy-rate.js'
 import { recordMeasuredCapacity, upsertBatteryHealth } from '../src/repo/battery.js'
 import { advanceCursor, readCursor } from '../src/repo/cursor.js'
 import { notifyVehicleChanged, VEHICLE_CHANGED_CHANNEL } from '../src/repo/notify.js'
@@ -65,6 +67,21 @@ const VEHICLE = 'repo-test-v1'
  */
 const VEHICLE_UNCHECKED = 'repo-test-v2'
 const TS = new Date('2026-09-04T10:00:00.000Z')
+
+/**
+ * The window every rate fixture lives in, and the reason it is 2020 rather
+ * than a date near the rest of this file.
+ *
+ * `energy_rate` has no vehicle column, so unlike every other table here these
+ * rows cannot be scoped to a test vehicle — they are scoped to a decade
+ * instead. Confining them to a window nothing real could occupy does two jobs:
+ * afterAll can delete exactly what this file wrote, and "no rate covers this
+ * moment" stays a true statement about a database that may also hold genuine
+ * rates, since `rateAt` only ever considers rows at or before the instant asked
+ * about.
+ */
+const RATE_WINDOW_FROM = new Date('2020-01-01T00:00:00.000Z')
+const RATE_WINDOW_TO = new Date('2021-01-01T00:00:00.000Z')
 
 const summary = (over: Partial<SessionSummary> = {}): SessionSummary => ({
   startedAt: TS, endedAt: new Date(TS.getTime() + 60_000),
@@ -125,6 +142,11 @@ describe.skipIf(!hasDb)('repositories', () => {
     await p.query('DELETE FROM raw_message WHERE vehicle_id=$1', [VEHICLE])
     await p.query('DELETE FROM battery_health_sample WHERE vehicle_id=$1', [VEHICLE])
     await p.query('DELETE FROM ingest_cursor WHERE source=$1', ['repo-test'])
+    // The rate fixtures are not vehicle-scoped, so they are deleted by the
+    // window they were deliberately confined to. See RATE_WINDOW below.
+    await p.query(
+      'DELETE FROM energy_rate WHERE effective_from >= $1 AND effective_from < $2',
+      [RATE_WINDOW_FROM, RATE_WINDOW_TO])
     await p.query('DELETE FROM telemetry_status WHERE vehicle_id = ANY($1)',
       [[VEHICLE, VEHICLE_UNCHECKED]])
     await p.query('DELETE FROM vehicle WHERE id = ANY($1)', [[VEHICLE, VEHICLE_UNCHECKED]])
@@ -634,6 +656,253 @@ describe.skipIf(!hasDb)('repositories', () => {
       const id = await withTransaction(getPool(), (c) =>
         findVehicleIdByVendorId(c, 'rivian', 'VIN-REPO'))
       expect(id).toBeNull()
+    })
+  })
+
+  /**
+   * Spec §3.2. A rate is looked up by the instant a charge STARTED, so the
+   * boundary behaviour of this one query is what decides whether a charge is
+   * priced at the tariff it was actually taken under. Every case below is
+   * silent when it goes wrong: the wrong rate and the right rate are both
+   * plausible numbers on a page.
+   */
+  describe('the rate in force at an instant', () => {
+    const JAN = new Date('2020-01-01T00:00:00.000Z')
+    const JUN = new Date('2020-06-01T00:00:00.000Z')
+    const SEP = new Date('2020-09-01T00:00:00.000Z')
+
+    beforeAll(async () => {
+      await withTransaction(getPool(), async (c) => {
+        await insertRate(c, {
+          effectiveFrom: JAN, pricePerKwh: 0.11, currency: 'USD',
+          source: 'urdb', urdbLabel: 'Schedule 7 (2020)',
+        })
+        await insertRate(c, {
+          effectiveFrom: JUN, pricePerKwh: 0.199, currency: 'USD',
+          source: 'urdb', urdbLabel: 'Schedule 7 (2020 rev)',
+        })
+      })
+    })
+
+    it('returns the rate that started exactly at the instant asked about', async () => {
+      // A charge beginning on the stroke of a rate change is priced at the NEW
+      // rate: `effective_from` is when the price starts applying, so a strict
+      // `<` here would price that charge at a tariff that had just ended.
+      const r = await withTransaction(getPool(), (c) => rateAt(c, JUN))
+      expect(r?.pricePerKwh).toBeCloseTo(0.199, 5)
+      expect(r?.urdbLabel).toBe('Schedule 7 (2020 rev)')
+    })
+
+    it('holds the earlier rate right up to the instant the next one starts', async () => {
+      const r = await withTransaction(getPool(), (c) =>
+        rateAt(c, new Date(JUN.getTime() - 1)))
+      expect(r?.pricePerKwh).toBeCloseTo(0.11, 5)
+    })
+
+    it('returns null before every rate rather than the oldest one', async () => {
+      // The case that matters most, because falling back to the oldest row
+      // would look like it worked. A charge older than our first price is
+      // unpriced and says so; pricing it at a rate from years later is what §5's
+      // backfill does DELIBERATELY, marked as an estimate. Doing it here would
+      // do the same thing silently and label the result a measurement.
+      const r = await withTransaction(getPool(), (c) =>
+        rateAt(c, new Date('2019-12-31T23:59:59.999Z')))
+      expect(r).toBeNull()
+    })
+
+    it('gives the price back as a number, not as the string pg returns', async () => {
+      // NUMERIC arrives from node-postgres as a STRING — it will not risk a
+      // double — and this package installs no setTypeParser. `toBeCloseTo`
+      // passes happily on '0.19900', so it would report green while
+      // `rate + fee` concatenated and `rate.toFixed(2)` threw somewhere in the
+      // worker. The typeof is the assertion; the arithmetic below is what the
+      // caller actually does with it.
+      const r = await withTransaction(getPool(), (c) => rateAt(c, JUN))
+      expect(typeof r?.pricePerKwh).toBe('number')
+      expect((r?.pricePerKwh ?? 0) + 0.001).toBeCloseTo(0.2, 5)
+    })
+
+    it('prefers the rate a human typed when two share an instant', async () => {
+      // The override, and the only reason the UNIQUE is on the PAIR: a manual
+      // row is allowed to sit exactly where the URDB row it contradicts sits.
+      // With only `effective_from DESC` the winner would be whichever row the
+      // planner reached first, which is to say the override would work until
+      // the day it quietly did not.
+      await withTransaction(getPool(), async (c) => {
+        await insertRate(c, {
+          effectiveFrom: SEP, pricePerKwh: 0.25, currency: 'USD',
+          source: 'urdb', urdbLabel: 'Schedule 7 (stale)',
+        })
+        await insertRate(c, {
+          effectiveFrom: SEP, pricePerKwh: 0.31, currency: 'USD',
+          source: 'manual', urdbLabel: null,
+        })
+      })
+      const r = await withTransaction(getPool(), (c) => rateAt(c, SEP))
+      expect(r?.source).toBe('manual')
+      expect(r?.pricePerKwh).toBeCloseTo(0.31, 5)
+    })
+
+    it('records a repeated fetch of the same rate once', async () => {
+      // §3.3's fetch runs daily and finds the same answer nearly every time. It
+      // reports the duplicate by returning null rather than raising, because a
+      // throw on the ordinary case would turn a working timer into a log full
+      // of errors.
+      const again = await withTransaction(getPool(), (c) => insertRate(c, {
+        effectiveFrom: JAN, pricePerKwh: 0.11, currency: 'USD',
+        source: 'urdb', urdbLabel: 'Schedule 7 (2020)',
+      }))
+      expect(again).toBeNull()
+
+      const { rows } = await getPool().query(
+        'SELECT count(*)::int AS n FROM energy_rate WHERE effective_from=$1', [JAN])
+      expect(rows[0]?.n).toBe(1)
+    })
+
+    it('lists the history newest first, with the override above what it corrects', async () => {
+      const all = await withTransaction(getPool(), (c) => listRates(c, 10))
+      const mine = all.filter((r) => r.effectiveFrom >= RATE_WINDOW_FROM
+        && r.effectiveFrom < RATE_WINDOW_TO)
+      // The settings page reads this to say what is being paid and what was
+      // paid before, so it has to agree with rateAt about which row is current
+      // — a list that put the corrected URDB row on top would contradict the
+      // figure on every charge below it.
+      expect(mine.map((r) => `${r.source}:${r.pricePerKwh}`)).toEqual([
+        'manual:0.31', 'urdb:0.25', 'urdb:0.199', 'urdb:0.11',
+      ])
+    })
+  })
+
+  /**
+   * Spec §3.4 and §3.5. A price is written by a different writer from the one
+   * that closes a session, and read back by a page that renders the basis when
+   * there is no figure — so the two things worth proving against a real
+   * Postgres are that all five fields survive the round trip, and that the
+   * pending states this table now carries can be found and abandoned.
+   */
+  describe('pricing a charge', () => {
+    const PRICED = 'repo-test-priced'
+    const PENDING_OLD = 'repo-test-pending-old'
+    const PENDING_NEW = 'repo-test-pending-new'
+    const ENDED = new Date('2026-08-01T12:00:00.000Z')
+
+    /** A closed charge, inserted directly so it cannot collide with the
+     *  one-open-session index the tests above are exercising. */
+    const charge = async (id: string, endedAt: Date, basis: string | null) => {
+      await getPool().query(
+        `INSERT INTO session (id, vehicle_id, kind, started_at, ended_at,
+                              energy_kwh, is_open, cost_basis)
+         VALUES ($1,$2,'charge',$3,$4,41.2,false,$5)`,
+        [id, VEHICLE, new Date(endedAt.getTime() - 3_600_000), endedAt, basis])
+    }
+
+    it('round-trips a home price and leaves the summary alone', async () => {
+      await charge(PRICED, ENDED, null)
+      await withTransaction(getPool(), (c) => priceSession(c, PRICED, {
+        cost: 8.2, costCurrency: 'USD', costRatePerKwh: 0.199,
+        costBasis: 'home', costSource: 'urdb',
+      }))
+
+      const { rows } = await getPool().query(
+        `SELECT cost, cost_currency, cost_rate_per_kwh, cost_basis, cost_source,
+                energy_kwh
+           FROM session WHERE id=$1`, [PRICED])
+      expect(rows).toHaveLength(1)
+      // NUMERIC again, on the way out this time: the web tier coerces these,
+      // so the assertion is on the value rather than the type.
+      expect(Number(rows[0]?.cost)).toBeCloseTo(8.2, 2)
+      expect(rows[0]?.cost_currency).toBe('USD')
+      expect(Number(rows[0]?.cost_rate_per_kwh)).toBeCloseTo(0.199, 5)
+      expect(rows[0]?.cost_basis).toBe('home')
+      expect(rows[0]?.cost_source).toBe('urdb')
+      // The price is a separate write from the summary for exactly this
+      // reason: closing a session and pricing it must not be able to overwrite
+      // each other's columns.
+      expect(rows[0]?.energy_kwh).toBeCloseTo(41.2, 3)
+    })
+
+    it('keeps a basis on a charge it has no figure for', async () => {
+      // The asymmetry §3.7 depends on. `cost_basis` is what the page renders
+      // INSTEAD of a number, so gating it on the cost the way `cost_currency`
+      // is gated would make every unpriced state unreachable — and every test
+      // that only looks at priced rows would still pass.
+      await withTransaction(getPool(), (c) => priceSession(c, PRICED, {
+        cost: null, costCurrency: null, costRatePerKwh: null,
+        costBasis: 'home', costSource: null,
+      }))
+      const { rows } = await getPool().query(
+        'SELECT cost, cost_basis FROM session WHERE id=$1', [PRICED])
+      expect(rows[0]?.cost).toBeNull()
+      expect(rows[0]?.cost_basis).toBe('home')
+    })
+
+    it('refuses to price a session that is not a charge', async () => {
+      // Only charges get a cost. A drive that acquired one would render a Cost
+      // column on a page whose contract says the key is always null there.
+      const drive = 'repo-test-priced-drive'
+      await getPool().query(
+        `INSERT INTO session (id, vehicle_id, kind, started_at, ended_at, is_open)
+         VALUES ($1,$2,'drive',$3,$4,false)`, [drive, VEHICLE, ENDED, ENDED])
+      await withTransaction(getPool(), (c) => priceSession(c, drive, {
+        cost: 8.2, costCurrency: 'USD', costRatePerKwh: 0.199,
+        costBasis: 'home', costSource: 'urdb',
+      }))
+      const { rows } = await getPool().query(
+        'SELECT cost, cost_basis FROM session WHERE id=$1', [drive])
+      expect(rows[0]?.cost).toBeNull()
+      expect(rows[0]?.cost_basis).toBeNull()
+    })
+
+    it('finds the charges awaiting an invoice, oldest first', async () => {
+      // The gate that makes a quiet month free (§3.5) reads EXISTS before
+      // anything reaches Tesla, and the list that follows it drives ONE request
+      // window rather than one request per session — hence oldest first.
+      await charge(PENDING_OLD, new Date('2026-06-01T12:00:00.000Z'), 'pending')
+      await charge(PENDING_NEW, new Date('2026-07-15T12:00:00.000Z'), 'pending')
+
+      expect(await withTransaction(getPool(), (c) => hasPendingCharges(c))).toBe(true)
+      const pending = await withTransaction(getPool(), (c) =>
+        pendingChargesSince(c, new Date('2026-01-01T00:00:00.000Z')))
+      expect(pending.map((p) => p.id)).toEqual([PENDING_OLD, PENDING_NEW])
+      expect(pending[0]?.vehicleId).toBe(VEHICLE)
+      expect(pending[0]?.energyKwh).toBeCloseTo(41.2, 3)
+
+      // A floor that excludes everything is not an error: it is what stops a
+      // run asking Tesla for a window wider than the give-up horizon.
+      const recent = await withTransaction(getPool(), (c) =>
+        pendingChargesSince(c, new Date('2026-07-01T00:00:00.000Z')))
+      expect(recent.map((p) => p.id)).toEqual([PENDING_NEW])
+    })
+
+    it('gives up on a charge 45 days after it ended, but not at 44', async () => {
+      // 45 days is the horizon in §3.5: free Supercharging, a stop billed to
+      // another account, and a record Tesla never publishes all look identical
+      // from here, and without this they would widen the request window
+      // forever. The boundary is asserted from BOTH sides because an
+      // off-by-one-day here is invisible — it just means a session is retried
+      // one more time, or given up on one day early.
+      const day = 86_400_000
+      // Chosen so the horizon lands BEFORE the two pending charges the test
+      // above left behind: a `now` that swept them up as well would make the
+      // count agree with a query that had lost its `ended_at` bound entirely.
+      const now = new Date('2026-07-10T00:00:00.000Z')
+      const at45 = 'repo-test-giveup-45'
+      const at44 = 'repo-test-giveup-44'
+      await charge(at45, new Date(now.getTime() - 45 * day), 'pending')
+      await charge(at44, new Date(now.getTime() - 44 * day), 'pending')
+
+      const flipped = await withTransaction(getPool(), (c) =>
+        giveUpPendingCharges(c, new Date(now.getTime() - 45 * day)))
+      expect(flipped).toBe(1)
+
+      const { rows } = await getPool().query(
+        'SELECT id, cost_basis, cost FROM session WHERE id = ANY($1) ORDER BY id',
+        [[at44, at45]])
+      expect(rows.map((r: { id: string, cost_basis: string }) =>
+        `${r.id}=${r.cost_basis}`)).toEqual([`${at44}=pending`, `${at45}=unknown`])
+      // Unknown, not zero. "We never found out" and "it was free" are different
+      // sentences, and a fabricated 0.00 would join the running totals.
+      expect(rows[1]?.cost).toBeNull()
     })
   })
 })

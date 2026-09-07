@@ -18,6 +18,7 @@
 // with it, none of which belongs in a page bundle. This file is pure string
 // handling over the vendored proto's enum names.
 import { teslaEnumLabel } from '@ev/tesla/enum-labels'
+import type { CostBasis } from './api-types.js'
 
 /** The single "not recorded" glyph. Never '0', never 'N/A', never blank. */
 export const DASH = '—'
@@ -165,6 +166,67 @@ export function formatCost(value: Maybe, currency: string | null | undefined): s
     // An unknown ISO code must not take the page down with it.
     return `${value.toFixed(2)} ${currency}`
   }
+}
+
+/**
+ * A tariff, per kWh: "$0.199/kWh".
+ *
+ * The fraction digits are set explicitly because Intl's currency style uses
+ * the currency's own minor unit — two digits for a dollar — and a tariff is
+ * quoted in tenths of a cent. Left to default, 19.9c/kWh renders as 20c and
+ * the arithmetic printed under a charge ("41.2 kWh x $0.199/kWh") stops
+ * multiplying out to the figure above it, which reads as a bug in the cost
+ * rather than as a rounding. The maximum matches the column's own NUMERIC(10,5),
+ * so nothing is shown that was not stored; the minimum is 2 so a whole-cent
+ * rate still looks like money.
+ */
+export function formatRatePerKwh(
+  value: Maybe,
+  currency: string | null | undefined,
+): string {
+  if (value == null || !Number.isFinite(value) || !currency) return DASH
+  try {
+    return `${new Intl.NumberFormat('en-GB', {
+      style: 'currency',
+      currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 5,
+    }).format(value)}/kWh`
+  } catch {
+    // An unknown ISO code must not take the charge page down with it.
+    return `${value} ${currency}/kWh`
+  }
+}
+
+/**
+ * Why a charge has no figure, in words.
+ *
+ * A blank cost cell is ambiguous between "this was free" and "we do not know",
+ * and those are opposite facts to a driver. Every unpriced charge therefore
+ * renders words, never an empty title beside a dash.
+ *
+ * There are FOUR of these, not three, and the pair that shares a basis is the
+ * one that gets missed: `home` covers both a charge no rate row covers and a
+ * charge the car never reported energy for, and they need different words
+ * because only the first is fixed by typing a rate into settings.
+ *
+ * Total by construction — a null basis (every drive, every idle, every charge
+ * closed before pricing existed) answers too, because a page may never render
+ * the words "null" or "undefined" and returning nothing here is how it would.
+ *
+ * Takes the basis union rather than the DTO so it stays testable without one.
+ */
+export function formatUnpricedCost(
+  basis: CostBasis | null | undefined,
+  energyKwh: Maybe,
+): string {
+  if (basis === 'home') {
+    // Checked ahead of the rate: with no kWh there is nothing to multiply, so
+    // "no rate for this date" would send someone to fix the wrong thing.
+    return energyKwh == null ? 'Energy not measured' : 'No rate for this date'
+  }
+  if (basis === 'pending') return 'Awaiting Tesla invoice'
+  return 'Not priced'
 }
 
 function unit(formatted: string, suffix: string): string {

@@ -1,4 +1,4 @@
-import { closePool, getPool } from '@ev/db'
+import { closePool, getPool, type DbPool } from '@ev/db'
 import { loadConfig } from './config.js'
 import {
   handlerErrorsTotal,
@@ -15,6 +15,7 @@ import {
 import { subscribe } from './mqtt.js'
 import { Pipeline, QUIET_PERIOD_MS, type PipelineResult } from './pipeline.js'
 import { pgRunner, registerVehicle } from './store.js'
+import { pgRateStore, runRateRefresh } from './urdb.js'
 
 /**
  * The worker entrypoint.
@@ -36,6 +37,21 @@ import { pgRunner, registerVehicle } from './store.js'
  * timing, not the polling granularity.
  */
 const FLUSH_INTERVAL_MS = Math.max(250, Math.floor(QUIET_PERIOD_MS / 2))
+
+/**
+ * How often to ask OpenEI what a kilowatt-hour costs (spec §3.3).
+ *
+ * A SECOND timer, and coarse, because the only other one in this file fires
+ * roughly once a second - it is the accumulator flush, not a scheduler. Hanging
+ * this on it would call a public API of NREL's about 86,400 times a day to
+ * learn a number that changes roughly once a year, which is the kind of thing
+ * that gets a key revoked.
+ *
+ * Daily is already far more often than the source moves. The point of the
+ * interval is not freshness, it is that a rate change is noticed within a day
+ * of NREL publishing it rather than whenever someone next looks.
+ */
+const RATE_FETCH_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 async function main(): Promise<void> {
   const config = loadConfig()
@@ -60,9 +76,14 @@ async function main(): Promise<void> {
   // startup here instead is the honest outcome, and the pod restarts.
   await registerVehicle(pool, config.vehicle)
 
-  const pipeline = new Pipeline(pgRunner(pool, config.cursorSource, config.vehicle.id), {
-    usableCapacityKwh: config.usableCapacityKwh,
-  })
+  const pipeline = new Pipeline(
+    pgRunner(pool, config.cursorSource, config.vehicle.id),
+    { usableCapacityKwh: config.usableCapacityKwh },
+    // Where the car lives, for the charges its own `locatedAtHome` never covers.
+    // Omitting it costs nothing visible: the signal still classifies most
+    // charges, and the ones it misses simply read `unknown` weeks later.
+    config.home,
+  )
 
   const record = (result: PipelineResult): void => {
     if (result.samples > 0) {
@@ -112,12 +133,30 @@ async function main(): Promise<void> {
   // Do not hold the event loop open on the timer alone.
   timer.unref?.()
 
+  // The rate fetch (spec §3.3), on its own timer, or not at all.
+  //
+  // No key, no timer: the fetch is the convenience half of this feature and the
+  // manual rate is the authoritative one, so an install without a key prices
+  // home charging perfectly well off whatever the owner typed in. Said once at
+  // startup because the alternative - silence - is indistinguishable from a
+  // timer that is running and failing.
+  let rateTimer: NodeJS.Timeout | null = null
+  if (config.openEiApiKey === null) {
+    console.log('OPENEI_API_KEY unset: energy rates come from manual entries only')
+  } else {
+    rateTimer = startRateFetch(pool, config.openEiApiKey)
+  }
+
   let closing = false
   const shutdown = async (signal: string): Promise<void> => {
     if (closing) return
     closing = true
     console.log(`${signal} received, draining`)
     clearInterval(timer)
+    // Both timers, or SIGTERM does not drain: an unref'd interval does not hold
+    // the loop open by itself, but a live one still fires during the drain and
+    // can start work after the pool has closed.
+    if (rateTimer) clearInterval(rateTimer)
     try {
       // force=true: the quiet period cannot elapse during shutdown because no
       // further message will arrive to measure it against. Without this, a
@@ -139,6 +178,40 @@ async function main(): Promise<void> {
     `ev-ingest listening: broker=${config.mqtt.url} topic=${config.mqtt.topic} ` +
       `client=${config.mqtt.clientId} metrics=:${config.metricsPort}`,
   )
+}
+
+/**
+ * The daily rate fetch, started once and then left alone.
+ *
+ * Fired immediately as well as on the interval. A pod that is restarted more
+ * often than once a day - a deploy, a node drain, a crash loop - would
+ * otherwise never reach the first tick, and the feature would look broken in
+ * exactly the environments that restart most.
+ *
+ * Errors are logged and dropped. An unhandled rejection out of a timer ends the
+ * process, and nothing about a tariff lookup justifies dropping an MQTT session
+ * that is busy recording telemetry the car will not send twice.
+ */
+function startRateFetch(pool: DbPool, apiKey: string): NodeJS.Timeout {
+  const store = pgRateStore(pool)
+  const tick = (): void => {
+    void runRateRefresh(store, {
+      apiKey,
+      onResult: (out) => {
+        // Only the day it moves. `unchanged` is 364 days out of 365 and logging
+        // it would bury the one line anyone would ever want to find.
+        if (out.kind === 'inserted') {
+          console.log(`energy rate updated from URDB: ${out.pricePerKwh}/kWh`)
+        }
+      },
+      onError: (err) => console.error('energy rate fetch failed', err),
+    })
+  }
+  const timer = setInterval(tick, RATE_FETCH_INTERVAL_MS)
+  // Do not hold the event loop open on the timer alone.
+  timer.unref?.()
+  tick()
+  return timer
 }
 
 main().catch((err: unknown) => {

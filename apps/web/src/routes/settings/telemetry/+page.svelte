@@ -403,6 +403,15 @@
 	</div>
 </section>
 
+<p class="faint note">
+	<!-- The way in to the rates page. The vehicle tab bar is pinned to five
+	     entries and a sixth would push settings that most visits never open into
+	     the same rank as Drives and Charges, so settings reach each other from
+	     here instead. -->
+	What a home charge costs per kWh is configured separately:
+	<a class="link" href="/settings/energy">Energy rates</a>.
+</p>
+
 <style>
 	.page-head {
 		margin-bottom: 1.5rem;

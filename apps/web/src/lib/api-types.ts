@@ -254,15 +254,54 @@ export interface SessionListItem {
   endLat: number | null
   endLon: number | null
   /**
-   * Charge cost in the currency named by `costCurrency`, when known. Nothing
-   * writes this yet (tariffs are deferred), so it is null in practice — but it
-   * is in the contract because the UI must render the column as absent rather
-   * than as a zero cost the moment a value does appear.
+   * Charge cost in the currency named by `costCurrency`, when known. Charges
+   * only: a drive and an idle are never priced.
+   *
+   * Null does NOT mean free, and no consumer may render it as 0. A home charge
+   * with no rate row covering its date, a Supercharger stop whose invoice has
+   * not posted, and a charger we cannot place all arrive here as null — and
+   * `costBasis` is what tells them apart.
    */
   cost: number | null
   /** ISO 4217, e.g. 'GBP'. null whenever `cost` is null. */
   costCurrency: string | null
+  /**
+   * Why this charge is priced the way it is — where the energy came from.
+   * null on drives and idles, and on any charge closed before pricing existed.
+   *
+   * This is the one cost field that SURVIVES a null `cost`: it is what a page
+   * renders in place of a figure, so it is deliberately not paired with the
+   * amount the way the three fields below are.
+   */
+  costBasis: CostBasis | null
+  /**
+   * Where the figure itself came from, which is what marks a backfilled row as
+   * an estimate: 'backfill-estimate' means it was priced at a later rate than
+   * it was charged at, and must be shown as an estimate rather than as a fact.
+   * null whenever `cost` is null.
+   */
+  costSource: CostSource | null
+  /**
+   * The rate the cost was computed at, in `costCurrency` per kWh, 5 dp.
+   *
+   * Stored per session rather than looked up on read, so a charge keeps the
+   * price it was actually charged at when the tariff later changes, and so the
+   * charge page can show its own arithmetic. Derived for a Tesla-billed
+   * session (amount ÷ energy) rather than authoritative. null whenever `cost`
+   * is null.
+   */
+  costRatePerKwh: number | null
 }
+
+/**
+ * Home is a location fact and Tesla-billed is a match fact, so neither needs a
+ * charger taxonomy to maintain; 'pending' is a stop that looks Supercharged and
+ * has no invoice yet, and 'unknown' is honest about every other network, which
+ * we have no billing feed for.
+ */
+export type CostBasis = 'home' | 'tesla' | 'pending' | 'unknown'
+
+export type CostSource = 'urdb' | 'manual' | 'tesla-invoice' | 'backfill-estimate'
 
 /**
  * One `session_point`. The drive path and the charge curve are the same rows

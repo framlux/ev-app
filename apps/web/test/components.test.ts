@@ -102,6 +102,9 @@ function session(overrides: Partial<SessionListItem> = {}): SessionListItem {
 		endLon: null,
 		cost: null,
 		costCurrency: null,
+		costBasis: null,
+		costSource: null,
+		costRatePerKwh: null,
 		...overrides
 	}
 }
@@ -384,14 +387,21 @@ describe('pages render against an empty database', () => {
 		assertNoBrokenValues(out.body)
 	})
 
-	it('a charge with no points renders without a curve and without a cost', () => {
+	it('a charge with no points renders without a curve, and says its cost is unknown', () => {
 		const out = render(ChargeDetailPage as never, {
 			props: { data: { detail: CHARGE_WITHOUT_POINTS, vehicle: VEHICLE } } as never
 		})
 		expect(out.body).toContain('No power curve for this charge')
-		// Nothing writes cost yet. An unknown cost must not render as free.
+		// This assertion used to be `not.toContain('Cost')`, from the years when
+		// nothing wrote the column and a tile would have been an empty promise.
+		// The rule it protects has NOT been weakened: an unknown cost still may
+		// never render as free. What changed is which absence is the honest one
+		// - a missing tile reads as "this app has nothing to say about money",
+		// so the tile is now always here and says why there is no number.
+		expect(out.body).toContain('Cost')
+		expect(out.body).toContain('Not priced')
 		expect(out.body).not.toContain('£0.00')
-		expect(out.body).not.toContain('Cost')
+		expect(out.body).not.toContain('US$0.00')
 		assertNoBrokenValues(out.body)
 	})
 })
@@ -669,24 +679,36 @@ describe('the null branches that a render-only assertion cannot see', () => {
 		assertNoBrokenValues(out.body)
 	})
 
-	it('SessionList omits the Cost column entirely when no charge carries a currency', () => {
+	it('SessionList omits the Cost column entirely when no charge carries a basis', () => {
 		const out = render(SessionList as never, {
 			props: {
 				sessions: [session({ kind: 'charge', cost: null, costCurrency: null })],
 				mode: 'charge'
 			} as never
 		})
-		// A Cost header over a column of dashes is a column claiming there is a
-		// cost to know. Nothing writes cost yet, so the header must not exist.
+		// This test used to gate on the CURRENCY, back when nothing wrote a cost
+		// at all and any charges page was a column of dashes. The gate is now the
+		// basis, and the invariant it exists for is untouched: a Cost header over
+		// rows that carry no cost fact whatsoever is a column claiming there is
+		// something to know. A charge closed before pricing existed carries no
+		// basis, so this stays the no-column case.
 		expect(out.body).not.toContain('Cost')
 		assertNoBrokenValues(out.body)
 	})
 
-	it('SessionList shows the Cost column once a charge carries a currency', () => {
+	it('SessionList shows the Cost column once a charge carries a basis', () => {
 		const out = render(SessionList as never, {
 			props: {
 				sessions: [
-					session({ id: 'chg-a', kind: 'charge', cost: 12.5, costCurrency: 'GBP' }),
+					session({
+						id: 'chg-a',
+						kind: 'charge',
+						cost: 12.5,
+						costCurrency: 'GBP',
+						costBasis: 'home',
+						costSource: 'urdb',
+						costRatePerKwh: 0.199
+					}),
 					session({ id: 'chg-b', kind: 'charge', cost: null, costCurrency: null })
 				],
 				mode: 'charge'
@@ -703,13 +725,154 @@ describe('the null branches that a render-only assertion cannot see', () => {
 		for (const mode of ['drive', 'mixed'] as const) {
 			const out = render(SessionList as never, {
 				props: {
-					sessions: [session({ kind: 'charge', cost: 12.5, costCurrency: 'GBP' })],
+					sessions: [
+						session({ kind: 'charge', cost: 12.5, costCurrency: 'GBP', costBasis: 'home' })
+					],
 					mode
 				} as never
 			})
 			expect(out.body).not.toContain('Cost')
 			expect(out.body).not.toContain('£12.50')
 		}
+	})
+})
+
+/**
+ * A charge with no figure is the COMMON case, not the edge one: a Supercharger
+ * stop waits weeks for its invoice, a charge before the first rate row has
+ * nothing to price it at, and every third-party network is honestly unknown.
+ * A blank cell is ambiguous between "this was free" and "we do not know", and
+ * those are opposite facts to whoever is reading. So each of the states below
+ * is pinned to the words it renders - a state whose words are missing shows an
+ * empty title beside a dash, which is exactly the ambiguity being removed.
+ */
+describe('an unpriced charge reads as unpriced, never as free', () => {
+	function chargeRow(overrides: Partial<SessionListItem> = {}): SessionListItem {
+		return session({ id: 'chg-x', kind: 'charge', ...overrides })
+	}
+
+	function list(sessions: SessionListItem[]): string {
+		return render(SessionList as never, { props: { sessions, mode: 'charge' } as never }).body
+	}
+
+	function chargePage(overrides: Partial<SessionListItem> = {}): string {
+		const detail: SessionDetail = {
+			...CHARGE_WITHOUT_POINTS,
+			session: chargeRow(overrides)
+		}
+		return render(ChargeDetailPage as never, {
+			props: { data: { detail, vehicle: VEHICLE } } as never
+		}).body
+	}
+
+	it('shows the Cost column for a page of nothing but pending Supercharger stops', () => {
+		// The page that most needs the column is the one where no row has a
+		// figure yet: gating on a currency would hide the only thing on screen
+		// that explains why four Supercharger stops are blank.
+		const body = list([
+			chargeRow({ id: 'chg-p1', costBasis: 'pending', energyKwh: 32.1 }),
+			chargeRow({ id: 'chg-p2', costBasis: 'pending', energyKwh: 18.4 })
+		])
+		expect(body).toContain('Cost')
+		expect(body).toContain('Awaiting Tesla invoice')
+		expect(body).not.toContain('0.00')
+		assertNoBrokenValues(body)
+	})
+
+	it('titles each unpriced row with the state that produced it', () => {
+		const body = list([
+			chargeRow({ id: 'chg-u', costBasis: 'unknown', energyKwh: 12 }),
+			chargeRow({ id: 'chg-p', costBasis: 'pending', energyKwh: 30 }),
+			// The pair that shares a basis, and the reason there are four states
+			// and not three: both are a home charge with no figure, but only the
+			// first is fixed by typing a rate into settings.
+			chargeRow({ id: 'chg-h1', costBasis: 'home', energyKwh: 41.2 }),
+			chargeRow({ id: 'chg-h2', costBasis: 'home', energyKwh: null })
+		])
+		expect(body).toContain('title="Not priced"')
+		expect(body).toContain('title="Awaiting Tesla invoice"')
+		expect(body).toContain('title="No rate for this date"')
+		expect(body).toContain('title="Energy not measured"')
+		assertNoBrokenValues(body)
+	})
+
+	it('leaves a priced row untitled, so the title is a signal and not decoration', () => {
+		const body = list([
+			chargeRow({
+				cost: 8.2,
+				costCurrency: 'USD',
+				costBasis: 'home',
+				costSource: 'urdb',
+				costRatePerKwh: 0.199,
+				energyKwh: 41.2
+			})
+		])
+		expect(body).toContain('US$8.20')
+		expect(body).not.toContain('title=')
+		assertNoBrokenValues(body)
+	})
+
+	it('the charge page shows a home charge with the arithmetic that produced it', () => {
+		// 41.2 kWh at 19.9c is $8.20, and printing the multiplication under the
+		// figure is the whole reason the rate is stored on the session: a cost
+		// nobody can check is a cost nobody believes.
+		const body = chargePage({
+			cost: 8.2,
+			costCurrency: 'USD',
+			costBasis: 'home',
+			costSource: 'urdb',
+			costRatePerKwh: 0.199,
+			energyKwh: 41.2
+		})
+		expect(body).toContain('US$8.20')
+		expect(body).toContain('41.20 kWh × US$0.199/kWh')
+		assertNoBrokenValues(body)
+	})
+
+	it('the charge page shows a Tesla-billed stop as an effective rate, not a tariff', () => {
+		// Tesla bills a total with idle and congestion fees inside it, so the
+		// per-kWh figure is something the invoice divided out - "effective" is
+		// the word that stops it being read as a price anyone was quoted.
+		const body = chargePage({
+			cost: 24.36,
+			costCurrency: 'USD',
+			costBasis: 'tesla',
+			costSource: 'tesla-invoice',
+			costRatePerKwh: 0.42,
+			energyKwh: 58
+		})
+		expect(body).toContain('US$24.36')
+		expect(body).toContain('US$0.42/kWh effective')
+		assertNoBrokenValues(body)
+	})
+
+	it('the charge page names the reason instead of a number when there is none', () => {
+		const pending = chargePage({ costBasis: 'pending', energyKwh: 32.1 })
+		expect(pending).toContain('Cost')
+		expect(pending).toContain('Awaiting Tesla invoice')
+		expect(pending).not.toContain('US$0.00')
+		assertNoBrokenValues(pending)
+
+		const noRate = chargePage({ costBasis: 'home', energyKwh: 41.2 })
+		expect(noRate).toContain('No rate for this date')
+		assertNoBrokenValues(noRate)
+	})
+
+	it('the charge page marks a backfilled figure as an estimate', () => {
+		// A backfill prices an old charge at TODAY's rate, so the number is
+		// invented for anything older than the last tariff change. Rendered
+		// identically to a real figure it would be indistinguishable from one.
+		const body = chargePage({
+			cost: 8.2,
+			costCurrency: 'USD',
+			costBasis: 'home',
+			costSource: 'backfill-estimate',
+			costRatePerKwh: 0.199,
+			energyKwh: 41.2
+		})
+		expect(body).toContain('US$8.20')
+		expect(body).toContain('estimated')
+		assertNoBrokenValues(body)
 	})
 })
 

@@ -7,7 +7,8 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/main.js",
-    "reprocess": "node dist/reprocess.js"
+    "reprocess": "node dist/reprocess.js",
+    "backfill-costs": "node dist/backfill-costs.js"
   },
   "dependencies": {
     "@ev/core": "workspace:*",

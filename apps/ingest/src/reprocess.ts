@@ -71,6 +71,12 @@ async function main(): Promise<void> {
     const pipeline = new Pipeline(
       { run: (fn) => fn(replayStoreOn(client, config.cursorSource)) },
       { usableCapacityKwh: config.usableCapacityKwh },
+      // The same home the live worker prices with, and not optional here. A
+      // replay re-derives every session and re-prices it through the same
+      // `finish()`, so a replay without this would rewrite `cost_basis` from
+      // 'home' to 'unknown' on every charge whose home-ness came from the
+      // coordinate fallback rather than from Tesla's own `locatedAtHome`.
+      config.home,
     )
 
     let count = 0

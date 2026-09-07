@@ -11,7 +11,8 @@
 		formatKwh,
 		formatPct,
 		formatTime,
-		formatEfficiency
+		formatEfficiency,
+		formatUnpricedCost
 	} from '$lib/format.js'
 
 	interface Props {
@@ -22,11 +23,12 @@
 
 	let { sessions, mode }: Props = $props()
 
-	// The cost column exists in the contract but nothing writes it yet (tariffs
-	// are deferred). Rendering an all-dash column would be noise, so it appears
-	// only once a row actually carries a currency — and the moment one does,
-	// the others show a dash rather than a fabricated zero.
-	let showCost = $derived(mode === 'charge' && sessions.some((s) => s.costCurrency != null))
+	// The gate is the BASIS, not the currency, and the difference is a whole
+	// page: a month of Supercharging arrives as rows that are all still waiting
+	// on Tesla's invoice, none of which carries a currency yet. Gating on the
+	// currency would hide the column on exactly the page whose blank cells most
+	// need explaining, and leave four unexplained charges looking free.
+	let showCost = $derived(mode === 'charge' && sessions.some((s) => s.costBasis != null))
 
 	function href(s: SessionListItem): string | null {
 		if (s.kind === 'drive') return `/drives/${s.id}`
@@ -106,7 +108,16 @@
 						<td class="r num hide-sm">{socRange(s)}</td>
 						<td class="r num">{formatKw(s.maxChargePowerKw)}</td>
 						{#if showCost}
-							<td class="r num">{formatCost(s.cost, s.costCurrency)}</td>
+							<!-- The title carries the reason, and only when there is no
+							     figure: a dash on its own is ambiguous between a charge
+							     that was free and one we cannot price, and those are
+							     opposite facts. A priced row gets no title, so hovering
+							     one is never a dead end. -->
+							<td
+								class="r num"
+								title={s.cost == null ? formatUnpricedCost(s.costBasis, s.energyKwh) : null}
+								>{formatCost(s.cost, s.costCurrency)}</td
+							>
 						{/if}
 					{/if}
 

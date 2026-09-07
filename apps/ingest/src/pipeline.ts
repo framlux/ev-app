@@ -7,6 +7,13 @@ import {
 } from '@ev/tesla'
 import { decodeIfKnown } from './deps.js'
 import {
+  classifyCharge,
+  priceCharge,
+  type ChargeCost,
+  type EnergyPrice,
+  type HomeLocation,
+} from './pricing.js'
+import {
   estimateCapacity,
   initialState,
   step,
@@ -37,7 +44,32 @@ export interface Store {
   closeSession(sessionId: string, summary: SessionSummary): Promise<void>
   recordBatteryHealth(row: BatteryHealthWrite): Promise<void>
   recordMeasuredCapacity(row: MeasuredCapacityWrite): Promise<void>
+  /**
+   * The price in force at an instant, or null if none is (spec §3.2).
+   *
+   * THE FIRST READ THROUGH THIS SEAM, which was write-only until pricing
+   * needed it, and a decision rather than an addition. The alternative was a
+   * separate `RateLookup` handed to the Pipeline beside its options, keeping
+   * `Store` a pure sink — and that would have put the lookup outside the
+   * message transaction, where a rate inserted between the SELECT and the
+   * COMMIT could price a charge at a tariff that was never in force when it
+   * closed. Reading here keeps the price and the session it belongs to inside
+   * one snapshot.
+   *
+   * The cost of the widening is bounded deliberately: one indexed SELECT, on
+   * the close of a charge only, on a connection the transaction already holds.
+   * A read that fanned out — a query per sample, or an unbounded scan — would
+   * make the hot path depend on the size of a table that only grows, and is
+   * the thing this comment exists to refuse.
+   */
+  rateAt(at: Date): Promise<EnergyPrice | null>
+  recordSessionCost(row: SessionCostWrite): Promise<void>
   advanceCursor(at: Date): Promise<void>
+}
+
+/** A price and the session it belongs to, as `priceSession` writes it. */
+export interface SessionCostWrite extends ChargeCost {
+  sessionId: string
 }
 
 export interface BatteryHealthWrite {
@@ -366,7 +398,17 @@ export class Pipeline {
    */
   private measuredDays = new Map<string, string>()
 
-  constructor(private runner: StoreRunner, private opts: MetricsOptions) {}
+  /**
+   * `home` is optional and defaults to off, because EV_HOME_LAT/LON are
+   * optional: without them the coordinate fallback is disabled and the car's
+   * own `locatedAtHome` is the only test of where a charge happened, which is
+   * the better signal anyway (spec §3.8).
+   */
+  constructor(
+    private runner: StoreRunner,
+    private opts: MetricsOptions,
+    private home: HomeLocation | null = null,
+  ) {}
 
   /**
    * Raw first, always. The tape is what makes everything else rebuildable, so a
@@ -548,12 +590,55 @@ export class Pipeline {
     const summary = summariseSession(kind, points, this.opts)
     await store.closeSession(sessionId, summary)
 
-    // Battery health is only measurable from a charge: it divides measured
-    // energy in by the SoC span, and a drive has no measured energy at all
-    // (its energy is inferred FROM a nameplate capacity, so using it would be
-    // circular). estimateCapacity returns null for spans too narrow to mean
-    // anything, and that null is the whole point — no row beats a bad row.
+    // Two things hang off a closing charge and nothing hangs off a closing
+    // drive, so the guard is here, once, rather than at the top of each. It
+    // used to live inside the battery block below — where it read as that
+    // block's own early return, and where anything appended after the block
+    // would silently never run. Both consequences are charge-only for the same
+    // reason: a drive's energy is inferred from a nameplate capacity rather
+    // than measured, so neither a capacity estimate nor a price could be
+    // anything but circular.
     if (kind !== 'charge') return
+    await this.recordHealth(store, summary, points)
+    await this.attachCost(store, sessionId, summary, points)
+  }
+
+  /**
+   * What this charge cost, and why (spec §3.4).
+   *
+   * Unconditional for a charge: every one gets a `cost_basis`, including the
+   * ones with no figure. A row left null is ambiguous between free, unknown and
+   * not-yet-written, and the charges page has no way to tell them apart — which
+   * is the whole reason the basis is a column rather than an inference.
+   *
+   * In the same transaction as `closeSession`, so a session never commits
+   * half-classified: a crash between the two would leave a closed charge that
+   * nothing ever revisits, since only the close triggers pricing.
+   */
+  private async attachCost(
+    store: Store, sessionId: string, summary: SessionSummary, points: VehicleSample[],
+  ): Promise<void> {
+    const classified = classifyCharge(points, summary, this.home)
+    // Only a home charge has a rate to look up. A Supercharger stop is priced
+    // from what Tesla billed and an unknown charger from nothing at all, so
+    // asking the database would be a query whose answer is discarded.
+    const rate = classified.basis === 'home' && classified.at !== null
+      ? await store.rateAt(classified.at)
+      : null
+    await store.recordSessionCost({ sessionId, ...priceCharge(classified, rate) })
+  }
+
+  /**
+   * Battery health, estimated from the charge that just closed.
+   *
+   * It divides measured energy in by the SoC span, so `estimateCapacity`
+   * returns null for spans too narrow to mean anything — and that null is the
+   * whole point. No row beats a bad row: a fabricated capacity would rescale
+   * every drive's energy figure that reads it.
+   */
+  private async recordHealth(
+    store: Store, summary: SessionSummary, points: VehicleSample[],
+  ): Promise<void> {
     const estimate = estimateCapacity({
       startSocPct: summary.startSocPct,
       endSocPct: summary.endSocPct,

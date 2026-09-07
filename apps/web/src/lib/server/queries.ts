@@ -39,6 +39,8 @@ import type {
   BatteryHealthPoint,
   BatteryHealthResponse,
   ChargeSetup,
+  CostBasis,
+  CostSource,
   LiveVehicleState,
   LiveVehicleWithState,
   PeriodStats,
@@ -602,8 +604,20 @@ function mapSession(r: Row): SessionListItem {
     cost: round(num(r['cost']), 2),
     // Never a currency without an amount: a lone 'GBP' would make the charges
     // page render a cost column full of em dashes that look like missing data
-    // rather than an absent feature.
+    // rather than an absent feature. The provenance and the rate are paired
+    // with the amount for the same reason — a rate under a tile showing no
+    // cost describes arithmetic that never happened.
     costCurrency: num(r['cost']) === null ? null : str(r['cost_currency']),
+    costSource: num(r['cost']) === null ? null : (str(r['cost_source']) as CostSource | null),
+    // 5 dp is the column's own precision, so nothing is lost on the way out.
+    costRatePerKwh: num(r['cost']) === null ? null : round(num(r['cost_rate_per_kwh']), 5),
+    // The basis is deliberately NOT paired with the amount. It is precisely
+    // the field that outlives a missing cost: a stop awaiting its Tesla
+    // invoice and a home charge no rate covers are both unpriced, and this is
+    // the only thing that lets the page say which. Gating it here the way the
+    // three above are gated blanks every explanation the UI has, and does it
+    // without failing anything else.
+    costBasis: str(r['cost_basis']) as CostBasis | null,
   }
 }
 
@@ -798,7 +812,7 @@ const SESSION_COLUMNS = `
   start_odometer_km, end_odometer_km, start_soc_pct, end_soc_pct,
   energy_kwh, distance_km, efficiency_wh_per_km, avg_speed_kph,
   max_charge_power_kw, start_lat, start_lon, end_lat, end_lon,
-  cost, cost_currency
+  cost, cost_currency, cost_rate_per_kwh, cost_basis, cost_source
 `
 
 /**

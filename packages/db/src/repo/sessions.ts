@@ -148,3 +148,150 @@ export async function deleteDerived(
       WHERE vehicle_id=$1 AND observed_on >= $2::date AND observed_on < $3::date`,
     [vehicleId, from, to])
 }
+
+/** Why a charge is priced the way it is — where the energy came from (§3.1). */
+export type CostBasis = 'home' | 'tesla' | 'pending' | 'unknown'
+
+/** Where the figure came from. 'backfill-estimate' marks §5's invented ones. */
+export type CostSource = 'urdb' | 'manual' | 'tesla-invoice' | 'backfill-estimate'
+
+/**
+ * A price for a charge, as `priceSession` writes it.
+ *
+ * `costBasis` is the only non-nullable field, and that asymmetry is the point.
+ * The other four are null together whenever we have no number, but the basis
+ * survives: it is what the UI renders INSTEAD of a figure (§3.7), so a charge
+ * awaiting a Tesla invoice reads as awaiting one rather than as free. A caller
+ * that has nothing to say still has to say which of the four states it is in.
+ */
+export interface SessionCost {
+  cost: number | null
+  costCurrency: string | null
+  costRatePerKwh: number | null
+  costBasis: CostBasis
+  costSource: CostSource | null
+}
+
+/**
+ * Attach a price to a session (spec §3.4).
+ *
+ * A SIBLING of `closeSession` rather than five more arguments to it, and that
+ * is structural rather than stylistic. `closeSession` writes a `SessionSummary`
+ * — a pure function of the samples, computed by the metrics engine and true
+ * whoever runs it — through a positional UPDATE that already binds fifteen
+ * parameters. A price is not a function of the samples: it depends on a tariff
+ * table, on where the car was, and on what Tesla eventually billed, and one of
+ * its sources does not arrive for weeks. Folding it in would make the summary
+ * un-recomputable and put a fifth kind of failure inside the statement that
+ * closes every drive.
+ *
+ * It matches on `kind='charge'` as well as the id, so a bug that hands it a
+ * drive changes nothing rather than putting a cost on a session the read API
+ * promises has none. Callers run it in the same transaction as `closeSession`,
+ * so a session never commits half-classified.
+ */
+export async function priceSession(
+  c: DbClient, sessionId: string, p: SessionCost,
+): Promise<void> {
+  await c.query(
+    `UPDATE session SET
+       cost=$2, cost_currency=$3, cost_rate_per_kwh=$4,
+       cost_basis=$5, cost_source=$6
+     WHERE id=$1 AND kind='charge'`,
+    [sessionId, p.cost, p.costCurrency, p.costRatePerKwh, p.costBasis, p.costSource])
+}
+
+/**
+ * Is there any charge still waiting on a Tesla invoice? (spec §3.5's work guard)
+ *
+ * This is the query that makes a month with no Supercharging cost nothing. It
+ * runs BEFORE any Tesla call is made, and `session_pending_cost_idx` is the
+ * partial index it reads — without one, discovering there is no work to do
+ * would be a sequential scan of every session ever recorded.
+ *
+ * EXISTS rather than a count, so Postgres stops at the first row: the answer is
+ * "any", and how many there are is a question the caller asks next, with
+ * `pendingChargesSince`, only once it knows the answer is yes.
+ */
+export async function hasPendingCharges(c: DbClient): Promise<boolean> {
+  const { rows } = await c.query(
+    `SELECT EXISTS (
+       SELECT 1 FROM session
+        WHERE kind='charge' AND cost IS NULL AND cost_basis='pending'
+     ) AS pending`)
+  return rows[0]?.pending === true
+}
+
+/** One charge awaiting a price, with what §3.5's matching needs to match on. */
+export interface PendingCharge {
+  id: string
+  vehicleId: string
+  startedAt: Date
+  endedAt: Date | null
+  energyKwh: number | null
+}
+
+/**
+ * The charges awaiting an invoice that ended at or after `from`, oldest first.
+ *
+ * Oldest first because the caller turns the first row's start into the
+ * `startTime` of one Tesla request covering the whole batch — a per-session
+ * query would multiply the API calls the §3.5 gate exists to avoid.
+ *
+ * `from` is a floor and not a filter on how far back to look: it is what stops
+ * a run asking Tesla for a window wider than the give-up horizon, where every
+ * record returned would be about a session that has already been abandoned.
+ */
+export async function pendingChargesSince(
+  c: DbClient, from: Date,
+): Promise<PendingCharge[]> {
+  const { rows } = await c.query(
+    `SELECT id, vehicle_id, started_at, ended_at, energy_kwh FROM session
+      WHERE kind='charge' AND cost IS NULL AND cost_basis='pending'
+        AND ended_at >= $1
+      ORDER BY started_at`,
+    [from])
+  return rows.map((r) => ({
+    id: r.id,
+    vehicleId: r.vehicle_id,
+    startedAt: r.started_at,
+    endedAt: r.ended_at,
+    energyKwh: r.energy_kwh,
+  }))
+}
+
+/**
+ * Stop waiting on charges that ended before `endedBefore` (spec §3.5).
+ *
+ * Free Supercharging, a stop billed to somebody else's account, and a record
+ * Tesla simply never publishes all look identical from here: a pending session
+ * that no invoice will ever match. Without this they would be re-queried at
+ * every run forever, growing the request window without bound.
+ *
+ * They become `unknown`, not priced-at-zero. "We never found out" and "it was
+ * free" are different sentences and §3.7 prints both; a zero would put a
+ * fabricated £0.00 into the running totals.
+ *
+ * `ended_at` and not `started_at`, because the invoice is raised against the
+ * end of the stop — dating the horizon from the start would give a long
+ * overnight charge slightly less patience than a short one for no reason. A
+ * still-open session has no `ended_at`, and `NULL <= x` is NULL, so it is never
+ * given up on: it has not finished waiting because it has not finished.
+ *
+ * The comparison is INCLUSIVE despite the parameter's name. The rule is "still
+ * pending 45 days after it ended", so a caller passing `now - 45 days` means a
+ * session that ended exactly then to flip; a strict `<` would make that instant
+ * the last one on which it is still kept, and the horizon would be 45 days plus
+ * a tick. Returns how many it gave up on, so the caller can log a number rather
+ * than an intention.
+ */
+export async function giveUpPendingCharges(
+  c: DbClient, endedBefore: Date,
+): Promise<number> {
+  const res = await c.query(
+    `UPDATE session SET cost_basis='unknown'
+      WHERE kind='charge' AND cost IS NULL AND cost_basis='pending'
+        AND ended_at <= $1`,
+    [endedBefore])
+  return res.rowCount ?? 0
+}

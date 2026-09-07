@@ -17,7 +17,9 @@ import {
 	formatOnOff,
 	formatPct,
 	formatPressure,
+	formatRatePerKwh,
 	formatRelative,
+	formatUnpricedCost,
 	formatSpeed,
 	formatTemp,
 	formatText,
@@ -204,6 +206,71 @@ describe('formatCost', () => {
 
 	it('survives an unknown ISO code instead of taking the page down', () => {
 		expect(formatCost(3, 'NOTACURRENCY')).toBe('3.00 NOTACURRENCY')
+	})
+})
+
+describe('formatRatePerKwh', () => {
+	it('keeps the tenth of a cent a tariff is actually quoted in', () => {
+		// Intl's currency style defaults to the currency's own 2 digits, which
+		// rounds a 19.9c/kWh tariff to 20c and makes the charge page's own
+		// arithmetic fail to multiply out. The rate column stores 5 decimals, so
+		// the formatter shows up to 5 and never invents precision it wasn't given.
+		// The locale is formatCost's, so the two money strings on a charge page
+		// agree with each other rather than one saying $ and the other US$.
+		expect(formatRatePerKwh(0.199, 'USD')).toBe('US$0.199/kWh')
+	})
+
+	it('still reads as money at whole cents', () => {
+		expect(formatRatePerKwh(0.12, 'GBP')).toBe('£0.12/kWh')
+	})
+
+	it('renders a free tariff as free rather than as unknown', () => {
+		// Same rule formatCost lives by: a rate of zero is a fact about the
+		// tariff, and hiding it behind a dash would read as an outage.
+		expect(formatRatePerKwh(0, 'GBP')).toBe('£0.00/kWh')
+	})
+
+	it('is a dash when either half is missing', () => {
+		expect(formatRatePerKwh(null, 'USD')).toBe(DASH)
+		expect(formatRatePerKwh(0.199, null)).toBe(DASH)
+	})
+
+	it('survives an unknown ISO code instead of taking the charge page down', () => {
+		expect(formatRatePerKwh(0.199, 'NOTACURRENCY')).toBe('0.199 NOTACURRENCY/kWh')
+	})
+})
+
+describe('formatUnpricedCost', () => {
+	/**
+	 * There are FOUR ways a charge ends up without a figure, not three, and the
+	 * two that share a basis are the ones that get dropped: a home charge with
+	 * no rate row covering its date and a home charge the car never reported
+	 * energy for are both `home`, and both would otherwise render an empty
+	 * title next to a dash that looks like a bug in the page.
+	 */
+	it('names a home charge no rate row covers', () => {
+		expect(formatUnpricedCost('home', 30)).toBe('No rate for this date')
+	})
+
+	it('names a home charge the car reported no energy for', () => {
+		// Checked before the rate, because with no kWh there is nothing to
+		// multiply and the rate is beside the point.
+		expect(formatUnpricedCost('home', null)).toBe('Energy not measured')
+	})
+
+	it('says a Supercharger stop is waiting on Tesla, not that it was free', () => {
+		expect(formatUnpricedCost('pending', 42)).toBe('Awaiting Tesla invoice')
+	})
+
+	it('says an unknown charger is unpriced', () => {
+		expect(formatUnpricedCost('unknown', 42)).toBe('Not priced')
+	})
+
+	it('answers for a session with no basis at all rather than returning nothing', () => {
+		// Drives and idles carry a null basis, and so does every charge closed
+		// before pricing shipped. The rendered page may never contain the words
+		// "null" or "undefined" (components.test.ts), so every input has words.
+		expect(formatUnpricedCost(null, null)).toBe('Not priced')
 	})
 })
 

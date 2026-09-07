@@ -8,8 +8,10 @@
 		formatKw,
 		formatKwh,
 		formatPct,
+		formatRatePerKwh,
 		formatText,
 		formatTime,
+		formatUnpricedCost,
 		formatVolts,
 		hasCoords
 	} from '$lib/format.js'
@@ -26,9 +28,45 @@
 		s.startSocPct != null && s.endSocPct != null ? s.endSocPct - s.startSocPct : null
 	)
 
-	// The cost tile appears only when a currency is set. Nothing writes cost
-	// yet, and an empty "£0.00" would be a claim about money that is not true.
-	let showCost = $derived(s.costCurrency != null)
+	// The cost tile is unconditional on a charge. An absent tile answers a
+	// different question from an empty one: it says the app has nothing to say
+	// about money, when what is true is that THIS charge has no figure and there
+	// is a reason. So a priced charge shows the money and an unpriced one shows
+	// the reason in words — never a "$0.00", which would be the one reading
+	// that is actually false.
+	let priced = $derived(s.cost != null && s.costCurrency != null)
+
+	/**
+	 * The arithmetic under the figure, which is why the rate is stored on the
+	 * session at all rather than looked up when the page renders: a cost nobody
+	 * can check against a rate is a cost nobody can argue with when the tariff
+	 * changes underneath it.
+	 *
+	 * The two bases read differently on purpose. A home charge really was priced
+	 * by multiplying, so it shows the multiplication. A Tesla-billed stop was
+	 * priced by Tesla — idle and congestion fees inside one total — so its rate
+	 * is something we divided back out, and "effective" is the word that stops
+	 * it being read as a price anyone was quoted.
+	 *
+	 * Null rather than a line of dashes when either half is missing: a hint that
+	 * says "— × —" under a real figure looks like the figure is broken too.
+	 */
+	let costHint = $derived.by(() => {
+		if (!priced || s.costRatePerKwh == null) return null
+		const rate = formatRatePerKwh(s.costRatePerKwh, s.costCurrency)
+		const arithmetic =
+			s.costBasis === 'tesla' ? `${rate} effective`
+			: s.energyKwh == null ? null
+			: `${formatKwh(s.energyKwh)} × ${rate}`
+		if (arithmetic == null) return null
+		// A backfilled figure was priced at TODAY's rate, not the one in force
+		// when the car was plugged in, so for anything older than the last
+		// tariff change the number is invented. Rendered identically to a real
+		// figure it would be indistinguishable from one.
+		return s.costSource === 'backfill-estimate' ?
+				`${arithmetic} · estimated at a later rate`
+			:	arithmetic
+	})
 
 	let located = $derived(hasCoords(s.startLat, s.startLon))
 
@@ -82,9 +120,13 @@
 			value="{formatPct(s.startSocPct)} → {formatPct(s.endSocPct)}"
 			hint={socAdded != null ? `${formatPct(socAdded)} added` : null}
 		/>
-		{#if showCost}
-			<StatTile label="Cost" value={formatCost(s.cost, s.costCurrency)} />
-		{/if}
+		<StatTile
+			label="Cost"
+			value={priced ?
+				formatCost(s.cost, s.costCurrency)
+			:	formatUnpricedCost(s.costBasis, s.energyKwh)}
+			hint={costHint}
+		/>
 	</div>
 
 	{#if setup}

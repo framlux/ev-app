@@ -8,6 +8,8 @@ import {
   insertSample,
   notifyVehicleChanged,
   openSession,
+  priceSession,
+  rateAt,
   recordMeasuredCapacity,
   upsertBatteryHealth,
   upsertSample,
@@ -62,6 +64,15 @@ export function storeOn(client: DbClient, cursorSource: string): Store {
     closeSession: (sessionId, summary) => closeSession(client, sessionId, summary),
     recordBatteryHealth: (row) => upsertBatteryHealth(client, row),
     recordMeasuredCapacity: (row) => recordMeasuredCapacity(client, row),
+    // The read half of the seam (spec §3.4). `EnergyRate` is a superset of what
+    // the pipeline asks for, so it passes straight through — and `rateAt` has
+    // already coerced `price_per_kwh` out of the string node-postgres returns
+    // for a NUMERIC, which is what makes the multiplication downstream honest.
+    rateAt: (at) => rateAt(client, at),
+    // Split the way `openSession` is: the pipeline names a session by id and
+    // hands over what it computed, and the id-versus-row shuffle lives here
+    // rather than leaking the repo layer's argument order into the pipeline.
+    recordSessionCost: (row) => priceSession(client, row.sessionId, row),
     advanceCursor: (at) => advanceCursor(client, cursorSource, at),
   }
 }
