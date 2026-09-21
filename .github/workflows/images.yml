@@ -72,7 +72,7 @@ jobs:
         if: steps.check.outputs.exists == 'true'
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/framlux/${{ matrix.name }}
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
           # No type=sha. A sha tag is what made every main commit look like a
           # release; the version tag is the only thing that should name a
           # published image.

@@ -2369,7 +2369,7 @@ Note anything that did not behave as described above, and fix it before proceedi
 ## Task 10: Ship it
 
 **Files (this repo):** none beyond the tag.
-**Files (separate repo `framlux/stack`):** `clusters/prod/apps/ev/base/deployment-web.yaml`, `clusters/prod/apps/ev/base/kustomization.yaml`.
+**Files (in the separate GitOps repo):** `clusters/prod/apps/ev/base/deployment-web.yaml`, `clusters/prod/apps/ev/base/kustomization.yaml`.
 
 - [ ] **Step 1: Confirm the tree is green and push**
 
@@ -2417,7 +2417,7 @@ In `stack/clusters/prod/apps/ev/base/kustomization.yaml`, change all three `newT
 - [ ] **Step 6: Commit and push the stack change**
 
 ```bash
-cd /Users/jonathanmiller/Repositories/framlux/stack
+cd ../stack
 git add clusters/prod/apps/ev/base/deployment-web.yaml clusters/prod/apps/ev/base/kustomization.yaml
 git commit -m "feat(ev): deploy v0.3.0 — real-time updates"
 git push
@@ -2425,6 +2425,6 @@ git push
 
 - [ ] **Step 7: Verify the rollout**
 
-ArgoCD syncs from the stack repo. Confirm with whatever access is available (`kubectl -n ev get pods`, or the ArgoCD UI), then load `https://ev.framlux.io/vehicles/<id>` and confirm the indicator reads Live while the car is reporting.
+ArgoCD syncs from the stack repo. Confirm with whatever access is available (`kubectl -n ev get pods`, or the ArgoCD UI), then load `https://ev.example.com/vehicles/<id>` and confirm the indicator reads Live while the car is reporting.
 
 If `kubectl` is not available from this machine, say so rather than claiming the rollout succeeded — the tag and the stack commit are the deliverables that can be verified, and the sync is ArgoCD's to do.

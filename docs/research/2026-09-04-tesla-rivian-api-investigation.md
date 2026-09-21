@@ -1,7 +1,7 @@
 # Building a personal Tesla + Rivian dashboard: API investigation
 
 **Date:** 2026-09-04
-**Scope:** One 2022 Tesla Model Y, one incoming Rivian R2. Single user (me). Goal: one app that does what Tessie does for the Tesla and what Rivian Roamer does for the Rivian.
+**Scope:** One Tesla Model Y, one Rivian R2. Single user. Goal: one app that does what Tessie does for the Tesla and what Rivian Roamer does for the Rivian.
 **Status:** Desk research only — nothing tested against live accounts yet. Items marked ⚠️ need to be verified before committing to a design.
 
 ---
@@ -50,7 +50,7 @@ Tesla defines three token types. The one we want is the **Third-Party Token**, a
 
 **Scopes available:** `openid`, `vehicle_device_data`, `vehicle_location`, `vehicle_cmds`, `vehicle_charging_cmds`.
 
-> ⚠️ **Superseded — do not use this list when performing the OAuth grant.** The design that came out of this research is read-only, and that guarantee is enforced *only* at the grant: no manifest records the scope set, and a token carrying command scopes behaves identically to a read-only one until something calls a command endpoint. The scopes to request are exactly **`openid`, `offline_access`, `vehicle_device_data`, `vehicle_location`** — `vehicle_cmds` and `vehicle_charging_cmds` must **not** be requested. See `docs/superpowers/specs/2026-09-04-ev-app-design.md` §5.1 and the stack repo's `clusters/prod/apps/ev/SECRETS.md`.
+> ⚠️ **Superseded — do not use this list when performing the OAuth grant.** The design that came out of this research is read-only, and that guarantee is enforced *only* at the grant: no manifest records the scope set, and a token carrying command scopes behaves identically to a read-only one until something calls a command endpoint. The scopes to request are exactly **`openid`, `offline_access`, `vehicle_device_data`, `vehicle_location`** — `vehicle_cmds` and `vehicle_charging_cmds` must **not** be requested. See `docs/superpowers/specs/2026-09-04-ev-app-design.md` §5.1.
 
 ### 2.3 Commands need the Vehicle Command Protocol
 
@@ -180,7 +180,7 @@ R2 deliveries began **9 June 2026**. Roamer already tracks and supports R2 (dedi
 
 Two things worth stealing conceptually:
 1. **"Rivian's feed is live-only"** — Rivian stores no history for you. If you aren't recording, the data is gone forever. Roamer only has your history *from the moment you subscribe*. This is the single strongest argument for standing up ingestion **before** the R2 arrives.
-2. They support **importing history from ElectraFi / TezLab** to backfill. If any of my Tesla history lives in a third-party service, an importer is worth having.
+2. They support **importing history from ElectraFi / TezLab** to backfill. Where existing Tesla history lives in a third-party service, an importer is worth having.
 
 ---
 

@@ -9,7 +9,7 @@
 
 ## 1. Purpose
 
-A single self-hosted web app that records and displays telemetry for my vehicles, replacing Tessie (Tesla) and eventually Rivian Roamer (Rivian) with one system I own. Deployed to the existing bare-metal k3s cluster via ArgoCD from the `framlux/stack` repo.
+A single self-hosted web app that records and displays telemetry for one household's vehicles, replacing Tessie (Tesla) and eventually Rivian Roamer (Rivian) with one system the owner runs. Deployed to a bare-metal k3s cluster via ArgoCD from a separate GitOps repo.
 
 The motivating constraint, established in the research: **neither vendor stores history for you.** Both APIs are live-only. Every drive list, charging curve and degradation trend in the commercial products is derived by them from a stream they recorded. If we are not recording, the data is gone permanently. Ingestion is therefore the first thing that must work and the last thing allowed to break.
 
@@ -17,7 +17,7 @@ The motivating constraint, established in the research: **neither vendor stores 
 
 - Continuously record Tesla vehicle state at high resolution without waking the car.
 - Derive drives, charges and idles from that stream, with efficiency, charging curves and battery-health trends.
-- Present it through a website at `ev.framlux.io`, authenticated with the existing Pocket-ID instance.
+- Present it through a website at the deployment's own hostname (`ev.example.com` throughout this spec), authenticated with a Pocket-ID instance.
 - Expose a versioned HTTP API that the website consumes, so a native app can later use the same surface.
 - Run for approximately the cost of electricity on hardware that already exists.
 
@@ -44,8 +44,8 @@ Decisions already settled, recorded here so the plan does not relitigate them.
 | Language | TypeScript throughout | The risk here is domain logic, not throughput. One language means the canonical model is a shared type rather than a generated contract. The engine is isolated as a package so extraction to Go or C# stays cheap. |
 | Storage | Plain PostgreSQL 17 via CNPG | TimescaleDB would mean a non-standard CNPG image for a workload of roughly 10–50M rows/year. Native monthly partitioning plus BRIN indexes is sufficient. |
 | Web/API split | One SvelteKit deployment | Splitting buys nothing when both halves are TypeScript in one repo. Accepted cost: a UI deploy restarts the API, which is irrelevant for one user. |
-| Auth | Pocket-ID OIDC, authorization code + PKCE | Matches the existing `crm-web` pattern and the cluster's established SSO. |
-| Hostnames | `ev.framlux.io`, `ev-telemetry.framlux.io` | Web and API on the first, which also serves the Tesla public key and is therefore the registered app domain. The car streams to the second. |
+| Auth | Pocket-ID OIDC, authorization code + PKCE | A small self-hosted OIDC provider; any OIDC provider that supports PKCE would do. |
+| Hostnames | Two, written here as `ev.example.com` and `ev-telemetry.example.com` | Web and API on the first, which also serves the Tesla public key and is therefore the registered app domain. The car streams to the second. Both are deployment-specific; the collector name is `EV_TELEMETRY_HOSTNAME`. |
 
 ---
 
@@ -57,7 +57,7 @@ Decisions already settled, recorded here so the plan does not relitigate them.
 Tesla Model Y
   │ mTLS websocket, protobuf
   ▼
-Traefik  ──IngressRouteTCP, TLS passthrough, HostSNI(ev-telemetry.framlux.io)──┐
+Traefik  ──IngressRouteTCP, TLS passthrough, HostSNI(ev-telemetry.example.com)──┐
                                                                               ▼
                                                                      ev-telemetry
                                                           (upstream tesla/fleet-telemetry)
@@ -81,7 +81,7 @@ Traefik  ──IngressRouteTCP, TLS passthrough, HostSNI(ev-telemetry.framlux.io
                                                             SvelteKit: UI + /api/v1, OIDC
                                                                               ▲
                                                                               │ HTTPS
-                                                                        ev.framlux.io
+                                                                        ev.example.com
 ```
 
 `reliable_ack` is the load-bearing detail. The receiver acknowledges a message to the car only once Mosquitto has accepted it. That makes the chain: worker stalls → broker queue grows → receiver stops acking → **the car buffers its own 5,000 messages (~2,500 seconds)**. A deploy, a worker crash or a short outage therefore loses nothing.
@@ -94,9 +94,9 @@ All in namespace `ev`.
 |---|---|---|---|
 | `ev-telemetry` | Deployment | `tesla/fleet-telemetry` (upstream, pinned) | Terminates mTLS itself. Config from ConfigMap, certs from Secret. |
 | `ev-mqtt` | StatefulSet | `eclipse-mosquitto` (pinned) | Persistence enabled on a small PVC so the session queue survives restart. |
-| `ev-ingest` | Deployment | `ghcr.io/framlux/ev-ingest` | Long-lived MQTT subscriber. Separate from web deliberately: different failure modes, and it must be able to crash without taking the site down. |
-| `ev-web` | Deployment | `ghcr.io/framlux/ev-web` | SvelteKit `adapter-node`, port 3000. |
-| `ev-migrator` | Job | `ghcr.io/framlux/ev-migrator` | `argocd.argoproj.io/sync-wave: "5"`, matching the CRM migrator's reasoning about CNPG secret timing. |
+| `ev-ingest` | Deployment | `ghcr.io/OWNER/ev-ingest` | Long-lived MQTT subscriber. Separate from web deliberately: different failure modes, and it must be able to crash without taking the site down. |
+| `ev-web` | Deployment | `ghcr.io/OWNER/ev-web` | SvelteKit `adapter-node`, port 3000. |
+| `ev-migrator` | Job | `ghcr.io/OWNER/ev-migrator` | `argocd.argoproj.io/sync-wave: "5"`, so it runs after CNPG has published the database secret. |
 | `ev-pg` | CNPG Cluster | `ghcr.io/cloudnative-pg/postgresql:17.6` | `data-disk` storage class, `data-tier` priority class. |
 | `ev-teslacmd` | Job, run on demand | `tesla/vehicle-command` | Signs and pushes the telemetry configuration. Not a Deployment: it holds the private key, config changes are rare, and read-only gives it no other purpose. |
 
@@ -162,7 +162,7 @@ Nothing downstream of `normalise` knows the vendor. Writing this now costs nothi
 ### 5.1 One-time setup
 
 1. Tesla account with verified email and MFA enabled.
-2. Register the application at `developer.tesla.com`. Domain: `ev.framlux.io`. Requested scopes: `openid`, `offline_access`, `vehicle_device_data`, `vehicle_location`. **Deliberately not** `vehicle_cmds` or `vehicle_charging_cmds`.
+2. Register the application at `developer.tesla.com`. Domain: `ev.example.com`. Requested scopes: `openid`, `offline_access`, `vehicle_device_data`, `vehicle_location`. **Deliberately not** `vehicle_cmds` or `vehicle_charging_cmds`.
 
    `offline_access` is required and is easy to miss: without it Tesla returns an access token that expires in 8 hours and **no refresh token at all**, so the integration dies overnight with no obvious cause. It grants no vehicle access of its own — it only permits refresh — so it does not weaken the read-only guarantee.
 3. Generate an EC secp256r1 keypair. The private key becomes a SealedSecret; the public key is served by `ev-web` at `/.well-known/appspecific/com.tesla.3p.public-key.pem`.
@@ -203,14 +203,14 @@ Even with streaming, a small Fleet API client is needed for the vehicle list, `k
 
 **Pocket-ID is the only way into this app.** There is no second authentication path and no
 "Sign in with Tesla". This matters because the naming invites the opposite: Tesla's application
-form requires a redirect URI, and the one registered is `https://ev.framlux.io/tesla_login`.
+form requires a redirect URI, and the one registered is `https://ev.example.com/tesla_login`.
 That path is *not* a login. It is a one-time OAuth callback the operator uses to mint a Fleet
 API refresh token, it authenticates nobody, and it must never appear in `PUBLIC_PATHS` or issue
 a session cookie. A Tesla token grants access to the *vehicle*; it must never grant access to
 the *app*, whose entire authorisation model is a single Pocket-ID `sub`. Enforced by
 `apps/web/test/boundaries.test.ts`, which is mutation-verified.
 
-Authorization code + PKCE against `https://sso.framlux.io`. Session in an HttpOnly, Secure, SameSite=Lax cookie. Client credentials and the session signing key are SealedSecrets named `ev-pocketid-client` and `ev-session`, mirroring `crm-pocketid-client` and `crm-session`.
+Authorization code + PKCE against `https://sso.example.com`. Session in an HttpOnly, Secure, SameSite=Lax cookie. Client credentials and the session signing key are SealedSecrets named `ev-pocketid-client` and `ev-session`, mirroring `crm-pocketid-client` and `crm-session`.
 
 A single Pocket-ID subject is authorised; anyone else authenticating successfully is rejected at the application layer. The allowed subject is configuration, not code.
 
@@ -236,7 +236,7 @@ Garage (all vehicles, current state), vehicle detail, drives list with map, driv
 
 ## 7. Kubernetes deployment
 
-Manifests live in `framlux/stack` at `clusters/prod/apps/ev/base/`, with `clusters/prod/apps/ev-app.yaml` and a line added to `clusters/prod/kustomization.yaml`. This follows the four-step "Adding a New Application" procedure in the stack repo's CLAUDE.md.
+Manifests live in a separate GitOps repo, not here, under a per-app base directory with an ArgoCD `Application` pointing at it. Keeping them out of this repo is deliberate: an image tag bump and a code change are different decisions with different review.
 
 ### 7.1 Manifests
 
@@ -246,9 +246,9 @@ Image tags are pinned in the kustomization `images:` block, as CRM does.
 
 ### 7.2 Ingress
 
-`ev.framlux.io` — standard Ingress, `cert-manager.io/cluster-issuer: letsencrypt-dns`, entrypoint `websecure`, middleware `kube-system-secure-headers@kubernetescrd`. Identical in shape to `crm`'s.
+`ev.example.com` — standard Ingress, `cert-manager.io/cluster-issuer: letsencrypt-dns`, entrypoint `websecure`, middleware `kube-system-secure-headers@kubernetescrd`. Identical in shape to `crm`'s.
 
-`ev-telemetry.framlux.io` — `IngressRouteTCP` with `tls.passthrough: true`, whose route rule matches `HostSNI` on that hostname, forwarding to `ev-telemetry:443`. Traefik routes on SNI without terminating, so fleet-telemetry performs its own mTLS and validates the vehicle's client certificate. No additional MetalLB address is required.
+`ev-telemetry.example.com` — `IngressRouteTCP` with `tls.passthrough: true`, whose route rule matches `HostSNI` on that hostname, forwarding to `ev-telemetry:443`. Traefik routes on SNI without terminating, so fleet-telemetry performs its own mTLS and validates the vehicle's client certificate. No additional MetalLB address is required.
 
 ### 7.3 Backups — deliberately none for now
 

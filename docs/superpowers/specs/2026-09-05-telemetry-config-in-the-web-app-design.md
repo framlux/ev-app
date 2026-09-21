@@ -116,7 +116,7 @@ That test is now doing more work than before. Previously the refresh token was t
 buildTelemetryConfig(input: { vin: string; ca: string }): TelemetryConfig
 ```
 
-It reads the field catalogue for names, intervals and `minimum_delta`, sets `prefer_typed: true`, and takes the **hostname and port from constants in `packages/tesla`** rather than from its caller — they are `ev-telemetry.framlux.io` and `443` today, hard-coded in the script, and a value both callers must agree on is exactly what this module exists to hold.
+It reads the field catalogue for names, intervals and `minimum_delta`, sets `prefer_typed: true`, and takes the **hostname and port from constants in `packages/tesla`** rather than from its caller — they come from `EV_TELEMETRY_HOSTNAME` and `EV_TELEMETRY_PORT`, and a value both callers must agree on is exactly what this module exists to hold.
 
 **Two guards from the script move into the builder**, because they are the reason it is not a one-liner:
 
@@ -212,15 +212,15 @@ The remaining exposure is a compromise of `ev-web` *while an operator is consent
 
 ## 7. What changes outside this repo
 
-**`framlux/stack`:**
+**In the GitOps repo:**
 - Mount `ev-tesla-oauth`'s `CLIENT_ID` and `CLIENT_SECRET` into `ev-web` **as `TESLA_CLIENT_ID` and `TESLA_CLIENT_SECRET`** — the code requires those names, because `POCKETID_CLIENT_ID` already occupies the unprefixed namespace and two OAuth clients in one process must not share a variable. Mount **not** `REFRESH_TOKEN`, which is the point of the design and should be called out in the manifest comment.
 - Mount the telemetry CA (`ev-telemetry-ca`, `tls.crt`) and the proxy CA (`ev-teslaproxy-tls`, `ca.crt`) read-only, **each with an explicit `items:` projection** — never a bare `secret:` volume. Both Secrets are cert-manager CA secrets and therefore also contain `tls.key`: `ev-telemetry-ca` holds the private key of the ten-year root **the car pins**, carrying `rotationPolicy: Never` precisely because rotating it means re-pushing config to a physical vehicle. Projecting the whole Secret into the one internet-facing pod in the namespace would be strictly worse than the refresh-token exposure this design removes. `deployment-teslaproxy.yaml` already does exactly this projection for the signing key, with the reasoning attached; copy that shape.
 - Add to the web Deployment: `TESLAPROXY_URL` (the base the client appends `/api/1` to), `TESLA_REDIRECT_URI`, `TELEMETRY_CA_FILE` (the path of the projected telemetry CA — §3.3 says the application does not read a CA, which is true of the PROXY's and false of this one: the telemetry CA travels *inside* the configuration the car is sent, so the app must read it), and `NODE_EXTRA_CA_CERTS` pointing at the projected proxy CA.
 
 **Every one of these names is required by code that throws without it.** Deploying to an earlier draft of this list produces a pod that answers "Connect to Tesla" with a 500 saying `TESLA_CLIENT_ID is not set`, and Push with `TELEMETRY_CA_FILE is not set`.
 - No NetworkPolicy change: `ev-web` is already admitted to `ev-teslaproxy:4443`, and the comment there anticipated this.
-- `SECRETS.md` §7 gains a note that `REFRESH_TOKEN` is now used only by the break-glass scripts.
+- The deployment's own secret documentation gains a note that `REFRESH_TOKEN` is now used only by the break-glass scripts.
 
 **Tesla developer portal**, and nothing in either repo can do it:
-- Register `https://ev.framlux.io/settings/telemetry/callback` as an allowed redirect URI. Until it is, consent fails at Tesla with a redirect-mismatch error before ever reaching us.
-- This is an **addition, not a replacement**. `SECRETS.md` records `https://ev.framlux.io/tesla_login` as the already-registered redirect — a path that deliberately does not exist, used once by hand to mint the refresh token. It stays registered for the break-glass flow, and `boundaries.test.ts` guards its name against ever becoming a sign-in (§3.4a). The `SECRETS.md` edit says both things: the second URI, and that `REFRESH_TOKEN` is now used only by the scripts.
+- Register `https://ev.example.com/settings/telemetry/callback` as an allowed redirect URI. Until it is, consent fails at Tesla with a redirect-mismatch error before ever reaching us.
+- This is an **addition, not a replacement**. The deployment's secret documentation records `https://ev.example.com/tesla_login` as the already-registered redirect — a path that deliberately does not exist, used once by hand to mint the refresh token. It stays registered for the break-glass flow, and `boundaries.test.ts` guards its name against ever becoming a sign-in (§3.4a). That edit says both things: the second URI, and that `REFRESH_TOKEN` is now used only by the scripts.
