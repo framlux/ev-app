@@ -35,12 +35,21 @@ import type {
 
 /**
  * Where the car sends its telemetry. Public DNS, not a cluster name: this is
- * dialled from the vehicle, over the internet.
+ * dialled from the vehicle, over the internet, so it is deployment-specific
+ * and comes from the environment.
+ *
+ * It reads as an empty string rather than throwing at import, because both
+ * callers import this module for other exports too and a test that never
+ * builds a config should not have to set it. `buildTelemetryConfig` is where
+ * an unset value is refused — the one place it would do harm.
  */
-export const TELEMETRY_HOSTNAME = 'ev-telemetry.framlux.io'
+export const TELEMETRY_HOSTNAME = process.env['EV_TELEMETRY_HOSTNAME'] ?? ''
 
-/** 443, because it must survive whatever network the car happens to be on. */
-export const TELEMETRY_PORT = 443
+/**
+ * 443 by default, because it must survive whatever network the car happens to
+ * be on. Overridable only for a deployment that genuinely cannot use it.
+ */
+export const TELEMETRY_PORT = Number(process.env['EV_TELEMETRY_PORT'] ?? '443')
 
 /**
  * What "the CA is really a CA" means — the ONE definition of it.
@@ -148,6 +157,15 @@ export function buildTelemetryConfig(input: {
     throw new Error(
       'the telemetry CA holds no BEGIN CERTIFICATE: the car pins this, and a ' +
       'configuration carrying the wrong bytes fails every connection silently.')
+  }
+
+  // An unset EV_TELEMETRY_HOSTNAME would push a configuration whose hostname is
+  // the empty string: accepted by Tesla, and the car then streams to nowhere.
+  // Same failure shape as the two guards above, so it is refused the same way.
+  if (TELEMETRY_HOSTNAME === '') {
+    throw new Error(
+      'EV_TELEMETRY_HOSTNAME is not set: the car dials this name from the ' +
+      'internet, and a configuration without it stops the stream silently.')
   }
 
   return {

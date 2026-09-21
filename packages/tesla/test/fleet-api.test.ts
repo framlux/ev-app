@@ -90,7 +90,7 @@ it('posts the telemetry configuration as-built, with the bearer token', async ()
   const config = {
     vins: ['VIN1'],
     config: {
-      hostname: 'ev-telemetry.framlux.io', port: 443, ca: '-- CERT --',
+      hostname: 'ev-telemetry.example.com', port: 443, ca: '-- CERT --',
       prefer_typed: true, fields: { VehicleSpeed: { interval_seconds: 10 } },
     },
   }
@@ -110,7 +110,7 @@ it('reads the applied configuration back, not just the synced flag', async () =>
   // itself; `{ synced }` alone cannot answer "is what the car has what the
   // catalogue says". check-telemetry-synced.sh already reads exactly these keys.
   const applied = {
-    hostname: 'ev-telemetry.framlux.io', port: 443, ca: '-- CERT --',
+    hostname: 'ev-telemetry.example.com', port: 443, ca: '-- CERT --',
     prefer_typed: true, fields: { VehicleSpeed: { interval_seconds: 10, minimum_delta: 1 } },
   }
   stubFetch({ synced: true, config: applied })

@@ -984,7 +984,7 @@ describe('the telemetry settings page renders in every state that occurs', () =>
 
 	const VEH = { id: 'veh-1', displayName: 'Model Y', vin: '5YJ3E1EA1PF000000' }
 
-	const CATALOGUE = { fieldCount: 41, hostname: 'ev-telemetry.framlux.io', port: 443 }
+	const CATALOGUE = { fieldCount: 41, hostname: 'ev-telemetry.example.com', port: 443 }
 
 	/** Every observed column null: the row a push creates before any check. */
 	function status(overrides: Record<string, unknown> = {}) {

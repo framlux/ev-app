@@ -364,10 +364,10 @@ describe('safeNextPath', () => {
 	})
 
 	it('refuses the exact tab vector the reviewer walked end to end', () => {
-		// new URL('/\t/evil.example', 'https://ev.framlux.io').href is
+		// new URL('/\t/evil.example', 'https://ev.example.com').href is
 		// 'https://evil.example/'. Pinned here so the danger is visible in the test
 		// rather than only in a comment.
-		expect(new URL('/\t/evil.example', 'https://ev.framlux.io').href).toBe('https://evil.example/')
+		expect(new URL('/\t/evil.example', 'https://ev.example.com').href).toBe('https://evil.example/')
 		expect(safeNextPath('/\t/evil.example')).toBe('/')
 	})
 
@@ -409,7 +409,7 @@ describe('safeNextPath', () => {
 		const out = safeNextPath(raw)
 		expect(out.startsWith('//')).toBe(false)
 		// The property that actually matters, stated the way a browser sees it.
-		expect(new URL(out, 'https://ev.framlux.io').origin).toBe('https://ev.framlux.io')
+		expect(new URL(out, 'https://ev.example.com').origin).toBe('https://ev.example.com')
 	})
 
 	it('never returns an off-origin path, exhaustively over four segments', () => {
@@ -424,7 +424,7 @@ describe('safeNextPath', () => {
 					for (const d of segs) {
 						const raw = `/${[a, b, c, d].join('/')}`
 						const out = safeNextPath(raw)
-						if (new URL(out, 'https://ev.framlux.io').origin !== 'https://ev.framlux.io') {
+						if (new URL(out, 'https://ev.example.com').origin !== 'https://ev.example.com') {
 							escaped.push(raw)
 						}
 					}

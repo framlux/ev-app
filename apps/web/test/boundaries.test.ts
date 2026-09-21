@@ -73,7 +73,7 @@ describe('apps/web architectural boundaries', () => {
  * Authentication boundary: Pocket-ID is the ONLY way into this app.
  *
  * The trap this guards is a naming accident. Tesla's application form demands a
- * redirect URI, and the one registered is https://ev.framlux.io/tesla_login.
+ * redirect URI, and the one registered is https://ev.example.com/tesla_login.
  * That path is not a login: it is a one-time OAuth callback the operator uses to
  * mint a Fleet API refresh token, and it authenticates nobody. Its name reads
  * like a sign-in option, which is exactly how a future change ends up adding

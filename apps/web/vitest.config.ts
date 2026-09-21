@@ -93,6 +93,13 @@ export default defineConfig({
 	test: {
 		name: 'web',
 		environment: 'node',
-		include: ['test/**/*.test.ts']
+		include: ['test/**/*.test.ts'],
+		/**
+		 * The collector hostname is deployment-specific and read from the
+		 * environment at import (see packages/tesla/src/telemetry-config.ts).
+		 * The settings page imports it, so the suite needs a value; this is the
+		 * one its assertions pin.
+		 */
+		env: { EV_TELEMETRY_HOSTNAME: 'ev-telemetry.example.com' }
 	}
 })

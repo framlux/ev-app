@@ -213,7 +213,7 @@ const USER = { locals: { user: { sub: SUBJECT }, session: { sub: SUBJECT } } }
 
 beforeEach(() => {
 	process.env.TESLAPROXY_URL = 'https://ev-teslaproxy.ev.svc.cluster.local:4443'
-	process.env.TESLA_REDIRECT_URI = 'https://ev.framlux.io/settings/telemetry/callback'
+	process.env.TESLA_REDIRECT_URI = 'https://ev.example.com/settings/telemetry/callback'
 	process.env.TESLA_CLIENT_ID = 'tesla-client-id'
 	process.env.TESLA_CLIENT_SECRET = 'tesla-client-secret'
 })
@@ -247,7 +247,7 @@ describe('who may call the telemetry actions', () => {
 				callback({
 					locals: {},
 					cookies: fakeCookies(),
-					url: new URL('https://ev.framlux.io/settings/telemetry/callback')
+					url: new URL('https://ev.example.com/settings/telemetry/callback')
 				} as never)
 			)
 		).toMatchObject({ status: 401 })
@@ -393,7 +393,7 @@ describe('the Tesla consent callback', () => {
 		return {
 			...USER,
 			cookies: fakeCookies(cookie === undefined ? {} : { [TESLA_FLOW_COOKIE]: cookie }),
-			url: new URL(`https://ev.framlux.io/settings/telemetry/callback?${query}`)
+			url: new URL(`https://ev.example.com/settings/telemetry/callback?${query}`)
 		}
 	}
 
@@ -869,7 +869,7 @@ describe('a Tesla call that never answered', () => {
  * 502 AND 504 ARE UNUSABLE STATUSES FOR THIS APP, and this is the test that
  * remembers why.
  *
- * Cloudflare fronts ev.framlux.io, and when an origin answers with a standard
+ * Cloudflare fronts ev.example.com, and when an origin answers with a standard
  * 502 or 504 it does not pass that response through — it substitutes its own
  * branded "Bad gateway" page and discards the body. So the app spent three
  * releases correctly returning `502 Tesla refused the request: <sentence>` in a

@@ -20,19 +20,19 @@ it('requests the read scopes the app actually runs on', () => {
 })
 
 it('authorizes against auth.tesla.com, not the fleet-auth token host', () => {
-  const u = new URL(authorizeUrl('cid', 'https://ev.framlux.io/tesla_login', 's'))
+  const u = new URL(authorizeUrl('cid', 'https://ev.example.com/tesla_login', 's'))
   expect(u.host).toBe('auth.tesla.com')
 })
 
 it('space-delimits scopes and carries every one of them', () => {
-  const u = new URL(authorizeUrl('cid', 'https://ev.framlux.io/tesla_login', 's'))
+  const u = new URL(authorizeUrl('cid', 'https://ev.example.com/tesla_login', 's'))
   expect(u.searchParams.get('scope')?.split(' ')).toEqual([...SCOPES])
 })
 
 it('passes client_id, redirect_uri and state through unmangled', () => {
-  const u = new URL(authorizeUrl('cid', 'https://ev.framlux.io/tesla_login', 'nonce123'))
+  const u = new URL(authorizeUrl('cid', 'https://ev.example.com/tesla_login', 'nonce123'))
   expect(u.searchParams.get('client_id')).toBe('cid')
-  expect(u.searchParams.get('redirect_uri')).toBe('https://ev.framlux.io/tesla_login')
+  expect(u.searchParams.get('redirect_uri')).toBe('https://ev.example.com/tesla_login')
   expect(u.searchParams.get('state')).toBe('nonce123')
   expect(u.searchParams.get('response_type')).toBe('code')
 })
@@ -41,12 +41,12 @@ it('asks Tesla to prompt for scopes an existing grant does not already carry', (
   // Without this, Tesla reuses the scopes of the existing (account, app) grant
   // and ignores the scope parameter entirely. Consent and exchange both
   // succeed, and the token silently carries the OLD scope set.
-  const u = new URL(authorizeUrl('cid', 'https://ev.framlux.io/tesla_login', 's'))
+  const u = new URL(authorizeUrl('cid', 'https://ev.example.com/tesla_login', 's'))
   expect(u.searchParams.get('prompt_missing_scopes')).toBe('true')
 })
 
 it('requires the full requested scope set, so a partial grant fails loudly', () => {
-  const u = new URL(authorizeUrl('cid', 'https://ev.framlux.io/tesla_login', 's'))
+  const u = new URL(authorizeUrl('cid', 'https://ev.example.com/tesla_login', 's'))
   expect(u.searchParams.get('require_requested_scopes')).toBe('true')
 })
 
@@ -127,7 +127,7 @@ it('returns a token set with no refreshToken when Tesla issues none', async () =
   // assertion is the executable form of "this flow holds no standing
   // credential".
   stubToken({ access_token: 'at', expires_in: 28800 })
-  const t = await exchangeCode('code', 'cid', 'secret', 'https://ev.framlux.io/cb')
+  const t = await exchangeCode('code', 'cid', 'secret', 'https://ev.example.com/cb')
   expect(t.accessToken).toBe('at')
   expect('refreshToken' in t).toBe(false)
   expect(t.expiresAt.getTime()).toBeGreaterThan(Date.now())
@@ -136,6 +136,6 @@ it('returns a token set with no refreshToken when Tesla issues none', async () =
 it('still carries the refreshToken through when Tesla issues one', async () => {
   // The scripts' flow does request offline_access, and it must keep working.
   stubToken({ access_token: 'at', refresh_token: 'rt', expires_in: 28800 })
-  const t = await exchangeCode('code', 'cid', 'secret', 'https://ev.framlux.io/cb')
+  const t = await exchangeCode('code', 'cid', 'secret', 'https://ev.example.com/cb')
   expect(t.refreshToken).toBe('rt')
 })

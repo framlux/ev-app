@@ -12,7 +12,7 @@
     "synced": true,
     "key_paired": true,
     "config": {
-      "hostname": "ev-telemetry.framlux.io",
+      "hostname": "ev-telemetry.example.com",
       "port": 443,
       "ca": "-----BEGIN CERTIFICATE-----\nMIIBcTCCARegAwIBAgIQZ0Xt3jVYRk9hZ0RiZ1pQYTAKBggqhkjOPQQDAjAXMRUw\nEwYDVQQDEwxldi10ZWxlbWV0cnkwHhcNMjUwOTA1MDAwMDAwWhcNMzUwOTAzMDAw\nMDAwWjAXMRUwEwYDVQQDEwxldi10ZWxlbWV0cnkwWTATBgcqhkjOPQIBBggqhkjO\nPQMBBwNCAAT3S1RkZXBsb3ltZW50Q0FmaXh0dXJlb25seU5PVGFyZWFsa2V5UEVN\nQkxPQjEyMzQ1Njc4OTBhYmNkZWZnaGlqo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYD\nVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUZmFrZUNBZml4dHVyZUtleUlEMAoGCCqG\nSM49BAMCA0gAMEUCIQDmFakeSignatureForAFixtureOnlyAAAAAAAAAAAAAgIg\nZmFrZVNpZ25hdHVyZUZvckFGaXh0dXJlT25seUJCQkJCQkI=\n-----END CERTIFICATE-----\n",
       "prefer_typed": true,

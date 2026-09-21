@@ -34,7 +34,7 @@ function stubFetch(response: unknown = {}): string[] {
 
 beforeEach(() => {
 	process.env.TESLAPROXY_URL = PROXY
-	process.env.TESLA_REDIRECT_URI = 'https://ev.framlux.io/settings/telemetry/callback'
+	process.env.TESLA_REDIRECT_URI = 'https://ev.example.com/settings/telemetry/callback'
 })
 
 afterEach(() => {
@@ -101,7 +101,7 @@ describe('the Fleet API client the web app uses', () => {
 
 describe('the registered Tesla redirect URI', () => {
 	it('comes from the environment, because Tesla matches it byte for byte', () => {
-		expect(teslaRedirectUri()).toBe('https://ev.framlux.io/settings/telemetry/callback')
+		expect(teslaRedirectUri()).toBe('https://ev.example.com/settings/telemetry/callback')
 	})
 
 	it('refuses when it is unset', () => {

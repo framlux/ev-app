@@ -104,7 +104,7 @@ describe('buildTelemetryConfig', () => {
   // must agree on is exactly what a shared module is for.
   it('takes the collector endpoint from constants, not from its caller', () => {
     const cfg = buildTelemetryConfig({ vin: VIN, ca: CA }).config
-    expect([cfg.hostname, cfg.port]).toEqual(['ev-telemetry.framlux.io', 443])
+    expect([cfg.hostname, cfg.port]).toEqual(['ev-telemetry.example.com', 443])
   })
 
   // Typed enums rather than raw ints; the normaliser's fixtures assume it.
@@ -242,7 +242,7 @@ describe('compareTelemetryConfig', () => {
 
   it('does not match the hostname or port moving', () => {
     const host = applied()
-    host.hostname = 'ev-telemetry.example.com'
+    host.hostname = 'ev-telemetry.moved.invalid'
     expect(compareTelemetryConfig(host, desired()).matches).toBe(false)
 
     const port = applied()
