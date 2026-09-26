@@ -46,6 +46,23 @@ describe('the sample write path', () => {
     expect(sql).toContain('gear = COALESCE(EXCLUDED.gear, sample.gear)')
   })
 
+  /**
+   * A replay READS the tape, so writing each message back onto it doubles the
+   * tape - and the copy carries the same received_at with a higher id, so
+   * streamRaw's keyset page reads it straight back and the replay never ends.
+   */
+  it('does not write the tape it is replaying', async () => {
+    const client = new RecordingClient()
+    await replayStoreOn(client as unknown as DbClient, 'test').insertRaw({
+      vehicleId: 'v1',
+      vendor: 'tesla',
+      receivedAt: new Date('2026-09-20T10:00:00.000Z'),
+      source: 'telemetry',
+      payload: { kind: 'metrics', vin: 'VIN', field: 'Soc', value: 80 },
+    })
+    expect(client.sql).toEqual([])
+  })
+
   it('changes nothing else about the store', () => {
     const client = new RecordingClient() as unknown as DbClient
     expect(Object.keys(replayStoreOn(client, 'test')))

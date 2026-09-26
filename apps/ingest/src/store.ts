@@ -99,6 +99,11 @@ export function replayStoreOn(client: DbClient, cursorSource: string): Store {
   return {
     ...storeOn(client, cursorSource),
     insertSample: (s) => upsertSample(client, s),
+    // A replay reads its messages FROM raw_message, so writing them back would
+    // double the tape. It would also never finish: the copy has the same
+    // received_at and a higher id, so streamRaw's keyset page reads it straight
+    // back, replays it, and writes another.
+    insertRaw: async () => {},
   }
 }
 
