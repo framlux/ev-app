@@ -224,5 +224,10 @@ function startRateFetch(pool: DbPool, apiKey: string): NodeJS.Timeout {
 
 main().catch((err: unknown) => {
   console.error('ev-ingest failed to start', err)
-  process.exitCode = 1
+  // exit(), not exitCode: by the time startup can fail the metrics server is
+  // already listening, and an open server holds the process up indefinitely.
+  // The liveness probe is a TCP check on that very port, so the pod stays
+  // Running and is never restarted, while ingesting nothing. That is how a node
+  // reboot that beat Postgres to readiness cost six days of telemetry.
+  process.exit(1)
 })
