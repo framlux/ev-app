@@ -42,10 +42,15 @@ Two properties are worth knowing before you judge the design:
 - **Streaming, not polling.** Polling the Fleet API is metered per request and
   risks waking the car (which costs range and money). Streamed signals are
   effectively free and never wake it.
-- **`reliable_ack` makes the chain lossless.** The receiver only acknowledges a
-  message to the car once the broker has accepted it, so a stalled worker means
-  the car buffers its own messages (~5,000 of them, roughly 40 minutes) rather
-  than dropping them. Deploys and crashes cost nothing.
+- **`reliable_ack` covers the broker, not the worker.** The receiver only
+  acknowledges a message to the car once the broker has accepted it, so a
+  broker outage means the car buffers its own messages (~5,000 of them, roughly
+  40 minutes) rather than dropping them. A stalled worker is different: the
+  broker keeps accepting into the worker's durable queue (100,000 messages or
+  128 MiB) and drops past that while still acknowledging, so the car holds
+  nothing back. Deploys and crashes cost nothing; a worker down for longer than
+  the queue holds loses data for good, which is why production alerts on a
+  worker that is not consuming.
 
 ---
 

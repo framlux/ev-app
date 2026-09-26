@@ -84,7 +84,9 @@ Traefik  ──IngressRouteTCP, TLS passthrough, HostSNI(ev-telemetry.example.co
                                                                         ev.example.com
 ```
 
-`reliable_ack` is the load-bearing detail. The receiver acknowledges a message to the car only once Mosquitto has accepted it. That makes the chain: worker stalls → broker queue grows → receiver stops acking → **the car buffers its own 5,000 messages (~2,500 seconds)**. A deploy, a worker crash or a short outage therefore loses nothing.
+`reliable_ack` is the load-bearing detail, and it protects less than it first appears to. The receiver acknowledges a message to the car only once Mosquitto has accepted it, so while the *broker* is down or refusing publishes the receiver stops acking and **the car buffers its own 5,000 messages (~2,500 seconds)**. A stalled *worker* is different. Mosquitto goes on accepting, and acknowledging, publishes into the worker's durable session queue until that queue is full (100,000 messages or 128 MiB, `configmap-mqtt.yaml` in the GitOps repo), and past that it drops them without telling the publisher, so the car never learns to hold anything back. A deploy, a worker crash or an outage of a few minutes therefore loses nothing; a worker that stays down past the queue's capacity loses everything after that point, permanently.
+
+That is not hypothetical. On 2026-09-19 a node reboot started ev-ingest before Postgres accepted connections, the worker failed its startup without exiting, and it sat unsubscribed for six days while the car was driven and acknowledged throughout. So a worker that is not consuming has to page someone (`EvIngestStalled`), because nothing upstream of it will ever push back.
 
 ### 3.2 Workloads
 
