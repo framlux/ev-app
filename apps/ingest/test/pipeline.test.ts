@@ -223,6 +223,43 @@ describe('Pipeline accumulation', () => {
     expect(db.state.samples).toHaveLength(1)
   })
 
+  it('keeps a burst that follows a quiet spell whole, rather than emit its first field alone', async () => {
+    // The 30 s ceiling is for a car that never goes quiet. Measured from the
+    // last emit instead of from the burst's own start, any gap over 30 s made
+    // the next burst's SECOND message look overdue, splitting it in two.
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+    await burst(pipeline, '2026-09-04T10:00:00.000Z', { Soc: 80 })
+    await pipeline.flush(t('2026-09-04T10:00:05.000Z'))
+    expect(db.state.samples).toHaveLength(1)
+
+    await pipeline.handle(field('2026-09-04T10:01:00.000Z', 'DetailedChargeState', 'DetailedChargeStateComplete'))
+    await pipeline.handle(field('2026-09-04T10:01:00.003Z', 'ACChargingPower', 0))
+    await pipeline.handle(field('2026-09-04T10:01:00.007Z', 'Soc', 81))
+    await pipeline.flush(t('2026-09-04T10:01:05.000Z'))
+
+    expect(db.state.samples.map((x) => x.ts.toISOString()))
+      .toEqual(['2026-09-04T10:00:00.000Z', '2026-09-04T10:01:00.007Z'])
+    expect(db.state.samples[1]).toMatchObject({ socPct: 81, chargeState: 'complete', chargePowerKw: 0 })
+  })
+
+  it('does not lose a burst whose fields share one instant to the half it split off', async () => {
+    // The re-timed backlog gave every field of a record one timestamp. The
+    // split-off first field took that instant, and the whole burst, stamped
+    // the same, was then dropped by the sample table's ON CONFLICT DO NOTHING.
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+    await burst(pipeline, '2026-09-04T10:00:00.000Z', { Soc: 80, ACChargingPower: 1.2 })
+    await pipeline.flush(t('2026-09-04T10:00:05.000Z'))
+
+    await burst(pipeline, '2026-09-04T10:01:00.000Z', {
+      Soc: 81, DetailedChargeState: 'DetailedChargeStateComplete', ACChargingPower: 0,
+    })
+    await pipeline.flush(t('2026-09-04T10:01:05.000Z'))
+
+    expect(db.state.samples.at(-1)).toMatchObject({ socPct: 81, chargeState: 'complete', chargePowerKw: 0 })
+  })
+
   it('flushes what is pending on shutdown', async () => {
     const db = new FakeDb()
     const pipeline = new Pipeline(db, OPTS)
@@ -279,6 +316,31 @@ describe('Pipeline session handling', () => {
 
     expect(openSessions(db).map((s) => s.kind)).toEqual(['drive'])
     expect(db.state.points).toHaveLength(1)
+  })
+
+  it('ends a charge on the Complete sample, with the final counter and SoC it carries', async () => {
+    // The segmenter ends a charge on the sample that says it stopped, because
+    // that sample carries the final reading. The summary is built from the
+    // points, and that sample was never one: 2026-09-22's charge came out a
+    // minute short and 0.2 kWh light.
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+    await burst(pipeline, '2026-09-22T11:56:00.000Z', {
+      DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 11, ACChargingEnergyIn: 0.1, Soc: 37.6,
+    })
+    await burst(pipeline, '2026-09-22T12:43:33.000Z', { ACChargingEnergyIn: 8.855, Soc: 49.8 })
+    await burst(pipeline, '2026-09-22T12:44:33.000Z', {
+      ACChargingEnergyIn: 9.056, Soc: 49.96, DetailedChargeState: 'DetailedChargeStateComplete', ACChargingPower: 0,
+    })
+    await pipeline.flush(t('2026-09-22T12:44:40.000Z'))
+
+    const [charge] = db.state.sessions
+    expect(charge?.isOpen).toBe(false)
+    expect(charge?.summary).toMatchObject({
+      endedAt: t('2026-09-22T12:44:33.000Z'), endSocPct: 49.96,
+    })
+    expect(charge?.summary?.energyKwh).toBeCloseTo(8.956, 3)
+    expect(db.state.points.at(-1)?.ts).toEqual(t('2026-09-22T12:44:33.000Z'))
   })
 
   it('closes a drive once parked and summarises it from the collected points', async () => {
@@ -610,7 +672,8 @@ describe('Pipeline.resume', () => {
     expect(charges.map((s) => s.id)).toEqual([charge!.id])
     expect(charges[0]?.isOpen).toBe(false)
     expect(charges[0]?.summary?.startedAt).toEqual(new Date(started))
-    expect(charges[0]?.summary?.endedAt).toEqual(new Date(at('23:30')))
+    // On the Complete sample, which carries the final reading.
+    expect(charges[0]?.summary?.endedAt).toEqual(new Date(at('23:31')))
     // No hole where the cold worker ran, and priced exactly once.
     const points = db.state.points.filter((p) => p.sessionId === charge!.id)
     expect(points.map((p) => p.ts.getTime())).toContain(at('21:28'))
@@ -708,7 +771,7 @@ describe('Pipeline.resume', () => {
 
     const merged = db.state.sessions.find((x) => x.id === 'merged')
     expect(merged?.isOpen).toBe(false)
-    expect(merged?.summary?.endedAt).toEqual(new Date(at('16:40')))
+    expect(merged?.summary?.endedAt).toEqual(new Date(at('16:41')))
     expect(openRows(db).map((r) => [r.kind, r.startedAt])).toEqual([['charge', new Date(at('18:00'))]])
   })
 
@@ -721,6 +784,8 @@ describe('Pipeline.resume', () => {
     await burst(s, iso(at('16:41')), { DetailedChargeState: 'DetailedChargeStateDisconnected', ACChargingPower: 0 })
     await burst(s, iso(at('18:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 45 })
     await charging(s, at('18:01'), at('18:20'), 45)
+    // The stopped worker's shutdown flush, which the resume stands in for.
+    await s.flush(new Date(at('18:21')), true)
     const [one, two] = scratch.state.sessions
     const pointsOf = (db: FakeDb, id: string) =>
       db.state.points.filter((p) => p.sessionId === id).map((p) => p.ts.getTime())
@@ -750,6 +815,7 @@ describe('Pipeline.resume', () => {
     const s = new Pipeline(scratch, OPTS)
     await burst(s, iso(at('16:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40 })
     await charging(s, at('16:01'), at('16:30'), 40)
+    await s.flush(new Date(at('16:31')), true)
     const [replayed] = scratch.state.sessions
 
     const db = new FakeDb()
@@ -822,10 +888,11 @@ describe('Pipeline.resume', () => {
     const p = new Pipeline(db, OPTS)
     await p.resume(tape(db), openRows(db), new Date(at('16:51')))
     await driving(p, at('16:52'), at('16:53'), 1017)
+    await p.flush(new Date(at('16:54')))
 
     const charge = db.state.sessions.find((x) => x.id === 'c')
     expect(charge?.isOpen).toBe(false)
-    expect(charge?.summary?.endedAt).toEqual(new Date(at('16:30')))
+    expect(charge?.summary?.endedAt).toEqual(new Date(at('16:31')))
     expect(charge?.summary?.distanceKm).toBeNull()
     expect(openRows(db).map((r) => r.id)).toEqual(['d'])
     expect(db.state.points.some((pt) => pt.sessionId === 'd' && pt.ts.getTime() === at('16:53'))).toBe(true)
@@ -920,10 +987,10 @@ describe('Pipeline: a charge longer than the six-hour level window', () => {
     const charges = db.state.sessions.filter((s) => s.kind === 'charge')
     expect(charges).toHaveLength(1)
     expect(charges[0]?.isOpen).toBe(false)
-    // Through the last energy report, not six hours and ten minutes in. (The
-    // summary ends at the last sample taken while charging; the Complete
-    // sample is what closes it, not one of its points.)
-    expect(charges[0]?.summary?.endedAt).toEqual(new Date(reports.at(-1)!))
+    // At the Complete, not six hours and ten minutes in. The Complete sample
+    // carries the final reading, so the charge ends on it.
+    expect(reports.at(-1)!).toBeLessThan(complete)
+    expect(charges[0]?.summary?.endedAt).toEqual(new Date(complete))
   })
 
   it('measures the whole charge on the AC counter, though both counters rise and power spoke once', async () => {

@@ -330,10 +330,8 @@ export class FieldAccumulator {
   private slots = new Map<string, Entry>()
   /** Arrival of the newest field in the pending sample. */
   private newestAt: number | null = null
-  /** Arrival of the oldest field in the pending sample. */
+  /** Arrival of the oldest field in the pending sample, for the hard-ceiling rule. */
   private pendingSince: number | null = null
-  /** Event time of the last sample emitted, for the hard-ceiling rule. */
-  private lastEmitAt: number | null = null
 
   apply(update: TeslaFieldUpdate, at: Date): void {
     const ms = at.getTime()
@@ -375,7 +373,10 @@ export class FieldAccumulator {
     // A clock that went backwards (NTP step, or a replayed tape out of order)
     // must not emit on every message; treat it as "not yet".
     if (ms - this.newestAt >= QUIET_PERIOD_MS) return true
-    return ms - (this.lastEmitAt ?? this.pendingSince) >= MAX_SAMPLE_INTERVAL_MS
+    // From the pending burst's own start, not the last emit: measured from the
+    // last emit, any gap over 30 s made a new burst's second message overdue,
+    // and its first field was written alone.
+    return ms - this.pendingSince >= MAX_SAMPLE_INTERVAL_MS
   }
 
   /** Anything accumulated but not yet emitted? */
@@ -398,7 +399,6 @@ export class FieldAccumulator {
       }
       state[key] = entry.value
     }
-    this.lastEmitAt = ts
     this.pendingSince = null
     // newestAt is kept: it is the anchor for the staleness of what remains.
     return { state: state as TeslaFieldUpdate, ts: new Date(ts) }
@@ -410,7 +410,6 @@ export class FieldAccumulator {
     copy.slots = new Map(this.slots)
     copy.newestAt = this.newestAt
     copy.pendingSince = this.pendingSince
-    copy.lastEmitAt = this.lastEmitAt
     return copy
   }
 }
@@ -677,6 +676,15 @@ export class Pipeline {
         this.openPoints.push(event.sample)
         await store.appendPoint(this.openId, event.sample)
       } else if (event.type === 'session-end' && this.openId) {
+        // The segmenter ends a session on a named sample: for a charge, the
+        // one that says it stopped, which carries the final energy counter and
+        // SoC. It is not always a point already, and the summary is built from
+        // the points, so without this a charge ended one reading early.
+        const last = this.openPoints.at(-1)
+        if (!last || event.sample.ts.getTime() > last.ts.getTime()) {
+          this.openPoints.push(event.sample)
+          await store.appendPoint(this.openId, event.sample)
+        }
         await this.finish(store, this.openId, event.kind, this.openPoints)
         this.openId = null
         this.openPoints = []
