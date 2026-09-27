@@ -764,6 +764,47 @@ describe('Pipeline.resume', () => {
       .toEqual(scratch.state.points.map((p) => p.ts.getTime()))
   })
 
+  it('matches a row stamped just before its replayed session, rather than duplicate it', async () => {
+    // The live worker and the replay can disagree on a start by a flush: the
+    // live timer races the database near the quiet boundary. Here the row
+    // falls between two charges, 10 s before the second began.
+    const scratch = new FakeDb()
+    const s = new Pipeline(scratch, OPTS)
+    await burst(s, iso(at('16:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40 })
+    await charging(s, at('16:01'), at('16:40'), 40)
+    await burst(s, iso(at('16:41')), { DetailedChargeState: 'DetailedChargeStateDisconnected', ACChargingPower: 0 })
+    await burst(s, iso(at('18:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 45 })
+    await charging(s, at('18:01'), at('18:20'), 45)
+
+    const db = new FakeDb()
+    db.state.raw = tape(scratch)
+    db.state.sessions.push({
+      id: 'early', vehicleId: 'veh-1', kind: 'charge', startedAt: new Date(at('18:00') - 10_000), isOpen: true, summary: null,
+    })
+    const report = await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('18:21')))
+
+    expect(report.abandoned).toEqual([])
+    expect(db.state.sessions.map((x) => x.id)).toEqual(['early'])
+    expect(openRows(db)).toEqual([{ id: 'early', kind: 'charge', startedAt: new Date(at('18:00')) }])
+  })
+
+  it('does not stretch the match to a row a whole sample interval before any session', async () => {
+    const scratch = new FakeDb()
+    const s = new Pipeline(scratch, OPTS)
+    await burst(s, iso(at('18:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 45 })
+    await charging(s, at('18:01'), at('18:20'), 45)
+
+    const db = new FakeDb()
+    db.state.raw = tape(scratch)
+    db.state.sessions.push({
+      id: 'stale', vehicleId: 'veh-1', kind: 'charge',
+      startedAt: new Date(at('18:00') - MAX_SAMPLE_INTERVAL_MS - 1), isOpen: true, summary: null,
+    })
+    const report = await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('18:21')))
+
+    expect(report.abandoned.map((r) => r.id)).toEqual(['stale'])
+  })
+
   it('closes an open charge with its own summary and resumes the open drive', async () => {
     const scratch = new FakeDb()
     const s = new Pipeline(scratch, OPTS)

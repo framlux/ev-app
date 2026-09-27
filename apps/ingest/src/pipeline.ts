@@ -959,17 +959,22 @@ class DryStore implements Store {
 
   /**
    * The replayed session a real row stands for: same kind, and the row's start
-   * inside the session's span. The latest such, because a row adopted into a
-   * later session keeps its own, earlier start.
+   * inside the session's span, or at most one sample interval before it. The
+   * slack is for a start the live worker and the replay disagree on: the live
+   * flush timer races the database near the quiet boundary, and an exact match
+   * would abandon the row and open a duplicate. Of several, the nearest start;
+   * a row adopted into a later session keeps its own start, so it is still
+   * nearest the first.
    */
   matchFor(row: OpenRow): ReplayedSession | null {
     const at = row.startedAt.getTime()
     let best: ReplayedSession | null = null
+    const distance = (s: ReplayedSession) => Math.abs(s.startedAt.getTime() - at)
     for (const s of this.sessions.values()) {
-      if (s.kind !== row.kind || s.startedAt.getTime() > at) continue
+      if (s.kind !== row.kind || s.startedAt.getTime() - MAX_SAMPLE_INTERVAL_MS > at) continue
       const end = s.closed ? (s.endedAt ?? s.points.at(-1)?.ts ?? s.startedAt).getTime() : Infinity
       if (at > end) continue
-      if (!best || s.startedAt.getTime() > best.startedAt.getTime()) best = s
+      if (!best || distance(s) < distance(best)) best = s
     }
     return best
   }
