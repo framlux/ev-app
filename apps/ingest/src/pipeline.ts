@@ -42,6 +42,8 @@ export interface Store {
   openSession(kind: SessionKind, vehicleId: string, at: Date): Promise<string>
   appendPoint(sessionId: string, s: VehicleSample): Promise<void>
   closeSession(sessionId: string, summary: SessionSummary): Promise<void>
+  /** Close without a summary: a row resume cannot account for. See `Pipeline.resume`. */
+  abandonSession(sessionId: string): Promise<void>
   recordBatteryHealth(row: BatteryHealthWrite): Promise<void>
   recordMeasuredCapacity(row: MeasuredCapacityWrite): Promise<void>
   /**
@@ -511,43 +513,89 @@ export class Pipeline {
   }
 
   /**
-   * Rebuild in-memory state for a session that was still open when the worker
-   * died, by replaying its own samples through the segmenter.
+   * Pick up where the previous worker stopped, by replaying the tape it wrote.
    *
-   * Without this a restart mid-drive forgets the session: the next sample opens
-   * a second one (the partial unique index turns that into adopting the first,
-   * with no points behind it) and the drive is summarised from whatever arrived
-   * after the restart. Replay costs one pass over rows already in `sample`.
+   * Everything the pipeline knows lives in memory: the carried field values,
+   * the open session and its points. A restart used to forget all of it, so a
+   * charge or drive open across a deploy was never closed, and the next session
+   * of its kind was merged into it (`openSession` adopts an open row). Nor could
+   * the state be rebuilt from `sample`: the car sends a field only when it
+   * changes, so a worker that restarted blind wrote samples without, say, the
+   * charge state, and replaying those rows would close a charge still running.
    *
-   * If the replay ends with nothing open, the session genuinely finished before
-   * the crash and is closed here rather than left open forever.
+   * The tape is what the previous worker actually saw, so the replay runs the
+   * very code the live path does, against a store that writes nothing. Then one
+   * transaction reconciles what it found with the rows that are really open,
+   * matched by kind and by time, never by kind alone:
+   *  - a row whose session the replay shows still running is carried on, and
+   *    gets back any points written while no worker knew about it;
+   *  - a row whose session ended is closed with the replay's summary and price;
+   *  - a row the tape cannot account for is closed without a summary;
+   *  - a session still running with no row of its own gets one.
+   *
+   * `now` stands in for the previous worker's shutdown flush, so the replay
+   * ends where it did; if that worker crashed instead, the last burst it never
+   * emitted is written here.
    */
-  async recoverOpenSession(
-    sessionId: string, kind: SessionKind, samples: VehicleSample[],
-  ): Promise<void> {
-    let state = initialState()
-    const points: VehicleSample[] = []
-    for (const sample of samples) {
-      const result = step(state, sample)
-      state = result.state
-      for (const event of result.events) {
-        if (event.type === 'session-start') points.length = 0
-        else if (event.type === 'session-point') points.push(event.sample)
+  async resume(
+    tape: Iterable<RawMessage> | AsyncIterable<RawMessage>,
+    open: readonly OpenRow[],
+    now: Date,
+  ): Promise<ResumeReport> {
+    const dry = new DryStore()
+    const live = this.runner
+    this.runner = { run: (fn) => fn(dry) }
+    let replayed = 0
+    try {
+      for await (const raw of tape) {
+        await this.handle(raw)
+        replayed++
+      }
+      dry.finalFlush = true
+      await this.flush(now, true)
+    } finally {
+      this.runner = live
+    }
+    // Both memos were filled against a store that wrote nothing.
+    this.ensuredMonths.clear()
+    this.measuredDays.clear()
+    return this.transactionally((store) => this.reconcile(store, dry, open, replayed))
+  }
+
+  private async reconcile(
+    store: Store, dry: DryStore, open: readonly OpenRow[], replayed: number,
+  ): Promise<ResumeReport> {
+    const report: ResumeReport = { replayed, resumed: null, closed: [], abandoned: [] }
+    for (const sample of dry.flushed) {
+      await this.ensureMonth(store, sample.ts)
+      await store.insertSample(sample)
+    }
+
+    const running = this.openId === null ? null : dry.session(this.openId)
+    let carried: string | null = null
+    const byStart = [...open].sort((x, y) => x.startedAt.getTime() - y.startedAt.getTime())
+    for (const row of byStart) {
+      const match = dry.matchFor(row)
+      if (match !== null && match === running) {
+        carried = row.id
+        report.resumed = row
+      } else if (match?.closed) {
+        await this.finish(store, row.id, row.kind, match.points)
+        report.closed.push(row)
+      } else {
+        await store.abandonSession(row.id)
+        report.abandoned.push(row)
       }
     }
 
-    this.state = state
-    this.openPoints = points
-
-    if (state.open) {
-      this.openId = sessionId
-      return
+    if (running) {
+      // Closed rows are settled above, so this cannot adopt one of them.
+      carried ??= await store.openSession(running.kind, running.vehicleId, running.startedAt)
+      report.resumed ??= { id: carried, kind: running.kind, startedAt: running.startedAt }
+      for (const point of this.openPoints) await store.appendPoint(carried, point)
     }
-
-    this.openId = null
-    if (points.length > 0) {
-      await this.transactionally((store) => this.finish(store, sessionId, kind, points))
-    }
+    this.openId = carried
+    return report
   }
 
   private accumulatorFor(vehicleId: string): FieldAccumulator {
@@ -841,4 +889,96 @@ function later(a: Date | null, b: Date | null): Date | null {
   if (!a) return b
   if (!b) return a
   return a.getTime() >= b.getTime() ? a : b
+}
+
+/** An open `session` row, as `findOpenSessions` reads it. */
+export interface OpenRow {
+  id: string
+  kind: SessionKind
+  startedAt: Date
+}
+
+/** What `Pipeline.resume` did, for the startup log. */
+export interface ResumeReport {
+  /** Tape messages replayed. */
+  replayed: number
+  /** The row the worker carries on with, if a session is still running. */
+  resumed: OpenRow | null
+  /** Open rows whose session had ended, now closed with the replay's summary. */
+  closed: OpenRow[]
+  /** Open rows the tape cannot account for, closed without a summary. */
+  abandoned: OpenRow[]
+}
+
+interface ReplayedSession {
+  id: string
+  kind: SessionKind
+  vehicleId: string
+  startedAt: Date
+  points: VehicleSample[]
+  closed: boolean
+  endedAt: Date | null
+}
+
+/**
+ * The store `resume` replays against. It writes nothing, and remembers the
+ * sessions the replay opened and closed so they can be matched with real rows.
+ */
+class DryStore implements Store {
+  private readonly sessions = new Map<string, ReplayedSession>()
+  private next = 0
+  /** Set for the flush that stands in for the stopped worker's shutdown. */
+  finalFlush = false
+  /** What that flush emitted: the burst a crashed worker never wrote. */
+  readonly flushed: VehicleSample[] = []
+
+  session(id: string): ReplayedSession | null {
+    return this.sessions.get(id) ?? null
+  }
+
+  /**
+   * The replayed session a real row stands for: same kind, and the row's start
+   * inside the session's span. The latest such, because a row adopted into a
+   * later session keeps its own, earlier start.
+   */
+  matchFor(row: OpenRow): ReplayedSession | null {
+    const at = row.startedAt.getTime()
+    let best: ReplayedSession | null = null
+    for (const s of this.sessions.values()) {
+      if (s.kind !== row.kind || s.startedAt.getTime() > at) continue
+      const end = s.closed ? (s.endedAt ?? s.points.at(-1)?.ts ?? s.startedAt).getTime() : Infinity
+      if (at > end) continue
+      if (!best || s.startedAt.getTime() > best.startedAt.getTime()) best = s
+    }
+    return best
+  }
+
+  async ensurePartitions(): Promise<void> {}
+  async insertRaw(): Promise<void> {}
+  async insertSample(s: VehicleSample): Promise<void> {
+    if (this.finalFlush) this.flushed.push(s)
+  }
+  async openSession(kind: SessionKind, vehicleId: string, at: Date): Promise<string> {
+    const id = `replay:${++this.next}`
+    this.sessions.set(id, { id, kind, vehicleId, startedAt: at, points: [], closed: false, endedAt: null })
+    return id
+  }
+  async appendPoint(sessionId: string, s: VehicleSample): Promise<void> {
+    this.sessions.get(sessionId)?.points.push(s)
+  }
+  async closeSession(sessionId: string, summary: SessionSummary): Promise<void> {
+    const s = this.sessions.get(sessionId)
+    if (s) {
+      s.closed = true
+      s.endedAt = summary.endedAt
+    }
+  }
+  async abandonSession(): Promise<void> {}
+  async recordBatteryHealth(): Promise<void> {}
+  async recordMeasuredCapacity(): Promise<void> {}
+  async rateAt(): Promise<EnergyPrice | null> {
+    return null
+  }
+  async recordSessionCost(): Promise<void> {}
+  async advanceCursor(): Promise<void> {}
 }

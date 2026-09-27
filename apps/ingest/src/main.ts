@@ -13,8 +13,13 @@ import {
   startMetricsServer,
 } from './metrics.js'
 import { subscribe } from './mqtt.js'
-import { Pipeline, QUIET_PERIOD_MS, type PipelineResult } from './pipeline.js'
-import { pgRunner, registerVehicle } from './store.js'
+import {
+  Pipeline,
+  QUIET_PERIOD_MS,
+  type OpenRow,
+  type PipelineResult,
+} from './pipeline.js'
+import { pgRunner, registerVehicle, resumeFromTape, resumeOrStartCold } from './store.js'
 import { pgRateStore, runRateRefresh } from './urdb.js'
 
 /**
@@ -76,14 +81,30 @@ async function main(): Promise<void> {
   // startup here instead is the honest outcome, and the pod restarts.
   await registerVehicle(pool, config.vehicle)
 
-  const pipeline = new Pipeline(
-    pgRunner(pool, config.cursorSource, config.vehicle.id),
-    { usableCapacityKwh: config.usableCapacityKwh },
-    // Where the car lives, for the charges its own `locatedAtHome` never covers.
-    // Omitting it costs nothing visible: the signal still classifies most
-    // charges, and the ones it misses simply read `unknown` weeks later.
-    config.home,
+  // Also BEFORE subscribing, and after the vehicle exists: carry on the session
+  // and the field values the previous worker had, rebuilt from its tape. A
+  // restart used to forget both, leaving a session open across a deploy to be
+  // merged into the next one (see Pipeline.resume).
+  const { pipeline, report } = await resumeOrStartCold(
+    () => new Pipeline(
+      pgRunner(pool, config.cursorSource, config.vehicle.id),
+      { usableCapacityKwh: config.usableCapacityKwh },
+      // Where the car lives, for the charges its own `locatedAtHome` never
+      // covers. Omitting it costs nothing visible: the signal still classifies
+      // most charges, and the ones it misses simply read `unknown` weeks later.
+      config.home,
+    ),
+    (p) => resumeFromTape(pool, p, config.vehicle.id),
+    (err) => console.error('resume failed; starting cold', err),
   )
+  if (report) {
+    const row = (r: OpenRow) => `${r.kind} ${r.id} from ${r.startedAt.toISOString()}`
+    console.log(
+      `resumed from ${report.replayed} taped messages: ` +
+        (report.resumed ? `carrying on ${row(report.resumed)}` : 'nothing open') +
+        (report.closed.length ? `; closed ${report.closed.map(row).join(', ')}` : '') +
+        (report.abandoned.length ? `; abandoned ${report.abandoned.map(row).join(', ')}` : ''))
+  }
 
   const record = (result: PipelineResult): void => {
     if (result.samples > 0) {

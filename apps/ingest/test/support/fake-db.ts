@@ -131,6 +131,11 @@ export class FakeDb implements StoreRunner {
         session.isOpen = false
         session.summary = summary
       },
+      abandonSession: async (sessionId) => {
+        // Closed, not summarised: the row's own figures are left as they were.
+        const session = s.sessions.find((x) => x.id === sessionId)
+        if (session) session.isOpen = false
+      },
       recordBatteryHealth: async (row) => { s.battery.push(row) },
       rateAt: async (at) => {
         s.rateLookups.push(at)

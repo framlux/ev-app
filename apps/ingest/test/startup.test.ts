@@ -1,8 +1,14 @@
+import { spawn } from 'node:child_process'
+import { createServer } from 'node:net'
+import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { RawMessage } from '@ev/core'
-import { closePool, getPool, runMigrationsUnderGate } from '@ev/db'
+import {
+  closePool, ensurePartitions, getPool, insertRaw, openSession, runMigrationsUnderGate,
+  withTransaction,
+} from '@ev/db'
 import { Pipeline } from '../src/pipeline.js'
-import { pgRunner, registerVehicle } from '../src/store.js'
+import { pgRunner, registerVehicle, resumeFromTape } from '../src/store.js'
 
 /**
  * The one thing about the worker that only a real Postgres can answer: does a
@@ -56,6 +62,7 @@ describe.skipIf(!hasDb)('worker startup', () => {
     await p.query('DELETE FROM raw_message WHERE vehicle_id=$1', [VEHICLE])
     await p.query('DELETE FROM sample WHERE vehicle_id=$1', [VEHICLE])
     await p.query('DELETE FROM ingest_cursor WHERE source=$1', ['startup-test'])
+    await p.query('DELETE FROM session WHERE vehicle_id=$1', [VEHICLE])
     await p.query('DELETE FROM vehicle WHERE id=$1', [VEHICLE])
     await closePool()
   })
@@ -88,4 +95,90 @@ describe.skipIf(!hasDb)('worker startup', () => {
     expect(rows).toHaveLength(1)
     expect(rows[0]?.display_name).toBe('Renamed')
   })
+
+  /**
+   * The tape a drive leaves: a minute of it at a time, moving and then parked.
+   * In 2027 so that no other test's rows for this vehicle share the window.
+   */
+  const drive = (minute: number, fields: Record<string, unknown>): RawMessage[] =>
+    Object.entries(fields).map(([name, value]) => ({
+      vehicleId: VEHICLE,
+      vendor: 'tesla' as const,
+      receivedAt: new Date(Date.UTC(2027, 1, 10, 10, minute)),
+      source: 'telemetry' as const,
+      payload: { kind: 'metrics', vin: VIN, field: name, value },
+    }))
+
+  it('resumes from the tape, closing an open drive the tape shows had parked', async () => {
+    const pool = getPool()
+    await registerVehicle(pool, identity)
+    const tape = [
+      ...[0, 1, 2, 3, 4, 5].flatMap((m) => drive(m, { VehicleSpeed: 40, Odometer: 1000 + m })),
+      ...[6, 7, 8, 9, 10, 11, 12, 13].flatMap((m) => drive(m, { VehicleSpeed: 0 })),
+    ]
+    const id = await withTransaction(pool, async (c) => {
+      await ensurePartitions(c, tape[0]!.receivedAt)
+      for (const m of tape) await insertRaw(c, m)
+      return openSession(c, VEHICLE, 'drive', tape[0]!.receivedAt)
+    })
+
+    const pipeline = new Pipeline(pgRunner(pool, 'startup-test', VEHICLE), { usableCapacityKwh: 75 })
+    const report = await resumeFromTape(pool, pipeline, VEHICLE, new Date(Date.UTC(2027, 1, 10, 10, 20)))
+
+    expect(report.closed.map((r) => r.id)).toEqual([id])
+    const { rows } = await pool.query('SELECT is_open, distance_km FROM session WHERE id=$1', [id])
+    expect(rows[0]?.is_open).toBe(false)
+    // Five miles of odometer, in kilometres.
+    expect(rows[0]?.distance_km).toBeCloseTo(8.05, 1)
+  })
+
+  /**
+   * The wiring, in the built worker: a row left open by an earlier worker,
+   * older than anything a resume replays, is closed before the worker
+   * subscribes, so it cannot absorb the next drive. The broker is unreachable
+   * on purpose; the resume happens before the worker ever needs it.
+   */
+  it('closes an orphaned session when the worker starts', async () => {
+    const pool = getPool()
+    await registerVehicle(pool, identity)
+    const orphan = await withTransaction(pool, (c) =>
+      openSession(c, VEHICLE, 'drive', new Date('2026-01-01T09:00:00.000Z')))
+
+    const closed = async () => {
+      const port = await new Promise<number>((resolve) => {
+        const server = createServer().listen(0, '127.0.0.1', () => {
+          const address = server.address()
+          server.close(() => resolve(typeof address === 'object' && address ? address.port : 0))
+        })
+      })
+      return port
+    }
+    const worker = spawn(process.execPath, [fileURLToPath(new URL('../dist/main.js', import.meta.url))], {
+      env: {
+        PATH: process.env['PATH'],
+        PGHOST: process.env['PGHOST'], PGPORT: process.env['PGPORT'],
+        PGUSER: process.env['PGUSER'], PGPASSWORD: process.env['PGPASSWORD'],
+        PGDATABASE: process.env['PGDATABASE'],
+        EV_VEHICLE_ID: VEHICLE, EV_VEHICLE_VIN: VIN, EV_USABLE_CAPACITY_KWH: '75',
+        MQTT_PASSWORD: 'unused', MQTT_URL: `mqtt://127.0.0.1:${await closed()}`,
+        METRICS_PORT: String(await closed()),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let out = ''
+    worker.stdout.on('data', (chunk: Buffer) => { out += chunk.toString() })
+    worker.stderr.on('data', (chunk: Buffer) => { out += chunk.toString() })
+    try {
+      let open = true
+      for (let i = 0; i < 75 && open; i++) {
+        await new Promise((r) => setTimeout(r, 200))
+        const { rows } = await pool.query('SELECT is_open FROM session WHERE id=$1', [orphan])
+        open = rows[0]?.is_open !== false
+      }
+      expect({ open, out }).toMatchObject({ open: false })
+      expect(out).toMatch(/resumed from \d+ taped messages: .*abandoned drive/)
+    } finally {
+      worker.kill('SIGKILL')
+    }
+  }, 30_000)
 })

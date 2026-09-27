@@ -10,7 +10,7 @@ import { insertRaw, streamRaw } from '../src/repo/raw.js'
 import { ensurePartitions, insertSample, upsertSample } from '../src/repo/samples.js'
 import { ensureVehicle, findVehicleIdByVendorId } from '../src/repo/vehicles.js'
 import {
-  appendPoint, closeSession, deleteDerived, findOpenSession, giveUpPendingCharges,
+  abandonSession, appendPoint, closeSession, deleteDerived, findOpenSession, giveUpPendingCharges,
   hasPendingCharges, openSession, pendingChargesSince, priceSession,
 } from '../src/repo/sessions.js'
 import { insertRate, listRates, rateAt } from '../src/repo/energy-rate.js'
@@ -491,7 +491,8 @@ describe.skipIf(!hasDb)('repositories', () => {
     const seen = await withTransaction(getPool(), async (c) => {
       const out: number[] = []
       // batchSize 1 exercises the keyset pagination rather than one big page.
-      for await (const row of streamRaw(c, at(0), at(2), 1)) {
+      // Its own vehicle: startup.test.ts tapes a message at the same instant.
+      for await (const row of streamRaw(c, at(0), at(2), 1, VEHICLE)) {
         out.push((row.payload as { seq: number }).seq)
       }
       return out
@@ -499,6 +500,55 @@ describe.skipIf(!hasDb)('repositories', () => {
     // Ordered, and `to` is exclusive so adjacent windows neither overlap nor
     // leave a hole.
     expect(seen).toEqual([0, 1])
+  })
+
+  it('streams one vehicle\'s tape when asked, which is all a resume may replay', async () => {
+    const at = (m: number) => new Date(TS.getTime() + 60 * 60_000 + m * 60_000)
+    await withTransaction(getPool(), async (c) => {
+      await insertRaw(c, { vehicleId: VEHICLE, vendor: 'tesla', source: 'telemetry', receivedAt: at(0), payload: { car: 1 } })
+      await insertRaw(c, { vehicleId: VEHICLE_UNCHECKED, vendor: 'tesla', source: 'telemetry', receivedAt: at(1), payload: { car: 2 } })
+    })
+    const seen = await withTransaction(getPool(), async (c) => {
+      const out: unknown[] = []
+      for await (const row of streamRaw(c, at(0), at(2), 1000, VEHICLE)) out.push(row.payload)
+      return out
+    })
+    expect(seen).toEqual([{ car: 1 }])
+    await getPool().query('DELETE FROM raw_message WHERE vehicle_id=$1', [VEHICLE_UNCHECKED])
+  })
+
+  /**
+   * Resume's last resort, for an open row the tape cannot account for: closed
+   * where its own points end (or where it started, with none), and its figures
+   * left as they were rather than invented. Its own vehicle, because
+   * `openSession` would adopt any drive another test left open on VEHICLE.
+   */
+  it('abandons an open session where its points end, or where it started', async () => {
+    const started = new Date('2026-09-04T12:00:00.000Z')
+    const lastPoint = new Date('2026-09-04T12:20:00.000Z')
+    const pool = getPool()
+    try {
+      const withPoints = await withTransaction(pool, async (c) => {
+        const id = await openSession(c, VEHICLE_UNCHECKED, 'drive', started)
+        await appendPoint(c, id, makeSample({ vehicleId: VEHICLE_UNCHECKED, ts: new Date('2026-09-04T12:10:00.000Z') }))
+        await appendPoint(c, id, makeSample({ vehicleId: VEHICLE_UNCHECKED, ts: lastPoint }))
+        await abandonSession(c, id)
+        return id
+      })
+      const bare = await withTransaction(pool, async (c) => {
+        const id = await openSession(c, VEHICLE_UNCHECKED, 'drive', started)
+        await abandonSession(c, id)
+        return id
+      })
+      expect(bare).not.toBe(withPoints)
+      const { rows } = await pool.query(
+        'SELECT id, is_open, ended_at, distance_km FROM session WHERE id = ANY($1)', [[withPoints, bare]])
+      const byId = Object.fromEntries(rows.map((r) => [r.id, r]))
+      expect(byId[withPoints]).toMatchObject({ is_open: false, ended_at: lastPoint, distance_km: null })
+      expect(byId[bare]).toMatchObject({ is_open: false, ended_at: started })
+    } finally {
+      await pool.query('DELETE FROM session WHERE vehicle_id=$1', [VEHICLE_UNCHECKED])
+    }
   })
 
   it('delivers a notification only after the transaction commits', async () => {

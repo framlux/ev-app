@@ -24,15 +24,21 @@ export interface RawRow {
 }
 
 /**
- * Stream the tape for a window, oldest first. Used by the reprocess entrypoint;
- * ordering is what lets a forward-only segmenter rebuild history correctly.
- * `to` is exclusive so that adjacent windows neither overlap nor leave a hole.
+ * Stream the tape for a window, oldest first. Used by the reprocess entrypoint
+ * and the worker's resume; ordering is what lets a forward-only segmenter
+ * rebuild history correctly. `to` is exclusive so that adjacent windows neither
+ * overlap nor leave a hole.
+ *
+ * `vehicleId` narrows it to one car. The worker only ever handles its own, and
+ * its segmenter holds one car's sessions, so a resume must replay that car's
+ * tape and nothing else.
  */
 export async function* streamRaw(
   c: DbClient,
   from: Date,
   to: Date,
   batchSize = 1000,
+  vehicleId: string | null = null,
 ): AsyncGenerator<RawRow> {
   let afterAt = from
   let afterId = '0'
@@ -42,9 +48,10 @@ export async function* streamRaw(
          FROM raw_message
         WHERE received_at >= $1 AND received_at < $2
           AND (received_at, id) > ($3, $4)
+          AND ($6::text IS NULL OR vehicle_id = $6)
         ORDER BY received_at, id
         LIMIT $5`,
-      [afterAt, to, afterAt, afterId, batchSize],
+      [afterAt, to, afterAt, afterId, batchSize, vehicleId],
     )
     if (rows.length === 0) return
     for (const r of rows) {

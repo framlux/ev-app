@@ -63,6 +63,25 @@ export async function findOpenSessions(
   return rows.map((r) => ({ id: r.id, kind: r.kind, startedAt: r.started_at }))
 }
 
+/**
+ * Close a session without a summary, because nothing can say what it was.
+ *
+ * For the worker's restart recovery only, when an open row has no counterpart
+ * in the tape it replays: an orphan from before the replay window, or a row a
+ * since-fixed bug wrote. Left open it would be adopted by the next session of
+ * its kind (see `openSession`), so it is closed where its own points end, and
+ * its figures stay whatever they were rather than being invented.
+ */
+export async function abandonSession(c: DbClient, sessionId: string): Promise<void> {
+  await c.query(
+    `UPDATE session
+        SET is_open = false,
+            ended_at = COALESCE(ended_at,
+              (SELECT max(ts) FROM session_point WHERE session_id = $1), started_at)
+      WHERE id = $1 AND is_open`,
+    [sessionId])
+}
+
 export async function appendPoint(
   c: DbClient, sessionId: string, s: VehicleSample,
 ): Promise<void> {

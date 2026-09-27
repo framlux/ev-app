@@ -552,87 +552,240 @@ describe('Pipeline transaction failure', () => {
   })
 })
 
-describe('Pipeline.recoverOpenSession', () => {
-  it('resumes a session that was still running, keeping its points', async () => {
+describe('Pipeline.resume', () => {
+  const iso = (ms: number) => new Date(ms).toISOString()
+  const at = (hhmm: string) => t(`2026-09-26T${hhmm}:00.000Z`).getTime()
+  const openRows = (db: FakeDb) =>
+    openSessions(db).map(({ id, kind, startedAt }) => ({ id, kind, startedAt }))
+  /** The tape a worker would stream back: what `insertRaw` wrote, in order. */
+  const tape = (db: FakeDb) => db.state.raw.slice()
+
+  /** Charging, a minute at a time. Power wanders, so every minute is a change the car sends. */
+  async function charging(p: Pipeline, from: number, to: number, soc: number): Promise<void> {
+    for (let ms = from; ms <= to; ms += 60_000) {
+      const m = (ms - from) / 60_000
+      await burst(p, iso(ms), { ACChargingPower: 7.2 + (m % 3) * 0.1, Soc: soc + m * 0.05 })
+    }
+  }
+
+  /** Driving, a minute at a time, the odometer counting. */
+  async function driving(p: Pipeline, from: number, to: number, odo: number): Promise<void> {
+    for (let ms = from; ms <= to; ms += 60_000) {
+      await burst(p, iso(ms), { VehicleSpeed: MOVING, Odometer: odo + (ms - from) / 60_000 })
+    }
+  }
+
+  it('resumes a charge across two cold restarts and closes it once, whole', async () => {
+    // 2026-09-26: the charge state arrived once, at 16:00:43. The v0.5.9
+    // rollout restarted the worker at 21:24 and the repair did again at 21:32,
+    // and the worker in between had no charge state, so it wrote samples and
+    // no session.
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
-
-    // Two samples already on disk from before the crash.
-    const samples = [
-      makeSample({ vehicleId: 'veh-1', ts: t('2026-09-04T10:00:00.000Z'), speedKph: 60, odometerKm: 1000, socPct: 80 }),
-      makeSample({ vehicleId: 'veh-1', ts: t('2026-09-04T10:05:00.000Z'), speedKph: 60, odometerKm: 1010, socPct: 75 }),
-    ]
-    db.state.sessions.push({
-      id: 's-old', vehicleId: 'veh-1', kind: 'drive',
-      startedAt: t('2026-09-04T10:00:00.000Z'), isOpen: true, summary: null,
+    const first = new Pipeline(db, OPTS)
+    const started = at('16:00') + 43_000
+    await burst(first, iso(started), {
+      DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 60,
     })
+    await charging(first, at('16:01'), at('21:23'), 60)
+    await first.flush(new Date(at('21:23') + 30_000), true)
+    const [charge] = openSessions(db)
+    expect(charge?.kind).toBe('charge')
 
-    await pipeline.recoverOpenSession('s-old', 'drive', samples)
+    const cold = new Pipeline(db, OPTS)
+    await charging(cold, at('21:24'), at('21:32'), 76)
+    await cold.flush(new Date(at('21:32') + 30_000), true)
 
-    // Now park it. The summary must span the whole drive, not just what
-    // arrived after the restart.
-    await pipeline.handleSample(makeSample({
-      vehicleId: 'veh-1', ts: t('2026-09-04T10:10:00.000Z'), speedKph: 0, odometerKm: 1020, socPct: 74 }))
-    await pipeline.handleSample(makeSample({
-      vehicleId: 'veh-1', ts: t('2026-09-04T10:16:00.000Z'), speedKph: 0, odometerKm: 1020, socPct: 74 }))
+    const resumed = new Pipeline(db, OPTS)
+    await resumed.resume(tape(db), openRows(db), new Date(at('21:33')))
+    await charging(resumed, at('21:33'), at('23:30'), 77)
+    await burst(resumed, iso(at('23:31')), {
+      DetailedChargeState: 'DetailedChargeStateComplete', ACChargingPower: 0,
+    })
+    await resumed.flush(new Date(at('23:32')), true)
 
-    const drive = db.state.sessions[0]
-    expect(drive?.isOpen).toBe(false)
-    expect(drive?.summary?.startOdometerKm).toBe(1000)
-    expect(drive?.summary?.distanceKm).toBe(20)
-    expect(db.state.sessions).toHaveLength(1)
+    const charges = db.state.sessions.filter((s) => s.kind === 'charge')
+    expect(charges.map((s) => s.id)).toEqual([charge!.id])
+    expect(charges[0]?.isOpen).toBe(false)
+    expect(charges[0]?.summary?.startedAt).toEqual(new Date(started))
+    expect(charges[0]?.summary?.endedAt).toEqual(new Date(at('23:30')))
+    // No hole where the cold worker ran, and priced exactly once.
+    const points = db.state.points.filter((p) => p.sessionId === charge!.id)
+    expect(points.map((p) => p.ts.getTime())).toContain(at('21:28'))
+    expect(db.state.costs.filter((c) => c.sessionId === charge!.id)).toHaveLength(1)
   })
 
-  it('closes a session whose samples show it had already finished', async () => {
+  /**
+   * An afternoon, a burst a minute: a drive, parked, a charge that pauses and
+   * resumes inside its window, unplugged, a second drive, a coverage gap longer
+   * than the segmenter's reset, and a charge still running at the end.
+   */
+  function afternoon(): Array<[number, Record<string, unknown>]> {
+    const out: Array<[number, Record<string, unknown>]> = []
+    let ms = at('12:00')
+    const push = (fields: Record<string, unknown>, gapMinutes = 1) => {
+      out.push([ms, fields])
+      ms += gapMinutes * 60_000
+    }
+    for (let i = 0; i < 12; i++) push({ VehicleSpeed: MOVING, Odometer: 1000 + i, Soc: 80 - i * 0.2 })
+    for (let i = 0; i < 7; i++) push({ VehicleSpeed: 0, Soc: 77.5 })
+    push({ DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 77.5 })
+    for (let i = 1; i <= 15; i++) push({ ACChargingPower: 7.2 + (i % 3) * 0.1, Soc: 77.5 + i * 0.1 })
+    push({ DetailedChargeState: 'DetailedChargeStateStopped', ACChargingPower: 0 }, 6)
+    push({ DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.1 })
+    for (let i = 1; i <= 8; i++) push({ ACChargingPower: 7.1 + (i % 3) * 0.1, Soc: 79 + i * 0.1 })
+    push({ DetailedChargeState: 'DetailedChargeStateDisconnected', ACChargingPower: 0 }, 3)
+    for (let i = 0; i < 10; i++) push({ VehicleSpeed: MOVING, Odometer: 1012 + i })
+    for (let i = 0; i < 6; i++) push({ VehicleSpeed: 0 }, i === 5 ? 90 : 1)
+    push({ DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 11, Soc: 75 })
+    for (let i = 1; i <= 10; i++) push({ ACChargingPower: 11 + (i % 3) * 0.1, Soc: 75 + i * 0.2 })
+    return out
+  }
+
+  /** What a viewer can see of the sessions, without the ids a restart may change. */
+  function sessionsOf(db: FakeDb) {
+    return db.state.sessions.map((s) => ({
+      kind: s.kind, startedAt: s.startedAt, isOpen: s.isOpen, summary: s.summary,
+      points: db.state.points.filter((p) => p.sessionId === s.id).length,
+    }))
+  }
+
+  async function straightThrough(): Promise<FakeDb> {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const p = new Pipeline(db, OPTS)
+    const bursts = afternoon()
+    for (const [ms, fields] of bursts) await burst(p, iso(ms), fields)
+    await p.flush(new Date(bursts.at(-1)![0] + 60_000), true)
+    return db
+  }
+
+  async function restartedAt(cut: number, graceful: boolean): Promise<FakeDb> {
+    const db = new FakeDb()
+    const bursts = afternoon()
+    const before = new Pipeline(db, OPTS)
+    for (const [ms, fields] of bursts.slice(0, cut)) await burst(before, iso(ms), fields)
+    const stoppedAt = bursts[cut - 1]![0] + 30_000
+    if (graceful) await before.flush(new Date(stoppedAt), true)
+
+    const after = new Pipeline(db, OPTS)
+    await after.resume(tape(db), openRows(db), new Date(stoppedAt))
+    for (const [ms, fields] of bursts.slice(cut)) await burst(after, iso(ms), fields)
+    await after.flush(new Date(bursts.at(-1)![0] + 60_000), true)
+    return db
+  }
+
+  it('makes a restart after any burst invisible, whether it shut down or crashed', async () => {
+    const expected = sessionsOf(await straightThrough())
+    expect(expected.map((s) => s.kind)).toEqual(['drive', 'charge', 'drive', 'charge'])
+    for (let cut = 1; cut < afternoon().length; cut++) {
+      for (const graceful of [true, false]) {
+        expect({ cut, graceful, sessions: sessionsOf(await restartedAt(cut, graceful)) })
+          .toEqual({ cut, graceful, sessions: expected })
+      }
+    }
+  }, 60_000)
+
+  it('splits a row that absorbed a second charge, closing it where the first one ended', async () => {
+    const scratch = new FakeDb()
+    const s = new Pipeline(scratch, OPTS)
+    const first = at('16:00')
+    await burst(s, iso(first), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40 })
+    await charging(s, at('16:01'), at('16:40'), 40)
+    await burst(s, iso(at('16:41')), { DetailedChargeState: 'DetailedChargeStateDisconnected', ACChargingPower: 0 })
+    await burst(s, iso(at('18:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 45 })
+    await charging(s, at('18:01'), at('18:20'), 45)
+
+    // What a cold worker leaves: the first charge never closed, so the second
+    // was adopted into it.
+    const db = new FakeDb()
+    db.state.raw = tape(scratch)
     db.state.sessions.push({
-      id: 's-old', vehicleId: 'veh-1', kind: 'drive',
-      startedAt: t('2026-09-04T10:00:00.000Z'), isOpen: true, summary: null,
+      id: 'merged', vehicleId: 'veh-1', kind: 'charge', startedAt: new Date(first), isOpen: true, summary: null,
     })
+    await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('18:21')))
 
-    // The car parked before the crash but the close never committed. Left
-    // alone this session stays open forever and blocks the next drive.
-    await pipeline.recoverOpenSession('s-old', 'drive', [
-      makeSample({ vehicleId: 'veh-1', ts: t('2026-09-04T10:00:00.000Z'), speedKph: 60, odometerKm: 1000 }),
-      makeSample({ vehicleId: 'veh-1', ts: t('2026-09-04T10:05:00.000Z'), speedKph: 0, odometerKm: 1010 }),
-      makeSample({ vehicleId: 'veh-1', ts: t('2026-09-04T10:12:00.000Z'), speedKph: 0, odometerKm: 1010 }),
-    ])
-
-    expect(openSessions(db)).toHaveLength(0)
-    expect(db.state.sessions[0]?.summary?.endOdometerKm).toBe(1010)
+    const merged = db.state.sessions.find((x) => x.id === 'merged')
+    expect(merged?.isOpen).toBe(false)
+    expect(merged?.summary?.endedAt).toEqual(new Date(at('16:40')))
+    expect(openRows(db).map((r) => [r.kind, r.startedAt])).toEqual([['charge', new Date(at('18:00'))]])
   })
 
-  it('re-prices a recovered charge at the rate its own start was under', async () => {
-    // `finish()` has two callers, so a session the worker recovers after a
-    // crash is priced here rather than on the sample path. That is correct
-    // rather than merely tolerated, and it is worth pinning: the lookup is by
-    // the session's own start, not by now, so a crash that straddles a rate
-    // change cannot make last week's charge cost this week's money. A
-    // `rateAt(new Date())` would pass every other test in this file.
+  it('closes an open charge with its own summary and resumes the open drive', async () => {
+    const scratch = new FakeDb()
+    const s = new Pipeline(scratch, OPTS)
+    await burst(s, iso(at('16:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40 })
+    await charging(s, at('16:01'), at('16:30'), 40)
+    await burst(s, iso(at('16:31')), { DetailedChargeState: 'DetailedChargeStateDisconnected', ACChargingPower: 0 })
+    await driving(s, at('16:35'), at('16:50'), 1000)
+
+    const db = new FakeDb()
+    db.state.raw = tape(scratch)
+    db.state.sessions.push(
+      { id: 'c', vehicleId: 'veh-1', kind: 'charge', startedAt: new Date(at('16:00')), isOpen: true, summary: null },
+      { id: 'd', vehicleId: 'veh-1', kind: 'drive', startedAt: new Date(at('16:35')), isOpen: true, summary: null },
+    )
+    const p = new Pipeline(db, OPTS)
+    await p.resume(tape(db), openRows(db), new Date(at('16:51')))
+    await driving(p, at('16:52'), at('16:53'), 1017)
+
+    const charge = db.state.sessions.find((x) => x.id === 'c')
+    expect(charge?.isOpen).toBe(false)
+    expect(charge?.summary?.endedAt).toEqual(new Date(at('16:30')))
+    expect(charge?.summary?.distanceKm).toBeNull()
+    expect(openRows(db).map((r) => r.id)).toEqual(['d'])
+    expect(db.state.points.some((pt) => pt.sessionId === 'd' && pt.ts.getTime() === at('16:53'))).toBe(true)
+  })
+
+  it('abandons an open row the tape cannot account for, rather than let it absorb the next one', async () => {
+    const db = new FakeDb()
+    db.state.sessions.push({
+      id: 'orphan', vehicleId: 'veh-1', kind: 'drive', startedAt: new Date(at('09:00')), isOpen: true, summary: null,
+    })
+    await new Pipeline(db, OPTS).resume([], openRows(db), new Date(at('12:00')))
+    expect(db.state.sessions[0]).toMatchObject({ id: 'orphan', isOpen: false, summary: null })
+  })
+
+  it('writes nothing while it replays', async () => {
+    const db = new FakeDb()
+    const p = new Pipeline(db, OPTS)
+    await driving(p, at('10:00'), at('10:10'), 1000)
+    await p.flush(new Date(at('10:10') + 30_000), true)
+    const before = structuredClone(db.state)
+
+    await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('10:11')))
+
+    expect(db.state.raw).toEqual(before.raw)
+    expect(db.state.samples).toEqual(before.samples)
+    expect(db.state.cursor).toEqual(before.cursor)
+    expect(db.state.sessions).toEqual(before.sessions)
+    expect(db.state.points).toEqual(before.points)
+  })
+
+  it('prices a charge that ended while it was down at the rate its own start was under', async () => {
+    // `rateAt(new Date())` would pass every other test here: the lookup must
+    // be by the session's start, so a restart that straddles a rate change
+    // cannot make last week's charge cost this week's money.
+    const scratch = new FakeDb()
+    const s = new Pipeline(scratch, OPTS, HOME)
+    await burst(s, '2026-09-04T20:00:00.000Z', {
+      DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2,
+      ACChargingEnergyIn: 0, Soc: 30, LocatedAtHome: true,
+    })
+    await burst(s, '2026-09-04T20:45:00.000Z', { ACChargingPower: 7.3, ACChargingEnergyIn: 20, Soc: 60 })
+    await burst(s, '2026-09-04T20:50:00.000Z', { DetailedChargeState: 'DetailedChargeStateDisconnected', ACChargingPower: 0 })
+
     const db = new FakeDb()
     db.state.rates = [OLD_RATE, NEW_RATE]
-    const pipeline = new Pipeline(db, OPTS, HOME)
+    db.state.raw = tape(scratch)
     db.state.sessions.push({
-      id: 's-old', vehicleId: 'veh-1', kind: 'charge',
+      id: 'c', vehicleId: 'veh-1', kind: 'charge',
       startedAt: t('2026-09-04T20:00:00.000Z'), isOpen: true, summary: null,
     })
-
-    await pipeline.recoverOpenSession('s-old', 'charge', [
-      makeSample({ vehicleId: 'veh-1', ts: t('2026-09-04T20:00:00.000Z'),
-        chargeState: 'charging', chargeEnergyAddedKwh: 0, locatedAtHome: true }),
-      makeSample({ vehicleId: 'veh-1', ts: t('2026-09-04T20:45:00.000Z'),
-        chargeState: 'charging', chargeEnergyAddedKwh: 20, locatedAtHome: true }),
-      makeSample({ vehicleId: 'veh-1', ts: t('2026-09-04T20:50:00.000Z'),
-        chargeState: 'disconnected' }),
-    ])
+    await new Pipeline(db, OPTS, HOME).resume(tape(db), openRows(db), t('2026-09-05T08:00:00.000Z'))
 
     expect(openSessions(db)).toHaveLength(0)
-    // Looked up at 20:00 on the 4th, so the 5th's increase never applies:
-    // 20 kWh x $0.10, not x $0.20.
     expect(db.state.rateLookups).toEqual([t('2026-09-04T20:00:00.000Z')])
     expect(db.state.costs).toEqual([{
-      sessionId: 's-old', cost: 2, costCurrency: 'USD', costRatePerKwh: 0.1,
+      sessionId: 'c', cost: 2, costCurrency: 'USD', costRatePerKwh: 0.1,
       costBasis: 'home', costSource: 'urdb',
     }])
   })

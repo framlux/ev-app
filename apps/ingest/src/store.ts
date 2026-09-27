@@ -1,9 +1,11 @@
 import {
+  abandonSession,
   advanceCursor,
   appendPoint,
   closeSession,
   ensurePartitions,
   ensureVehicle,
+  findOpenSessions,
   insertRaw,
   insertSample,
   notifyVehicleChanged,
@@ -11,15 +13,25 @@ import {
   priceSession,
   rateAt,
   recordMeasuredCapacity,
+  streamRaw,
   upsertBatteryHealth,
   upsertSample,
   withTransaction,
   type DbClient,
   type DbPool,
+  type RawRow,
   type VehicleChange,
 } from '@ev/db'
 import type { Config } from './config.js'
-import type { Store, StoreRunner } from './pipeline.js'
+import type { RawMessage } from './deps.js'
+import {
+  STALE_VALUE_MS,
+  type OpenRow,
+  type Pipeline,
+  type ResumeReport,
+  type Store,
+  type StoreRunner,
+} from './pipeline.js'
 
 /**
  * Make the configured vehicle exist, once, before the first message.
@@ -53,6 +65,74 @@ export async function registerVehicle(pool: DbPool, vehicle: Config['vehicle']):
   )
 }
 
+/**
+ * The furthest back a resume replays. A row open longer than this is an orphan,
+ * not a session: nothing drives or charges for two days, and replaying days of
+ * tape at every startup would delay the worker for a row it can only abandon.
+ */
+export const RESUME_MAX_LOOKBACK_MS = 2 * 24 * 60 * 60_000
+
+/**
+ * Where `resumeFromTape` starts: before the earliest open session by the time a
+ * value is carried (STALE_VALUE_MS), so what the car last said is known again
+ * by the time that session began, and never further back than the cap.
+ */
+export function resumeWindowStart(open: readonly OpenRow[], now: Date): Date {
+  const earliest = Math.min(now.getTime(), ...open.map((r) => r.startedAt.getTime()))
+  return new Date(Math.max(earliest - STALE_VALUE_MS, now.getTime() - RESUME_MAX_LOOKBACK_MS))
+}
+
+/**
+ * Rebuild the worker's state from the tape, before it subscribes. See
+ * `Pipeline.resume` for why the tape and not the sample table.
+ */
+export async function resumeFromTape(
+  pool: DbPool, pipeline: Pipeline, vehicleId: string, now: Date = new Date(),
+): Promise<ResumeReport> {
+  const client = await pool.connect()
+  try {
+    const open = await findOpenSessions(client, vehicleId)
+    // To the end of the tape: nothing new is taped until this worker subscribes.
+    const to = new Date(now.getTime() + 24 * 60 * 60_000)
+    const tape = messagesOf(streamRaw(client, resumeWindowStart(open, now), to, 1000, vehicleId))
+    return await pipeline.resume(tape, open, now)
+  } finally {
+    client.release()
+  }
+}
+
+async function* messagesOf(rows: AsyncIterable<RawRow>): AsyncGenerator<RawMessage> {
+  for await (const row of rows) {
+    yield {
+      vehicleId: row.vehicleId,
+      vendor: row.vendor,
+      receivedAt: row.receivedAt,
+      source: row.source,
+      payload: row.payload,
+    }
+  }
+}
+
+/**
+ * Resume, or start cold if that fails. main()'s catch exits, so a resume that
+ * threw there would crash-loop and ingest nothing, which is the outage this
+ * exists to prevent. The cold start gets a pipeline the failed replay never
+ * touched; the reconcile is one transaction, so the database is untouched too.
+ */
+export async function resumeOrStartCold<P>(
+  make: () => P,
+  resume: (pipeline: P) => Promise<ResumeReport>,
+  onError: (err: unknown) => void,
+): Promise<{ pipeline: P; report: ResumeReport | null }> {
+  const pipeline = make()
+  try {
+    return { pipeline, report: await resume(pipeline) }
+  } catch (err) {
+    onError(err)
+    return { pipeline: make(), report: null }
+  }
+}
+
 /** Bind the repo layer's (client, ...) functions to one connection. */
 export function storeOn(client: DbClient, cursorSource: string): Store {
   return {
@@ -62,6 +142,7 @@ export function storeOn(client: DbClient, cursorSource: string): Store {
     openSession: (kind, vehicleId, at) => openSession(client, vehicleId, kind, at),
     appendPoint: (sessionId, s) => appendPoint(client, sessionId, s),
     closeSession: (sessionId, summary) => closeSession(client, sessionId, summary),
+    abandonSession: (sessionId) => abandonSession(client, sessionId),
     recordBatteryHealth: (row) => upsertBatteryHealth(client, row),
     recordMeasuredCapacity: (row) => recordMeasuredCapacity(client, row),
     // The read half of the seam (spec §3.4). `EnergyRate` is a superset of what
