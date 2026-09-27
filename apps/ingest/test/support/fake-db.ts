@@ -136,6 +136,10 @@ export class FakeDb implements StoreRunner {
         const session = s.sessions.find((x) => x.id === sessionId)
         if (session) session.isOpen = false
       },
+      discardSession: async (sessionId) => {
+        s.sessions = s.sessions.filter((x) => x.id !== sessionId)
+        s.points = s.points.filter((p) => p.sessionId !== sessionId)
+      },
       resetSession: async (sessionId, startedAt, points) => {
         const session = s.sessions.find((x) => x.id === sessionId)
         if (!session) throw new Error(`resetSession: no session ${sessionId}`)

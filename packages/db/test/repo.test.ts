@@ -11,7 +11,7 @@ import { ensurePartitions, insertSample, upsertSample } from '../src/repo/sample
 import { ensureVehicle, findVehicleIdByVendorId } from '../src/repo/vehicles.js'
 import {
   abandonSession, appendPoint, closeSession, deleteDerived, findOpenSession, giveUpPendingCharges,
-  hasPendingCharges, openSession, pendingChargesSince, priceSession, resetSession,
+  discardSession, hasPendingCharges, openSession, pendingChargesSince, priceSession, resetSession,
 } from '../src/repo/sessions.js'
 import { insertRate, listRates, rateAt } from '../src/repo/energy-rate.js'
 import { recordMeasuredCapacity, upsertBatteryHealth } from '../src/repo/battery.js'
@@ -546,6 +546,30 @@ describe.skipIf(!hasDb)('repositories', () => {
       const byId = Object.fromEntries(rows.map((r) => [r.id, r]))
       expect(byId[withPoints]).toMatchObject({ is_open: false, ended_at: lastPoint, distance_km: null })
       expect(byId[bare]).toMatchObject({ is_open: false, ended_at: started })
+    } finally {
+      await pool.query('DELETE FROM session WHERE vehicle_id=$1', [VEHICLE_UNCHECKED])
+    }
+  })
+
+  /**
+   * A drive that went nowhere (a shuffle into the garage) is not kept: its
+   * row goes, and its points with it, so nothing reads it as a trip.
+   */
+  it('discards a session and its points', async () => {
+    const at = (m: number) => new Date(Date.parse('2026-09-04T15:00:00.000Z') + m * 60_000)
+    const pool = getPool()
+    try {
+      const [gone, kept] = await withTransaction(pool, async (c) => {
+        const gone = await openSession(c, VEHICLE_UNCHECKED, 'drive', at(0))
+        await appendPoint(c, gone, makeSample({ vehicleId: VEHICLE_UNCHECKED, ts: at(1) }))
+        await discardSession(c, gone)
+        const kept = await openSession(c, VEHICLE_UNCHECKED, 'drive', at(10))
+        return [gone, kept]
+      })
+      const { rows } = await pool.query('SELECT id FROM session WHERE id = ANY($1)', [[gone, kept]])
+      expect(rows.map((r) => r.id)).toEqual([kept])
+      const { rows: points } = await pool.query('SELECT 1 FROM session_point WHERE session_id=$1', [gone])
+      expect(points).toEqual([])
     } finally {
       await pool.query('DELETE FROM session WHERE vehicle_id=$1', [VEHICLE_UNCHECKED])
     }

@@ -103,6 +103,17 @@ export async function resetSession(
   for (const p of points) await appendPoint(c, sessionId, p)
 }
 
+/**
+ * Delete a session outright, its points with it (ON DELETE CASCADE).
+ *
+ * For a drive that went nowhere: pulling into the garage after dropping
+ * everyone at the door, the odometer never moving. It is real movement, but
+ * not a trip, and kept it would count as one. See `Pipeline.finish`.
+ */
+export async function discardSession(c: DbClient, sessionId: string): Promise<void> {
+  await c.query('DELETE FROM session WHERE id=$1', [sessionId])
+}
+
 export async function appendPoint(
   c: DbClient, sessionId: string, s: VehicleSample,
 ): Promise<void> {

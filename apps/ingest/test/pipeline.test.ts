@@ -447,6 +447,92 @@ describe('Pipeline session handling', () => {
  * measurement has no session behind it, it is a field on a sample. The two
  * series share a daily row and neither may overwrite the other.
  */
+describe('Pipeline: a drive that went nowhere', () => {
+  /**
+   * Into the garage after dropping everyone at the door, as 2026-09-26 00:37
+   * did it: back and forth at walking pace, the odometer never moving, then
+   * parked. Speeds are in mph, as the car streams them.
+   */
+  async function shuffle(pipeline: Pipeline, odometer: number): Promise<void> {
+    const steps: Array<[string, Record<string, unknown>]> = [
+      ['00:37:23', { VehicleSpeed: 3, Gear: 'ShiftStateD', Odometer: odometer }],
+      ['00:37:36', { VehicleSpeed: 3, Gear: 'ShiftStateP' }],
+      ['00:37:45', { VehicleSpeed: 0, Gear: 'ShiftStateR' }],
+      ['00:37:56', { VehicleSpeed: 3, Gear: 'ShiftStateD' }],
+      ['00:38:25', { VehicleSpeed: 4, Gear: 'ShiftStateR' }],
+      ['00:38:45', { VehicleSpeed: 0, Gear: 'ShiftStateP' }],
+    ]
+    for (const [hms, fields] of steps) await burst(pipeline, `2026-09-26T${hms}.000Z`, fields)
+  }
+
+  it('discards it when it closes, points and all, and still reports the close', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+    await shuffle(pipeline, 39571)
+    expect(openSessions(db).map((x) => x.kind)).toEqual(['drive'])
+
+    // Parked past the five-minute threshold, which is what closes a drive.
+    await pipeline.handle(field('2026-09-26T00:44:00.000Z', 'Soc', 56))
+    const closing = await pipeline.flush(t('2026-09-26T00:44:05.000Z'))
+
+    expect(db.state.sessions).toEqual([])
+    expect(db.state.points).toEqual([])
+    // A viewer saw it open, so its end is news: the runner notifies on this.
+    expect(closing.sessionsClosed).toBe(1)
+  })
+
+  it('discards one that ends in a plug-in, and opens the charge', async () => {
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+    await shuffle(pipeline, 39571)
+    await burst(pipeline, '2026-09-26T00:40:43.000Z', {
+      DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 1.2,
+    })
+    await pipeline.flush(t('2026-09-26T00:40:50.000Z'))
+
+    expect(db.state.sessions.map((x) => [x.kind, x.isOpen])).toEqual([['charge', true]])
+  })
+
+  it('keeps a short hop that went somewhere, and a slow crawl that moved the odometer', async () => {
+    // 2026-09-09 17:52: 0.16 km at up to 23 km/h. A real trip, however short.
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+    await burst(pipeline, '2026-09-09T17:52:25.000Z', { VehicleSpeed: 14, Odometer: 38000 })
+    await burst(pipeline, '2026-09-09T17:53:25.000Z', { VehicleSpeed: 0, Odometer: 38000 })
+    await burst(pipeline, '2026-09-09T17:59:00.000Z', { VehicleSpeed: 0 })
+    // A crawl through a car park: never above 10 km/h, but it went 0.3 km.
+    await burst(pipeline, '2026-09-09T18:10:00.000Z', { VehicleSpeed: 5, Odometer: 38000 })
+    await burst(pipeline, '2026-09-09T18:13:00.000Z', { VehicleSpeed: 0, Odometer: 38000.2 })
+    await burst(pipeline, '2026-09-09T18:19:00.000Z', { VehicleSpeed: 0 })
+    await pipeline.flush(t('2026-09-09T18:19:05.000Z'))
+
+    expect(db.state.sessions.map((x) => [x.kind, x.isOpen])).toEqual([['drive', false], ['drive', false]])
+  })
+
+  it('discards the row of one a restart left open, rather than abandon a stub', async () => {
+    // The worker died after the car's next report, which it taped but never
+    // got to emit: the replay's final flush is what closes the drive.
+    const scratch = new FakeDb()
+    const s = new Pipeline(scratch, OPTS)
+    await shuffle(s, 39571)
+    await s.handle(field('2026-09-26T00:44:00.000Z', 'Soc', 56))
+    const [open] = scratch.state.sessions
+
+    const db = new FakeDb()
+    db.state.raw = scratch.state.raw.slice()
+    db.state.sessions = structuredClone(scratch.state.sessions)
+    db.state.points = structuredClone(scratch.state.points)
+    const report = await new Pipeline(db, OPTS).resume(
+      db.state.raw, openSessions(db).map(({ id, kind, startedAt }) => ({ id, kind, startedAt })),
+      t('2026-09-26T00:44:00.000Z'))
+
+    expect(db.state.sessions).toEqual([])
+    expect(db.state.points).toEqual([])
+    expect(report).toMatchObject({ abandoned: [], closed: [], sessionsClosed: 1 })
+    expect(report.discarded.map((r) => r.id)).toEqual([open!.id])
+  })
+})
+
 describe('Pipeline: measured battery capacity', () => {
   it("records the car's measured pack energy once per UTC day", async () => {
     const db = new FakeDb()

@@ -44,6 +44,8 @@ export interface Store {
   closeSession(sessionId: string, summary: SessionSummary): Promise<void>
   /** Close without a summary: a row resume cannot account for. See `Pipeline.resume`. */
   abandonSession(sessionId: string): Promise<void>
+  /** Delete a session and its points: a drive that went nowhere. See `wentNowhere`. */
+  discardSession(sessionId: string): Promise<void>
   /** Replace an open row's start and points with a replay's. See `Pipeline.resume`. */
   resetSession(sessionId: string, startedAt: Date, points: readonly VehicleSample[]): Promise<void>
   recordBatteryHealth(row: BatteryHealthWrite): Promise<void>
@@ -592,7 +594,7 @@ export class Pipeline {
     store: Store, dry: DryStore, open: readonly OpenRow[], replayed: number,
   ): Promise<ResumeReport> {
     const report: ResumeReport = {
-      ...EMPTY, replayed, resumed: null, closed: [], abandoned: [],
+      ...EMPTY, replayed, resumed: null, closed: [], abandoned: [], discarded: [],
       samples: dry.flushed.length, lastSampleTs: dry.newestSampleTs,
     }
     for (const sample of dry.flushed) {
@@ -610,8 +612,8 @@ export class Pipeline {
         report.resumed = { ...row, startedAt: match.startedAt }
       } else if (match?.closed) {
         await store.resetSession(row.id, match.startedAt, match.points)
-        await this.finish(store, row.id, row.kind, match.points)
-        report.closed.push(row)
+        const kept = await this.finish(store, row.id, row.kind, match.points)
+        ;(kept ? report.closed : report.discarded).push(row)
       } else {
         await store.abandonSession(row.id)
         report.abandoned.push(row)
@@ -628,7 +630,7 @@ export class Pipeline {
       await store.resetSession(carried, running.startedAt, this.openPoints)
     }
     this.openId = carried
-    report.sessionsClosed = report.closed.length + report.abandoned.length
+    report.sessionsClosed = report.closed.length + report.abandoned.length + report.discarded.length
     return report
   }
 
@@ -708,10 +710,15 @@ export class Pipeline {
     }
   }
 
+  /** Close a session, or discard it if it was a drive that went nowhere; true if kept. */
   private async finish(
     store: Store, sessionId: string, kind: SessionKind, points: VehicleSample[],
-  ): Promise<void> {
+  ): Promise<boolean> {
     const summary = summariseSession(kind, points, this.opts)
+    if (kind === 'drive' && wentNowhere(summary, points)) {
+      await store.discardSession(sessionId)
+      return false
+    }
     await store.closeSession(sessionId, summary)
 
     // Two things hang off a closing charge and nothing hangs off a closing
@@ -722,9 +729,10 @@ export class Pipeline {
     // reason: a drive's energy is inferred from a nameplate capacity rather
     // than measured, so neither a capacity estimate nor a price could be
     // anything but circular.
-    if (kind !== 'charge') return
+    if (kind !== 'charge') return true
     await this.recordHealth(store, summary, points)
     await this.attachCost(store, sessionId, summary, points)
+    return true
   }
 
   /**
@@ -928,6 +936,27 @@ function merge(a: PipelineResult, b: PipelineResult): PipelineResult {
   }
 }
 
+/**
+ * The fastest a drive may go and still count as going nowhere, in km/h.
+ *
+ * Walking pace with room to spare: the shuffles this is for (2026-09-14,
+ * 09-15, 09-26, 09-27, pulling into the garage after stopping at the door)
+ * topped out at 2-6 km/h, and the shortest real trip on the tape, 0.16 km on
+ * 2026-09-09, reached 23.
+ */
+export const NOWHERE_MAX_SPEED_KPH = 10
+
+/**
+ * A drive that went nowhere: the odometer never moved and it never went
+ * faster than NOWHERE_MAX_SPEED_KPH. The car really moved, into the garage or
+ * across the driveway, but it was not a trip, and kept it would count as one
+ * in the drive list and totals. `finish` deletes it rather than close it.
+ */
+export function wentNowhere(summary: SessionSummary, points: readonly VehicleSample[]): boolean {
+  if (summary.distanceKm !== null && summary.distanceKm > 0) return false
+  return points.every((p) => p.speedKph === null || p.speedKph <= NOWHERE_MAX_SPEED_KPH)
+}
+
 function later(a: Date | null, b: Date | null): Date | null {
   if (!a) return b
   if (!b) return a
@@ -956,6 +985,8 @@ export interface ResumeReport extends PipelineResult {
   closed: OpenRow[]
   /** Open rows the tape cannot account for, closed without a summary. */
   abandoned: OpenRow[]
+  /** Open rows whose drive ended having gone nowhere, deleted. */
+  discarded: OpenRow[]
 }
 
 interface ReplayedSession {
@@ -1030,6 +1061,13 @@ class DryStore implements Store {
     }
   }
   async abandonSession(): Promise<void> {}
+  async discardSession(sessionId: string): Promise<void> {
+    const s = this.sessions.get(sessionId)
+    if (s) {
+      s.closed = true
+      s.endedAt = s.points.at(-1)?.ts ?? s.startedAt
+    }
+  }
   async resetSession(): Promise<void> {}
   async recordBatteryHealth(): Promise<void> {}
   async recordMeasuredCapacity(): Promise<void> {}

@@ -121,7 +121,8 @@ async function main(): Promise<void> {
       `resumed from ${report.replayed} taped messages: ` +
         (report.resumed ? `carrying on ${row(report.resumed)}` : 'nothing open') +
         (report.closed.length ? `; closed ${report.closed.map(row).join(', ')}` : '') +
-        (report.abandoned.length ? `; abandoned ${report.abandoned.map(row).join(', ')}` : ''))
+        (report.abandoned.length ? `; abandoned ${report.abandoned.map(row).join(', ')}` : '') +
+        (report.discarded.length ? `; discarded ${report.discarded.map(row).join(', ')}` : ''))
   }
 
   const client = subscribe(
