@@ -13,10 +13,12 @@ import {
   closePool,
   deleteDerived,
   ensurePartitions,
+  findOpenSessions,
   getPool,
   streamRaw,
   withTransaction,
   type DbClient,
+  type OpenSessionRow,
 } from '@ev/db'
 import { loadConfig } from './config.js'
 import { Pipeline } from './pipeline.js'
@@ -40,6 +42,19 @@ export function parseArgs(argv: string[]): Window {
   return window
 }
 
+/**
+ * The open sessions a replay of `w` would wrongly adopt.
+ *
+ * The replay deletes and rebuilds the sessions that START inside its window,
+ * but `openSession` adopts whatever row of that kind is already open, so one
+ * left open outside the window swallows the first rebuilt session of its kind.
+ * A Sep 12 charge was once written onto a Sep 26 row exactly this way.
+ */
+export function openOutsideWindow(open: OpenSessionRow[], w: Window): OpenSessionRow[] {
+  return open.filter((s) =>
+    s.startedAt.getTime() < w.from.getTime() || s.startedAt.getTime() >= w.to.getTime())
+}
+
 function valueOf(argv: string[], flag: string): string | undefined {
   const i = argv.indexOf(flag)
   return i === -1 ? undefined : argv[i + 1]
@@ -51,6 +66,13 @@ async function main(): Promise<void> {
   const pool = getPool()
 
   const replayed = await withTransaction(pool, async (client: DbClient) => {
+    const adoptable = openOutsideWindow(await findOpenSessions(client, config.vehicle.id), { from, to })
+    if (adoptable.length > 0) {
+      const names = adoptable.map((s) => `${s.kind} ${s.id} (started ${s.startedAt.toISOString()})`)
+      throw new Error(
+        `open outside the window, so the replay would adopt it: ${names.join(', ')}. ` +
+          'Widen the window to cover it.')
+    }
     await ensurePartitions(client, from)
     await deleteDerived(client, config.vehicle.id, from, to)
 

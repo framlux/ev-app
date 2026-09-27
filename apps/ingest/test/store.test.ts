@@ -63,6 +63,19 @@ describe('the sample write path', () => {
     expect(client.sql).toEqual([])
   })
 
+  /**
+   * The cursor row is the live worker's. A replay is one long transaction, so
+   * writing it held that row's lock for the whole rebuild and stalled every
+   * live message behind it - with a deadlock waiting at the tail, where the
+   * replay's upsert meets a sample the blocked live transaction already wrote.
+   */
+  it('does not move the live cursor', async () => {
+    const client = new RecordingClient()
+    await replayStoreOn(client as unknown as DbClient, 'test')
+      .advanceCursor(new Date('2026-09-20T10:00:00.000Z'))
+    expect(client.sql).toEqual([])
+  })
+
   it('changes nothing else about the store', () => {
     const client = new RecordingClient() as unknown as DbClient
     expect(Object.keys(replayStoreOn(client, 'test')))

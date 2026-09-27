@@ -104,6 +104,11 @@ export function replayStoreOn(client: DbClient, cursorSource: string): Store {
     // received_at and a higher id, so streamRaw's keyset page reads it straight
     // back, replays it, and writes another.
     insertRaw: async () => {},
+    // The cursor row is the live worker's. A replay is one long transaction, so
+    // writing it held that row's lock for the whole rebuild and stalled every
+    // live message behind it; nothing reads the cursor, so a replay has no
+    // reason to touch it.
+    advanceCursor: async () => {},
   }
 }
 
