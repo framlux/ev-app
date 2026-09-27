@@ -265,6 +265,26 @@ export const VOLATILE_FIELDS: ReadonlySet<string> = new Set<string>([
     .flatMap(slotsOf),
 ])
 
+/**
+ * The slots a charge's state lives in, and the rails whose power keeps it alive.
+ *
+ * The car sends a field only when it changes, so a steady charge reports its
+ * state once, when it starts. Expired like any other level, that state vanished
+ * six hours in, the segmenter read the charge as paused, and ten minutes later
+ * closed it while power was still flowing - and ignored the `Complete` that
+ * followed. So while a rail reports fresh, non-zero power, the car is telling
+ * us the charge is still on and its state is kept. Zero or stale power lets it
+ * expire as before, so a lost `Complete` cannot hold a charge open forever.
+ */
+const CHARGE_STATE_SLOTS: ReadonlySet<string> = new Set<string>([
+  'chargeStateDetailed',
+  'chargeStateBasic',
+] satisfies (keyof TeslaFieldState)[])
+const CHARGING_POWER_SLOTS = [
+  'acPowerKw',
+  'dcPowerKw',
+] as const satisfies readonly (keyof TeslaFieldState)[]
+
 export function staleWindowFor(field: string): number {
   return VOLATILE_FIELDS.has(field) ? VOLATILE_STALE_MS : STALE_VALUE_MS
 }
@@ -330,8 +350,10 @@ export class FieldAccumulator {
     if (this.newestAt === null) return null
     const ts = this.newestAt
     const state: Record<string, unknown> = {}
+    const charging = this.chargingAt(ts)
     for (const [key, entry] of this.slots) {
-      if (ts - entry.at >= staleWindowFor(key)) {
+      const held = charging && CHARGE_STATE_SLOTS.has(key)
+      if (ts - entry.at >= staleWindowFor(key) && !held) {
         this.slots.delete(key)
         continue
       }
@@ -341,6 +363,17 @@ export class FieldAccumulator {
     this.pendingSince = null
     // newestAt is kept: it is the anchor for the staleness of what remains.
     return { state: state as TeslaFieldUpdate, ts: new Date(ts) }
+  }
+
+  /** Does a rail report fresh, non-zero power at `ts`? See CHARGE_STATE_SLOTS. */
+  private chargingAt(ts: number): boolean {
+    return CHARGING_POWER_SLOTS.some((key) => {
+      const entry = this.slots.get(key)
+      return entry !== undefined
+        && ts - entry.at < staleWindowFor(key)
+        && typeof entry.value === 'number'
+        && entry.value > 0
+    })
   }
 
   /** Deep enough copy for transaction rollback. Entries are immutable. */
