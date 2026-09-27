@@ -124,41 +124,35 @@ export function step(
       open = { ...open, pausedSample: paused ?? sample }
     }
   } else if (open?.kind === 'drive') {
+    // How long the car has been parked, measured to THIS sample. Checked
+    // before anything this sample says, as a charge's pause is: a stop long
+    // enough to end the drive is as likely to be discovered by the sample that
+    // drives away, or wakes the car in gear, as by one taken while it sat,
+    // since nothing obliges the car to report while parked.
+    const stoppedMs = open.stationarySince
+      ? sample.ts.getTime() - open.stationarySince.getTime()
+      : 0
     if (isCharging) {
       events.push({ type: 'session-end', kind: 'drive', at: sample.ts, sample })
       open = null
+    } else if (open.stationarySince && stoppedMs >= opts.driveEndParkedMs) {
+      // Close where it stopped, and fall through: a moving sample opens the
+      // next drive.
+      events.push(endEvent(open))
+      open = null
     } else if (motion === 'moving') {
-      // Measured on this branch too, as a charge's pause is: a stop long enough
-      // to end the drive is as likely to be discovered by the sample that
-      // drives away as by one taken while parked, since nothing obliges the
-      // car to report while it sits.
-      const stoppedMs = open.stationarySince
-        ? sample.ts.getTime() - open.stationarySince.getTime()
-        : 0
-      if (open.stationarySince && stoppedMs >= opts.driveEndParkedMs) {
-        // Close where it stopped, and fall through to open the next drive.
-        events.push(endEvent(open))
-        open = null
-      } else {
-        open = { ...open, lastSample: sample, stationarySince: null }
-        events.push({ type: 'session-point', sample })
-      }
+      open = { ...open, lastSample: sample, stationarySince: null }
+      events.push({ type: 'session-point', sample })
     } else {
       // Only a sample that actually says "stopped" starts the parked clock; an
-      // `unknown` one neither starts nor clears it, but is still measured
-      // against a clock already running.
-      const stationarySince =
-        motion === 'stationary' ? open.stationarySince ?? sample.ts : open.stationarySince
-      const stoppedMs = stationarySince
-        ? sample.ts.getTime() - stationarySince.getTime()
-        : 0
-      if (stationarySince && stoppedMs >= opts.driveEndParkedMs) {
-        events.push(endEvent(open))
-        open = null
-      } else {
-        open = { ...open, lastSample: sample, stationarySince }
-        events.push({ type: 'session-point', sample })
-      }
+      // `unknown` one neither starts nor clears it. A car stopped in gear is
+      // waiting (a queue, a light) and still on the trip, so D, R or N stops
+      // the clock: only Park, or a stop whose gear is unknown, ends a drive.
+      const stationarySince = inGear(sample)
+        ? null
+        : motion === 'stationary' ? open.stationarySince ?? sample.ts : open.stationarySince
+      open = { ...open, lastSample: sample, stationarySince }
+      events.push({ type: 'session-point', sample })
     }
   }
 
@@ -212,6 +206,13 @@ function motionOf(
     return 'moving'
   }
   return 'unknown'
+}
+
+/** In a driving gear: D, R or N, as Tesla's raw `ShiftState` strings. */
+const DRIVING_GEARS: ReadonlySet<string> = new Set(['ShiftStateD', 'ShiftStateR', 'ShiftStateN'])
+
+function inGear(sample: VehicleSample): boolean {
+  return sample.gear !== null && DRIVING_GEARS.has(sample.gear)
 }
 
 function openSession(kind: SessionKind, sample: VehicleSample): OpenSession {

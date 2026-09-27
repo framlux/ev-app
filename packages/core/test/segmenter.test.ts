@@ -271,6 +271,55 @@ describe('segmenter', () => {
     expect(ends(events, 'drive')).toHaveLength(0)
   })
 
+  it('keeps one drive through a long wait in Drive', () => {
+    // 2026-09-11 22:23: stopped for 5 min 14 s in D, a queue or a light, then
+    // on again. Only Park ends a drive; waiting in gear is still the trip.
+    const waiting = (sec: number) =>
+      makeSample({ vehicleId: 'v1', ts: at(sec), speedKph: 0, odometerKm: 1001, gear: 'ShiftStateD',
+                   socPct: 80, powerState: 'online', chargeState: 'disconnected' })
+    const { events } = run([
+      moving(0, 50, 1000, 80),
+      waiting(60), waiting(180), waiting(360), waiting(374),
+      moving(380, 5, 1001, 80),
+      moving(440, 40, 1002, 79),
+    ])
+    expect(starts(events, 'drive')).toHaveLength(1)
+    expect(ends(events, 'drive')).toHaveLength(0)
+  })
+
+  it('counts the park threshold from when the car went into Park', () => {
+    const inGear = (sec: number, gear: string) =>
+      makeSample({ vehicleId: 'v1', ts: at(sec), speedKph: 0, odometerKm: 1001, gear,
+                   socPct: 80, powerState: 'online', chargeState: 'disconnected' })
+    const { events } = run([
+      moving(0, 50, 1000, 80),
+      inGear(60, 'ShiftStateD'),
+      inGear(240, 'ShiftStateP'),
+      inGear(500, 'ShiftStateP'),
+      // Five minutes after Park, not after the stop: 240 + 300.
+      inGear(539, 'ShiftStateP'),
+      inGear(540, 'ShiftStateP'),
+    ])
+    expect(ends(events, 'drive').map((e) => e.at)).toEqual([at(539)])
+  })
+
+  it('ends a drive at a long stop in Park even if the next sample is in gear', () => {
+    // 2026-09-26 00:28: home, switched off in the driveway for six minutes,
+    // then woken in R to pull into the garage. The stop had already ended the
+    // drive; being in gear afterwards must not undo that.
+    const inGear = (sec: number, gear: string) =>
+      makeSample({ vehicleId: 'v1', ts: at(sec), speedKph: 0, odometerKm: 1001, gear,
+                   socPct: 80, powerState: 'online', chargeState: 'disconnected' })
+    const { events } = run([
+      moving(0, 50, 1000, 80),
+      inGear(60, 'ShiftStateP'),
+      inGear(438, 'ShiftStateR'),
+      moving(450, 5, 1001, 80),
+    ])
+    expect(ends(events, 'drive').map((e) => e.at)).toEqual([at(60)])
+    expect(starts(events, 'drive').map((e) => e.at)).toEqual([at(0), at(450)])
+  })
+
   it('closes an open session when samples gap beyond the reset window', () => {
     const { events } = run([
       moving(0, 40, 1000, 80),
