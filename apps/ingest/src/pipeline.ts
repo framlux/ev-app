@@ -44,6 +44,8 @@ export interface Store {
   closeSession(sessionId: string, summary: SessionSummary): Promise<void>
   /** Close without a summary: a row resume cannot account for. See `Pipeline.resume`. */
   abandonSession(sessionId: string): Promise<void>
+  /** Replace an open row's start and points with a replay's. See `Pipeline.resume`. */
+  resetSession(sessionId: string, startedAt: Date, points: readonly VehicleSample[]): Promise<void>
   recordBatteryHealth(row: BatteryHealthWrite): Promise<void>
   recordMeasuredCapacity(row: MeasuredCapacityWrite): Promise<void>
   /**
@@ -544,9 +546,10 @@ export class Pipeline {
    * very code the live path does, against a store that writes nothing. Then one
    * transaction reconciles what it found with the rows that are really open,
    * matched by kind and by time, never by kind alone:
-   *  - a row whose session the replay shows still running is carried on, and
-   *    gets back any points written while no worker knew about it;
+   *  - a row whose session the replay shows still running is carried on;
    *  - a row whose session ended is closed with the replay's summary and price;
+   *  - either way, the row's start and points become the replay's, which fills
+   *    the hole a blind worker left and drops a session it absorbed;
    *  - a row the tape cannot account for is closed without a summary;
    *  - a session still running with no row of its own gets one.
    *
@@ -595,8 +598,9 @@ export class Pipeline {
       const match = dry.matchFor(row)
       if (match !== null && match === running) {
         carried = row.id
-        report.resumed = row
+        report.resumed = { ...row, startedAt: match.startedAt }
       } else if (match?.closed) {
+        await store.resetSession(row.id, match.startedAt, match.points)
         await this.finish(store, row.id, row.kind, match.points)
         report.closed.push(row)
       } else {
@@ -609,7 +613,7 @@ export class Pipeline {
       // Closed rows are settled above, so this cannot adopt one of them.
       carried ??= await store.openSession(running.kind, running.vehicleId, running.startedAt)
       report.resumed ??= { id: carried, kind: running.kind, startedAt: running.startedAt }
-      for (const point of this.openPoints) await store.appendPoint(carried, point)
+      await store.resetSession(carried, running.startedAt, this.openPoints)
     }
     this.openId = carried
     return report
@@ -991,6 +995,7 @@ class DryStore implements Store {
     }
   }
   async abandonSession(): Promise<void> {}
+  async resetSession(): Promise<void> {}
   async recordBatteryHealth(): Promise<void> {}
   async recordMeasuredCapacity(): Promise<void> {}
   async rateAt(): Promise<EnergyPrice | null> {

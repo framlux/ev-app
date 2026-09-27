@@ -11,7 +11,7 @@ import { ensurePartitions, insertSample, upsertSample } from '../src/repo/sample
 import { ensureVehicle, findVehicleIdByVendorId } from '../src/repo/vehicles.js'
 import {
   abandonSession, appendPoint, closeSession, deleteDerived, findOpenSession, giveUpPendingCharges,
-  hasPendingCharges, openSession, pendingChargesSince, priceSession,
+  hasPendingCharges, openSession, pendingChargesSince, priceSession, resetSession,
 } from '../src/repo/sessions.js'
 import { insertRate, listRates, rateAt } from '../src/repo/energy-rate.js'
 import { recordMeasuredCapacity, upsertBatteryHealth } from '../src/repo/battery.js'
@@ -546,6 +546,33 @@ describe.skipIf(!hasDb)('repositories', () => {
       const byId = Object.fromEntries(rows.map((r) => [r.id, r]))
       expect(byId[withPoints]).toMatchObject({ is_open: false, ended_at: lastPoint, distance_km: null })
       expect(byId[bare]).toMatchObject({ is_open: false, ended_at: started })
+    } finally {
+      await pool.query('DELETE FROM session WHERE vehicle_id=$1', [VEHICLE_UNCHECKED])
+    }
+  })
+
+  /**
+   * Resume's correction of a row a blind worker left: its start and points
+   * become the replay's, so a hole is filled and a session it absorbed is gone.
+   * A replayed point list can repeat an instant, and must not fail on it.
+   */
+  it('resets an open session to the start and points a replay found', async () => {
+    const at = (m: number) => new Date(Date.parse('2026-09-04T14:00:00.000Z') + m * 60_000)
+    const point = (m: number) => makeSample({ vehicleId: VEHICLE_UNCHECKED, ts: at(m), socPct: 50 + m })
+    const pool = getPool()
+    try {
+      const id = await withTransaction(pool, async (c) => {
+        const id = await openSession(c, VEHICLE_UNCHECKED, 'charge', at(5))
+        for (const m of [5, 6, 90, 91]) await appendPoint(c, id, point(m))
+        await resetSession(c, id, at(0), [point(0), point(1), point(1), point(2)])
+        return id
+      })
+      const { rows: session } = await pool.query(
+        'SELECT started_at, is_open FROM session WHERE id=$1', [id])
+      expect(session[0]).toEqual({ started_at: at(0), is_open: true })
+      const { rows: points } = await pool.query(
+        'SELECT ts, soc_pct FROM session_point WHERE session_id=$1 ORDER BY ts', [id])
+      expect(points).toEqual([0, 1, 2].map((m) => ({ ts: at(m), soc_pct: 50 + m })))
     } finally {
       await pool.query('DELETE FROM session WHERE vehicle_id=$1', [VEHICLE_UNCHECKED])
     }

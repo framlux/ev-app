@@ -712,6 +712,58 @@ describe('Pipeline.resume', () => {
     expect(openRows(db).map((r) => [r.kind, r.startedAt])).toEqual([['charge', new Date(at('18:00'))]])
   })
 
+  it('gives each row exactly the replay\'s points: no hole, and none of the charge it absorbed', async () => {
+    const scratch = new FakeDb()
+    const s = new Pipeline(scratch, OPTS)
+    const first = at('16:00')
+    await burst(s, iso(first), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40 })
+    await charging(s, at('16:01'), at('16:40'), 40)
+    await burst(s, iso(at('16:41')), { DetailedChargeState: 'DetailedChargeStateDisconnected', ACChargingPower: 0 })
+    await burst(s, iso(at('18:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 45 })
+    await charging(s, at('18:01'), at('18:20'), 45)
+    const [one, two] = scratch.state.sessions
+    const pointsOf = (db: FakeDb, id: string) =>
+      db.state.points.filter((p) => p.sessionId === id).map((p) => p.ts.getTime())
+
+    // What the cold workers left: the first charge's points stop at 16:20,
+    // where the first restart forgot it, and the second charge's were written
+    // onto the same row when it was adopted.
+    const db = new FakeDb()
+    db.state.raw = tape(scratch)
+    db.state.sessions.push({
+      id: 'merged', vehicleId: 'veh-1', kind: 'charge', startedAt: new Date(first), isOpen: true, summary: null,
+    })
+    db.state.points = scratch.state.points
+      .filter((p) => p.sessionId === two!.id || p.ts.getTime() <= at('16:20'))
+      .map((p) => ({ sessionId: 'merged', ts: p.ts }))
+    await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('18:21')))
+
+    expect(pointsOf(db, 'merged')).toEqual(pointsOf(scratch, one!.id))
+    const [second] = openRows(db)
+    expect(pointsOf(db, second!.id)).toEqual(pointsOf(scratch, two!.id))
+  })
+
+  it('moves a row that started late back to where the replay says its session began', async () => {
+    // A cold worker opens a charge only once the car says it is charging again,
+    // and a row can be dated after the first point the replay gives it.
+    const scratch = new FakeDb()
+    const s = new Pipeline(scratch, OPTS)
+    await burst(s, iso(at('16:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40 })
+    await charging(s, at('16:01'), at('16:30'), 40)
+    const [replayed] = scratch.state.sessions
+
+    const db = new FakeDb()
+    db.state.raw = tape(scratch)
+    db.state.sessions.push({
+      id: 'late', vehicleId: 'veh-1', kind: 'charge', startedAt: new Date(at('16:05')), isOpen: true, summary: null,
+    })
+    await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('16:31')))
+
+    expect(openRows(db)).toEqual([{ id: 'late', kind: 'charge', startedAt: replayed!.startedAt }])
+    expect(db.state.points.filter((p) => p.sessionId === 'late').map((p) => p.ts.getTime()))
+      .toEqual(scratch.state.points.map((p) => p.ts.getTime()))
+  })
+
   it('closes an open charge with its own summary and resumes the open drive', async () => {
     const scratch = new FakeDb()
     const s = new Pipeline(scratch, OPTS)

@@ -82,6 +82,22 @@ export async function abandonSession(c: DbClient, sessionId: string): Promise<vo
     [sessionId])
 }
 
+/**
+ * Make an open row's start and points exactly the ones a resume's replay found.
+ *
+ * What the previous workers wrote cannot be trusted: one that restarted blind
+ * wrote no points while it did not know the session, and one that adopted the
+ * row into a later session wrote that session's points onto it. The replay saw
+ * the whole tape, so its account replaces theirs rather than being merged in.
+ */
+export async function resetSession(
+  c: DbClient, sessionId: string, startedAt: Date, points: readonly VehicleSample[],
+): Promise<void> {
+  await c.query('UPDATE session SET started_at=$2 WHERE id=$1', [sessionId, startedAt])
+  await c.query('DELETE FROM session_point WHERE session_id=$1', [sessionId])
+  for (const p of points) await appendPoint(c, sessionId, p)
+}
+
 export async function appendPoint(
   c: DbClient, sessionId: string, s: VehicleSample,
 ): Promise<void> {

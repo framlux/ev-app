@@ -13,6 +13,7 @@ import {
   priceSession,
   rateAt,
   recordMeasuredCapacity,
+  resetSession,
   streamRaw,
   upsertBatteryHealth,
   upsertSample,
@@ -143,6 +144,7 @@ export function storeOn(client: DbClient, cursorSource: string): Store {
     appendPoint: (sessionId, s) => appendPoint(client, sessionId, s),
     closeSession: (sessionId, summary) => closeSession(client, sessionId, summary),
     abandonSession: (sessionId) => abandonSession(client, sessionId),
+    resetSession: (sessionId, startedAt, points) => resetSession(client, sessionId, startedAt, points),
     recordBatteryHealth: (row) => upsertBatteryHealth(client, row),
     recordMeasuredCapacity: (row) => recordMeasuredCapacity(client, row),
     // The read half of the seam (spec §3.4). `EnergyRate` is a superset of what

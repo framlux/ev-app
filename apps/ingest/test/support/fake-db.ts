@@ -136,6 +136,19 @@ export class FakeDb implements StoreRunner {
         const session = s.sessions.find((x) => x.id === sessionId)
         if (session) session.isOpen = false
       },
+      resetSession: async (sessionId, startedAt, points) => {
+        const session = s.sessions.find((x) => x.id === sessionId)
+        if (!session) throw new Error(`resetSession: no session ${sessionId}`)
+        session.startedAt = startedAt
+        s.points = s.points.filter((p) => p.sessionId !== sessionId)
+        // Through appendPoint's ON CONFLICT, as the SQL does: a burst the
+        // accumulator splits emits two samples at one instant.
+        for (const p of points) {
+          if (!s.points.some((x) => x.sessionId === sessionId && x.ts.getTime() === p.ts.getTime())) {
+            s.points.push({ sessionId, ts: p.ts })
+          }
+        }
+      },
       recordBatteryHealth: async (row) => { s.battery.push(row) },
       rateAt: async (at) => {
         s.rateLookups.push(at)
