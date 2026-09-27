@@ -889,9 +889,10 @@ describe('Pipeline.resume', () => {
 
 describe('Pipeline: a charge longer than the six-hour level window', () => {
   it('stays one session until the car says Complete, on the energy counter alone', async () => {
-    // The 2026-09-26 charge as the car sent it: the charge state once at
-    // 16:00:43, no power report for eight hours, the energy counter rising every
-    // twenty minutes or so (one gap of 34), and Complete at 00:39:45.
+    // The 2026-09-26 charge's shape: the charge state once at 16:00:43, no
+    // power report for eight hours, and Complete at 00:39:45. The counter here
+    // comes every twenty minutes (one gap of 34), sparser than the tape's
+    // 4 min 18 s, so the hold does not depend on the counter being frequent.
     const db = new FakeDb()
     const pipeline = new Pipeline(db, OPTS)
     const start = t('2026-09-26T16:00:43.000Z').getTime()
@@ -923,6 +924,41 @@ describe('Pipeline: a charge longer than the six-hour level window', () => {
     // summary ends at the last sample taken while charging; the Complete
     // sample is what closes it, not one of its points.)
     expect(charges[0]?.summary?.endedAt).toEqual(new Date(reports.at(-1)!))
+  })
+
+  it('measures the whole charge on the AC counter, though both counters rise and power spoke once', async () => {
+    // The 2026-09-26 charge as the tape has it: 1.2 kW reported once, 47 s
+    // before the charge state, and never again; the AC counter up 0.1 kWh
+    // every 4 min 18 s; the DC counter rising too, every 6 min 40 s. Power
+    // is what claims the AC rail, and it is six hours old long before the end.
+    const db = new FakeDb()
+    const pipeline = new Pipeline(db, OPTS)
+    const iso = (ms: number) => new Date(ms).toISOString()
+    const at = (s: string) => t(`2026-09-26T${s}Z`).getTime()
+    const complete = t('2026-09-27T00:39:45.000Z').getTime()
+
+    const bursts: Array<[number, Record<string, unknown>]> = [
+      [at('15:59:43.000'), { ACChargingEnergyIn: 0, Soc: 71.4 }],
+      [at('15:59:56.000'), { ACChargingPower: 1.2 }],
+      [at('16:00:43.000'), { DetailedChargeState: 'DetailedChargeStateCharging', ChargeState: 'Enable' }],
+    ]
+    for (let n = 1, ms = at('16:04:20.000'); ms < complete; n++, ms += 258_000) {
+      bursts.push([ms, { ACChargingEnergyIn: n * 0.1, Soc: 71.4 + n * 0.1 }])
+    }
+    for (let n = 1, ms = at('16:05:00.000'); ms < complete; n++, ms += 400_000) {
+      bursts.push([ms, { DCChargingEnergyIn: n * 0.12 }])
+    }
+    bursts.sort((x, y) => x[0] - y[0])
+    for (const [ms, fields] of bursts) await burst(pipeline, iso(ms), fields)
+    const lastAc = bursts.filter(([, f]) => 'ACChargingEnergyIn' in f).at(-1)![1]['ACChargingEnergyIn'] as number
+    await burst(pipeline, iso(complete), {
+      DetailedChargeState: 'DetailedChargeStateComplete', ACChargingPower: 0,
+    })
+    await pipeline.flush(new Date(complete + 60_000), true)
+
+    const charges = db.state.sessions.filter((s) => s.kind === 'charge')
+    expect(charges).toHaveLength(1)
+    expect(charges[0]?.summary?.energyKwh).toBeCloseTo(lastAc, 3)
   })
 })
 

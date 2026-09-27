@@ -282,10 +282,17 @@ export const VOLATILE_FIELDS: ReadonlySet<string> = new Set<string>([
  * few minutes while energy flows) - refreshes the state as if the car had just
  * said it again. It still expires six hours after the last sign, so a lost
  * `Complete` cannot hold a charge open forever.
+ *
+ * `activeRail` is refreshed with it. Only positive power claims a rail, and it
+ * says which counter measures the charge; expired, both counters are known and
+ * `chooseEnergy` gives up, so the same charge was measured only to 22:00 (8.3
+ * of its 12.0 kWh). A rising counter does not claim a rail itself: the DC
+ * counter rose through that AC charge too.
  */
 const CHARGE_STATE_SLOTS = [
   'chargeStateDetailed',
   'chargeStateBasic',
+  'activeRail',
 ] as const satisfies readonly (keyof TeslaFieldState)[]
 const CHARGING_POWER_SLOTS = [
   'acPowerKw',
