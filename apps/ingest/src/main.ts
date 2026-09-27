@@ -97,14 +97,6 @@ async function main(): Promise<void> {
     (p) => resumeFromTape(pool, p, config.vehicle.id),
     (err) => console.error('resume failed; starting cold', err),
   )
-  if (report) {
-    const row = (r: OpenRow) => `${r.kind} ${r.id} from ${r.startedAt.toISOString()}`
-    console.log(
-      `resumed from ${report.replayed} taped messages: ` +
-        (report.resumed ? `carrying on ${row(report.resumed)}` : 'nothing open') +
-        (report.closed.length ? `; closed ${report.closed.map(row).join(', ')}` : '') +
-        (report.abandoned.length ? `; abandoned ${report.abandoned.map(row).join(', ')}` : ''))
-  }
 
   const record = (result: PipelineResult): void => {
     if (result.samples > 0) {
@@ -118,6 +110,18 @@ async function main(): Promise<void> {
         result.lastSampleTs.getTime() / 1000,
       )
     }
+  }
+
+  if (report) {
+    // Counted as a live message's result would be, so a session closed at
+    // startup is not missing from the dashboards.
+    record(report)
+    const row = (r: OpenRow) => `${r.kind} ${r.id} from ${r.startedAt.toISOString()}`
+    console.log(
+      `resumed from ${report.replayed} taped messages: ` +
+        (report.resumed ? `carrying on ${row(report.resumed)}` : 'nothing open') +
+        (report.closed.length ? `; closed ${report.closed.map(row).join(', ')}` : '') +
+        (report.abandoned.length ? `; abandoned ${report.abandoned.map(row).join(', ')}` : ''))
   }
 
   const client = subscribe(

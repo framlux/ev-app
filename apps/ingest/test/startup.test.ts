@@ -4,8 +4,8 @@ import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { RawMessage } from '@ev/core'
 import {
-  closePool, ensurePartitions, getPool, insertRaw, openSession, runMigrationsUnderGate,
-  withTransaction,
+  closePool, ensurePartitions, getPool, insertRaw, openSession, parseVehicleChange,
+  runMigrationsUnderGate, VEHICLE_CHANGED_CHANNEL, withTransaction,
 } from '@ev/db'
 import { Pipeline } from '../src/pipeline.js'
 import { pgRunner, registerVehicle, resumeFromTape } from '../src/store.js'
@@ -122,10 +122,22 @@ describe.skipIf(!hasDb)('worker startup', () => {
       return openSession(c, VEHICLE, 'drive', tape[0]!.receivedAt)
     })
 
+    // A drive closed at startup is news to a viewer, as one closed live is.
+    const listener = await pool.connect()
+    const heard: unknown[] = []
+    listener.on('notification', (msg) => heard.push(parseVehicleChange(msg.payload ?? '')))
+    await listener.query(`LISTEN ${VEHICLE_CHANGED_CHANNEL}`)
+
     const pipeline = new Pipeline(pgRunner(pool, 'startup-test', VEHICLE), { usableCapacityKwh: 75 })
     const report = await resumeFromTape(pool, pipeline, VEHICLE, new Date(Date.UTC(2027, 1, 10, 10, 20)))
+    await new Promise((r) => setTimeout(r, 200))
+    await listener.query(`UNLISTEN ${VEHICLE_CHANGED_CHANNEL}`)
+    listener.release()
 
     expect(report.closed.map((r) => r.id)).toEqual([id])
+    expect(heard).toContainEqual({
+      vehicleId: VEHICLE, kind: 'session', ts: new Date(Date.UTC(2027, 1, 10, 10, 13)).toISOString(),
+    })
     const { rows } = await pool.query('SELECT is_open, distance_km FROM session WHERE id=$1', [id])
     expect(rows[0]?.is_open).toBe(false)
     // Five miles of odometer, in kilometres.
@@ -153,6 +165,7 @@ describe.skipIf(!hasDb)('worker startup', () => {
       })
       return port
     }
+    const metricsPort = await closed()
     const worker = spawn(process.execPath, [fileURLToPath(new URL('../dist/main.js', import.meta.url))], {
       env: {
         PATH: process.env['PATH'],
@@ -161,7 +174,7 @@ describe.skipIf(!hasDb)('worker startup', () => {
         PGDATABASE: process.env['PGDATABASE'],
         EV_VEHICLE_ID: VEHICLE, EV_VEHICLE_VIN: VIN, EV_USABLE_CAPACITY_KWH: '75',
         MQTT_PASSWORD: 'unused', MQTT_URL: `mqtt://127.0.0.1:${await closed()}`,
-        METRICS_PORT: String(await closed()),
+        METRICS_PORT: String(metricsPort),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -177,6 +190,9 @@ describe.skipIf(!hasDb)('worker startup', () => {
       }
       expect({ open, out }).toMatchObject({ open: false })
       expect(out).toMatch(/resumed from \d+ taped messages: .*abandoned drive/)
+      // Counted like a session closed live, so the dashboard does not miss it.
+      const metrics = await (await fetch(`http://127.0.0.1:${metricsPort}/metrics`)).text()
+      expect(metrics).toMatch(/^ev_ingest_sessions_closed_total 1$/m)
     } finally {
       worker.kill('SIGKILL')
     }

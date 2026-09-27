@@ -591,7 +591,10 @@ export class Pipeline {
   private async reconcile(
     store: Store, dry: DryStore, open: readonly OpenRow[], replayed: number,
   ): Promise<ResumeReport> {
-    const report: ResumeReport = { replayed, resumed: null, closed: [], abandoned: [] }
+    const report: ResumeReport = {
+      ...EMPTY, replayed, resumed: null, closed: [], abandoned: [],
+      samples: dry.flushed.length, lastSampleTs: dry.newestSampleTs,
+    }
     for (const sample of dry.flushed) {
       await this.ensureMonth(store, sample.ts)
       await store.insertSample(sample)
@@ -617,11 +620,15 @@ export class Pipeline {
 
     if (running) {
       // Closed rows are settled above, so this cannot adopt one of them.
-      carried ??= await store.openSession(running.kind, running.vehicleId, running.startedAt)
+      if (carried === null) {
+        carried = await store.openSession(running.kind, running.vehicleId, running.startedAt)
+        report.sessionsOpened = 1
+      }
       report.resumed ??= { id: carried, kind: running.kind, startedAt: running.startedAt }
       await store.resetSession(carried, running.startedAt, this.openPoints)
     }
     this.openId = carried
+    report.sessionsClosed = report.closed.length + report.abandoned.length
     return report
   }
 
@@ -934,8 +941,13 @@ export interface OpenRow {
   startedAt: Date
 }
 
-/** What `Pipeline.resume` did, for the startup log. */
-export interface ResumeReport {
+/**
+ * What `Pipeline.resume` did, for the startup log, and as a `PipelineResult`
+ * so the runner announces it and main() counts it as it would a live message:
+ * the sessions it closed and opened, the samples it wrote, and the newest
+ * sample the replay saw.
+ */
+export interface ResumeReport extends PipelineResult {
   /** Tape messages replayed. */
   replayed: number
   /** The row the worker carries on with, if a session is still running. */
@@ -967,6 +979,8 @@ class DryStore implements Store {
   finalFlush = false
   /** What that flush emitted: the burst a crashed worker never wrote. */
   readonly flushed: VehicleSample[] = []
+  /** The newest sample the replay produced, written now or by the old worker. */
+  newestSampleTs: Date | null = null
 
   session(id: string): ReplayedSession | null {
     return this.sessions.get(id) ?? null
@@ -998,6 +1012,7 @@ class DryStore implements Store {
   async insertRaw(): Promise<void> {}
   async insertSample(s: VehicleSample): Promise<void> {
     if (this.finalFlush) this.flushed.push(s)
+    if (!this.newestSampleTs || s.ts.getTime() > this.newestSampleTs.getTime()) this.newestSampleTs = s.ts
   }
   async openSession(kind: SessionKind, vehicleId: string, at: Date): Promise<string> {
     const id = `replay:${++this.next}`

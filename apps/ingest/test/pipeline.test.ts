@@ -898,6 +898,31 @@ describe('Pipeline.resume', () => {
     expect(db.state.points.some((pt) => pt.sessionId === 'd' && pt.ts.getTime() === at('16:53'))).toBe(true)
   })
 
+  it('reports what it closed, opened and wrote, as a unit of work does', async () => {
+    // The shape the runner notifies from and main() records metrics from, so
+    // a charge closed at startup reaches the web tier and the counters like
+    // one closed by a live message.
+    const scratch = new FakeDb()
+    const s = new Pipeline(scratch, OPTS)
+    await burst(s, iso(at('16:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40 })
+    await charging(s, at('16:01'), at('16:30'), 40)
+    await burst(s, iso(at('16:31')), { DetailedChargeState: 'DetailedChargeStateDisconnected', ACChargingPower: 0 })
+    await driving(s, at('16:35'), at('16:50'), 1000)
+
+    const db = new FakeDb()
+    db.state.raw = tape(scratch)
+    db.state.sessions.push(
+      { id: 'c', vehicleId: 'veh-1', kind: 'charge', startedAt: new Date(at('16:00')), isOpen: true, summary: null },
+      { id: 'orphan', vehicleId: 'veh-1', kind: 'drive', startedAt: new Date(at('09:00')), isOpen: true, summary: null },
+    )
+    // Crashed: the last burst, at 16:50, was never written.
+    const report = await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('16:51')))
+
+    expect(report).toMatchObject({
+      sessionsClosed: 2, sessionsOpened: 1, samples: 1, lastSampleTs: new Date(at('16:50')),
+    })
+  })
+
   it('abandons an open row the tape cannot account for, rather than let it absorb the next one', async () => {
     const db = new FakeDb()
     db.state.sessions.push({
