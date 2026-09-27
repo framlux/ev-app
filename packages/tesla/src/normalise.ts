@@ -205,7 +205,8 @@ const COLUMNS_BY_NAME: ReadonlyMap<string, SampleColumn> = new Map(
  * type. Every one of them collapses several messages into one column, or reads
  * a struct: nine of the ten fields that share a column are here, plus the door
  * struct, and each writes exactly the slots it wrote before this file learned to
- * derive the rest.
+ * derive the rest. `Gear` is the one exception of meaning: its null says
+ * something.
  *
  * `Location` is NOT here, and that is the interesting absence: it was
  * hand-written until `OriginLocation` and `DestinationLocation` arrived with the
@@ -218,6 +219,13 @@ const FIELD_OVERRIDES: Record<string, (value: unknown) => TeslaFieldUpdate | nul
   DetailedChargeState: (v) => one('chargeStateDetailed', chargeState(str(v))),
 
   DoorState: (v) => one('doorsOpen', anyDoorOpen(v)),
+
+  // A null gear is the drive system powering down, and a Tesla that is off is
+  // in Park. It does not always send P first: on the tape it went straight
+  // from D or R to null ten times, stopped every time. Dropped like any other
+  // null, the last D was carried for as long as the car sat, and a parked car
+  // read as one waiting in gear. The raw tape keeps the null.
+  Gear: (v) => one('gear', v === null ? 'ShiftStateP' : str(v)),
 
   // Power is reported per rail and coalesced at build time. The rail that is
   // actually delivering is recorded here, while we can still see it, because

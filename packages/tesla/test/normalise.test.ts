@@ -108,6 +108,18 @@ describe('decodeTeslaField: unknown fields', () => {
   })
 })
 
+describe('decodeTeslaField: Gear', () => {
+  it('reads a null gear as Park, since that is what a switched-off car is in', () => {
+    // The car sends Gear null when its drive system powers down, and not
+    // always a P first: on the tape it went straight from D or R to null ten
+    // times, stopped every time (2026-09-15 19:40:04, then locked and the
+    // driver's seat empty by 19:42). Ignored, the last D was carried for 51
+    // minutes as if the car sat waiting in gear.
+    expect(decodeTeslaField('Gear', null)).toEqual({ gear: 'ShiftStateP' })
+    expect(decodeTeslaField('Gear', 'ShiftStateR')).toEqual({ gear: 'ShiftStateR' })
+  })
+})
+
 describe('decodeTeslaField: Location', () => {
   it('takes latitude and longitude together', () => {
     expect(decoded('Location', { latitude: 52.2, longitude: 0.13 }))
@@ -350,8 +362,9 @@ const WRONG: Record<SqlType, unknown> = {
 
 /**
  * The fields whose payload shape is NOT their column's type: the pair-valued
- * locations, the two enums the engine reasons about, the door struct, and the
- * four TPMS corners, which are bare numbers that collapse into one JSONB record.
+ * locations, the two enums the engine reasons about, the door struct, the
+ * four TPMS corners, which are bare numbers that collapse into one JSONB record,
+ * and Gear, whose null is a value.
  */
 const SHAPED: Record<string, { good: unknown; wrong: unknown }> = {
   Location: { good: { latitude: 52.2, longitude: 0.13 }, wrong: 'somewhere' },
@@ -360,6 +373,8 @@ const SHAPED: Record<string, { good: unknown; wrong: unknown }> = {
   ChargeState: { good: 'Charging', wrong: 'ChargeStateSomethingNew' },
   DetailedChargeState: { good: 'Charging', wrong: 'ChargeStateSomethingNew' },
   DoorState: { good: { DriverFront: false, PassengerFront: true }, wrong: 42 },
+  // Its null means Park (see 'decodeTeslaField: Gear'), so a wrong one is a number.
+  Gear: { good: 'ShiftStateD', wrong: 42 },
   TpmsPressureFl: { good: 2.8, wrong: 'flat' },
   TpmsPressureFr: { good: 2.9, wrong: 'flat' },
   TpmsPressureRl: { good: 2.7, wrong: 'flat' },
@@ -426,7 +441,8 @@ describe('every catalogued field decodes', () => {
     // Never a fabricated value: a wrong type must lose the message, not the
     // transaction, and must not overwrite a good earlier reading either.
     expect(decodeTeslaField(entry.field, wrongPayload(entry))).toBeNull()
-    expect(decodeTeslaField(entry.field, null)).toBeNull()
+    // Except Gear, whose null is the car switching off: see its own describe.
+    if (entry.field !== 'Gear') expect(decodeTeslaField(entry.field, null)).toBeNull()
   })
 })
 
