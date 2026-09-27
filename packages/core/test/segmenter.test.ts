@@ -214,6 +214,63 @@ describe('segmenter', () => {
     expect(points(events)).toHaveLength(4)
   })
 
+  it('reads Park as stationary, even when a late odometer report rises', () => {
+    // 2026-09-27: parked at 18:28 in P; the car woke at 18:40 with the
+    // odometer 0.01 km on, and no speed. Read as movement, that tick reset the
+    // parked clock, and every later speedless sample left the drive open for as
+    // long as the car sat there.
+    const inPark = (sec: number, odo: number) =>
+      makeSample({ vehicleId: 'v1', ts: at(sec), odometerKm: odo, gear: 'ShiftStateP',
+                   powerState: 'online', chargeState: 'stopped' })
+    const { state, events } = run([
+      moving(0, 50, 1000, 80),
+      moving(60, 40, 1000.8, 80),
+      parked(120, 1001, 80),
+      inPark(840, 1001.01),
+      inPark(900, 1001.01),
+    ])
+    expect(ends(events, 'drive').map((e) => e.at)).toEqual([at(120)])
+    expect(state.open).toBeNull()
+  })
+
+  it('still reads a rising odometer as moving when the gear is not Park', () => {
+    const noSpeed = (sec: number, odo: number, gear: string | null) =>
+      makeSample({ vehicleId: 'v1', ts: at(sec), odometerKm: odo, gear,
+                   powerState: 'online', chargeState: 'disconnected' })
+    const { events } = run([
+      moving(0, 50, 100, 80),
+      noSpeed(400, 105, 'ShiftStateD'),
+      noSpeed(800, 110, null),
+    ])
+    expect(events.filter((e) => e.type === 'session-end')).toHaveLength(0)
+    expect(points(events)).toHaveLength(3)
+  })
+
+  it('splits a drive at a long stop even when the next sample is already moving', () => {
+    // 2026-09-25: parked in P from 18:16:52, and the next sample, 5 min 28 s
+    // later, was reversing out. A stop that long ends a drive; it must not
+    // matter that nothing reported it while it lasted.
+    const { events } = run([
+      moving(0, 50, 1000, 80),
+      parked(60, 1001, 80),
+      parked(180, 1001, 80),
+      moving(60 + 328, 5, 1001, 80),
+      moving(460, 40, 1002, 79),
+    ])
+    expect(ends(events, 'drive').map((e) => e.at)).toEqual([at(180)])
+    expect(starts(events, 'drive').map((e) => e.at)).toEqual([at(0), at(388)])
+  })
+
+  it('keeps one drive when the car moves off before the park threshold', () => {
+    const { events } = run([
+      moving(0, 50, 1000, 80),
+      parked(60, 1001, 80),
+      moving(60 + 299, 5, 1001, 80),
+    ])
+    expect(starts(events, 'drive')).toHaveLength(1)
+    expect(ends(events, 'drive')).toHaveLength(0)
+  })
+
   it('closes an open session when samples gap beyond the reset window', () => {
     const { events } = run([
       moving(0, 40, 1000, 80),

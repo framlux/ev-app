@@ -128,8 +128,21 @@ export function step(
       events.push({ type: 'session-end', kind: 'drive', at: sample.ts, sample })
       open = null
     } else if (motion === 'moving') {
-      open = { ...open, lastSample: sample, stationarySince: null }
-      events.push({ type: 'session-point', sample })
+      // Measured on this branch too, as a charge's pause is: a stop long enough
+      // to end the drive is as likely to be discovered by the sample that
+      // drives away as by one taken while parked, since nothing obliges the
+      // car to report while it sits.
+      const stoppedMs = open.stationarySince
+        ? sample.ts.getTime() - open.stationarySince.getTime()
+        : 0
+      if (open.stationarySince && stoppedMs >= opts.driveEndParkedMs) {
+        // Close where it stopped, and fall through to open the next drive.
+        events.push(endEvent(open))
+        open = null
+      } else {
+        open = { ...open, lastSample: sample, stationarySince: null }
+        events.push({ type: 'session-point', sample })
+      }
     } else {
       // Only a sample that actually says "stopped" starts the parked clock; an
       // `unknown` one neither starts nor clears it, but is still measured
@@ -185,7 +198,13 @@ function motionOf(
   if (sample.speedKph !== null) {
     return sample.speedKph > opts.movingSpeedKph ? 'moving' : 'stationary'
   }
-  // No speed reported. A rising odometer still proves movement; a flat one
+  // No speed reported, and the car says it is in Park: it is not moving,
+  // whatever the odometer does. The odometer is reported late and on its own
+  // delta, so a parked car can wake with it a hundredth of a kilometre on; read
+  // as movement, that reset the parked clock and held the drive open all night.
+  // The raw enum string, as Tesla sends it (`catalogue.ts`).
+  if (sample.gear === 'ShiftStateP') return 'stationary'
+  // A rising odometer still proves movement; a flat one
   // proves nothing, because odometer resolution is coarse enough to sit still
   // through slow traffic.
   const prevOdo = prev?.odometerKm ?? null
