@@ -70,14 +70,19 @@ export async function findOpenSessions(
  * in the tape it replays: an orphan from before the replay window, or a row a
  * since-fixed bug wrote. Left open it would be adopted by the next session of
  * its kind (see `openSession`), so it is closed where its own points end, and
- * its figures stay whatever they were rather than being invented.
+ * its figures stay whatever they were rather than being invented. A charge's
+ * cost is marked unknown, since nothing will ever price it.
  */
 export async function abandonSession(c: DbClient, sessionId: string): Promise<void> {
   await c.query(
     `UPDATE session
         SET is_open = false,
             ended_at = COALESCE(ended_at,
-              (SELECT max(ts) FROM session_point WHERE session_id = $1), started_at)
+              (SELECT max(ts) FROM session_point WHERE session_id = $1), started_at),
+            -- Every charge gets a basis (see priceSession); this one's energy
+            -- is unknown, so its cost is too. Drives keep their null.
+            cost_basis = CASE WHEN kind = 'charge' THEN COALESCE(cost_basis, 'unknown')
+                              ELSE cost_basis END
       WHERE id = $1 AND is_open`,
     [sessionId])
 }

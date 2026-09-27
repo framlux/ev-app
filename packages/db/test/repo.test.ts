@@ -552,6 +552,31 @@ describe.skipIf(!hasDb)('repositories', () => {
   })
 
   /**
+   * An abandoned charge has no figures to price, and a null `cost_basis` reads
+   * on the charges page as not-yet-classified rather than unknown. A drive
+   * keeps its null: only charges have a price.
+   */
+  it('marks an abandoned charge\'s cost unknown, and leaves a drive unpriced', async () => {
+    const started = new Date('2026-09-04T13:00:00.000Z')
+    const pool = getPool()
+    try {
+      const [charge, drive] = await withTransaction(pool, async (c) => {
+        const charge = await openSession(c, VEHICLE_UNCHECKED, 'charge', started)
+        const drive = await openSession(c, VEHICLE_UNCHECKED, 'drive', started)
+        await abandonSession(c, charge)
+        await abandonSession(c, drive)
+        return [charge, drive]
+      })
+      const { rows } = await pool.query(
+        'SELECT id, cost_basis FROM session WHERE id = ANY($1)', [[charge, drive]])
+      const byId = Object.fromEntries(rows.map((r) => [r.id, r.cost_basis]))
+      expect(byId).toEqual({ [charge]: 'unknown', [drive]: null })
+    } finally {
+      await pool.query('DELETE FROM session WHERE vehicle_id=$1', [VEHICLE_UNCHECKED])
+    }
+  })
+
+  /**
    * Resume's correction of a row a blind worker left: its start and points
    * become the replay's, so a hole is filled and a session it absorbed is gone.
    * A replayed point list can repeat an instant, and must not fail on it.
