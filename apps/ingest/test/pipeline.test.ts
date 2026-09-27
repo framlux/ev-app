@@ -560,11 +560,14 @@ describe('Pipeline.resume', () => {
   /** The tape a worker would stream back: what `insertRaw` wrote, in order. */
   const tape = (db: FakeDb) => db.state.raw.slice()
 
-  /** Charging, a minute at a time. Power wanders, so every minute is a change the car sends. */
+  /**
+   * Charging, a minute at a time, as the car reports it: the energy counter
+   * rises (its delta is 0.1 kWh) while a steady power is never re-sent.
+   */
   async function charging(p: Pipeline, from: number, to: number, soc: number): Promise<void> {
     for (let ms = from; ms <= to; ms += 60_000) {
-      const m = (ms - from) / 60_000
-      await burst(p, iso(ms), { ACChargingPower: 7.2 + (m % 3) * 0.1, Soc: soc + m * 0.05 })
+      const kwh = (ms - at('16:00')) / 60_000 * 0.12
+      await burst(p, iso(ms), { ACChargingEnergyIn: kwh, Soc: soc + ((ms - from) / 60_000) * 0.05 })
     }
   }
 
@@ -792,37 +795,41 @@ describe('Pipeline.resume', () => {
 })
 
 describe('Pipeline: a charge longer than the six-hour level window', () => {
-  it('stays one session while power flows, and closes when the car says Complete', async () => {
-    // 2026-09-26 in production: DetailedChargeState arrived once, at 16:00:43,
-    // and the charge ran past 22:00:43 with power reported every minute.
+  it('stays one session until the car says Complete, on the energy counter alone', async () => {
+    // The 2026-09-26 charge as the car sent it: the charge state once at
+    // 16:00:43, no power report for eight hours, the energy counter rising every
+    // twenty minutes or so (one gap of 34), and Complete at 00:39:45.
     const db = new FakeDb()
     const pipeline = new Pipeline(db, OPTS)
     const start = t('2026-09-26T16:00:43.000Z').getTime()
     const iso = (ms: number) => new Date(ms).toISOString()
 
     await burst(pipeline, iso(start), {
-      DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40,
+      DetailedChargeState: 'DetailedChargeStateCharging', ChargeState: 'Enable', Soc: 40,
     })
-    const minutes = 7 * 60
-    for (let m = 1; m <= minutes; m++) {
-      // Power wanders, as it does, so every minute is a change the car reports.
-      await burst(pipeline, iso(start + m * 60_000), {
-        ACChargingPower: 7.2 + (m % 3) * 0.1, Soc: 40 + m * 0.1,
-      })
+    let ms = start
+    let energy = 0
+    const reports: number[] = []
+    for (const gap of [20, 20, 34, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20]) {
+      ms += gap * 60_000
+      energy += gap * 0.12
+      reports.push(ms)
+      await burst(pipeline, iso(ms), { ACChargingEnergyIn: energy, Soc: 40 + energy / 0.75 })
     }
-    const done = start + (minutes + 1) * 60_000
-    await burst(pipeline, iso(done), {
+    const complete = t('2026-09-27T00:39:45.000Z').getTime()
+    expect(ms).toBeLessThan(complete)
+    await burst(pipeline, iso(complete), {
       DetailedChargeState: 'DetailedChargeStateComplete', ACChargingPower: 0,
     })
-    await pipeline.flush(new Date(done + 60_000), true)
+    await pipeline.flush(new Date(complete + 60_000), true)
 
     const charges = db.state.sessions.filter((s) => s.kind === 'charge')
     expect(charges).toHaveLength(1)
     expect(charges[0]?.isOpen).toBe(false)
-    // Through the last minute of power, not six hours and ten minutes in. (The
+    // Through the last energy report, not six hours and ten minutes in. (The
     // summary ends at the last sample taken while charging; the Complete
     // sample is what closes it, not one of its points.)
-    expect(charges[0]?.summary?.endedAt).toEqual(new Date(start + minutes * 60_000))
+    expect(charges[0]?.summary?.endedAt).toEqual(new Date(reports.at(-1)!))
   })
 })
 
@@ -1123,31 +1130,43 @@ describe('FieldAccumulator staleness, at the boundaries', () => {
 
   /**
    * The car sends a field only when it changes, so a steady charge reports
-   * `DetailedChargeState` once, at the start. Expiring it like any other level
-   * turned every charge longer than six hours into "paused" and closed it ten
-   * minutes later, although power was still flowing. Fresh, non-zero charging
-   * power is the car saying the charge is still on; the next two tests pin the
-   * cases where it is not, so a lost `Complete` cannot hold a charge open.
+   * `DetailedChargeState` once, at the start, and its power only when it moves
+   * by 0.5 kW - the 2026-09-26 charge sent none for eight hours. Expiring the
+   * state like any other level closed every charge longer than six hours with
+   * energy still flowing. So the state is refreshed by signs of charging:
+   * positive power, or an energy counter that rises. It still expires six
+   * hours after the last one, so a lost `Complete` cannot hold a charge open.
    */
-  it('keeps the charge state past its window while fresh charging power flows', () => {
+  it('keeps the charge state past its window when charging power is reported', () => {
     const acc = new FieldAccumulator()
     acc.apply({ chargeStateDetailed: 'charging' }, at(0))
     acc.apply({ acPowerKw: 7.2, activeRail: 'ac' }, at(STALE_VALUE_MS + 60_000))
     expect(acc.take()?.state.chargeStateDetailed).toBe('charging')
   })
 
-  it('still drops the charge state past its window when the power reads zero', () => {
+  it('keeps the charge state while the energy counter rises, with no power reported', () => {
     const acc = new FieldAccumulator()
     acc.apply({ chargeStateDetailed: 'charging' }, at(0))
-    acc.apply({ acPowerKw: 0, activeRail: 'ac' }, at(STALE_VALUE_MS + 60_000))
+    acc.apply({ acEnergyKwh: 10 }, at(60 * 60_000))
+    acc.apply({ acEnergyKwh: 10.5 }, at(5 * 60 * 60_000))
+    acc.apply({ socPct: 80 }, at(STALE_VALUE_MS + 30 * 60_000))
+    expect(acc.take()?.state.chargeStateDetailed).toBe('charging')
+  })
+
+  it('does not count a zero power or a counter that stays put as charging', () => {
+    const acc = new FieldAccumulator()
+    acc.apply({ chargeStateDetailed: 'charging' }, at(0))
+    acc.apply({ acEnergyKwh: 10 }, at(60 * 60_000))
+    acc.apply({ acEnergyKwh: 10, acPowerKw: 0 }, at(5 * 60 * 60_000))
+    acc.apply({ socPct: 80 }, at(STALE_VALUE_MS))
     expect(acc.take()?.state.chargeStateDetailed).toBeUndefined()
   })
 
-  it('still drops the charge state past its window when the power is itself stale', () => {
+  it('drops the charge state six hours after the last sign of charging', () => {
     const acc = new FieldAccumulator()
     acc.apply({ chargeStateDetailed: 'charging' }, at(0))
-    acc.apply({ acPowerKw: 7.2, activeRail: 'ac' }, at(STALE_VALUE_MS))
-    acc.apply({ socPct: 80 }, at(STALE_VALUE_MS + VOLATILE_STALE_MS))
+    acc.apply({ acPowerKw: 7.2, activeRail: 'ac' }, at(60 * 60_000))
+    acc.apply({ socPct: 80 }, at(60 * 60_000 + STALE_VALUE_MS))
     expect(acc.take()?.state.chargeStateDetailed).toBeUndefined()
   })
 

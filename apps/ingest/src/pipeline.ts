@@ -268,23 +268,30 @@ export const VOLATILE_FIELDS: ReadonlySet<string> = new Set<string>([
 ])
 
 /**
- * The slots a charge's state lives in, and the rails whose power keeps it alive.
+ * The slots a charge's state lives in, and the signs that a charge is going on.
  *
  * The car sends a field only when it changes, so a steady charge reports its
- * state once, when it starts. Expired like any other level, that state vanished
- * six hours in, the segmenter read the charge as paused, and ten minutes later
- * closed it while power was still flowing - and ignored the `Complete` that
- * followed. So while a rail reports fresh, non-zero power, the car is telling
- * us the charge is still on and its state is kept. Zero or stale power lets it
- * expire as before, so a lost `Complete` cannot hold a charge open forever.
+ * state once, when it starts, and its power only when it moves by 0.5 kW: the
+ * 2026-09-26 charge sent no power at all for eight hours. Expired like any other
+ * level, the state vanished six hours in, the segmenter read the charge as
+ * paused, closed it ten minutes later with energy still flowing, and ignored
+ * the `Complete` that followed. So a sign of charging - positive power, or an
+ * energy counter above where it stood (its delta is 0.1 kWh, so it moves every
+ * few minutes while energy flows) - refreshes the state as if the car had just
+ * said it again. It still expires six hours after the last sign, so a lost
+ * `Complete` cannot hold a charge open forever.
  */
-const CHARGE_STATE_SLOTS: ReadonlySet<string> = new Set<string>([
+const CHARGE_STATE_SLOTS = [
   'chargeStateDetailed',
   'chargeStateBasic',
-] satisfies (keyof TeslaFieldState)[])
+] as const satisfies readonly (keyof TeslaFieldState)[]
 const CHARGING_POWER_SLOTS = [
   'acPowerKw',
   'dcPowerKw',
+] as const satisfies readonly (keyof TeslaFieldState)[]
+const CHARGING_ENERGY_SLOTS = [
+  'acEnergyKwh',
+  'dcEnergyKwh',
 ] as const satisfies readonly (keyof TeslaFieldState)[]
 
 export function staleWindowFor(field: string): number {
@@ -321,12 +328,35 @@ export class FieldAccumulator {
 
   apply(update: TeslaFieldUpdate, at: Date): void {
     const ms = at.getTime()
+    // Before the slots move: a rising counter is judged against where it stood.
+    const charging = this.showsCharging(update)
     for (const [key, value] of Object.entries(update)) {
       if (value === undefined) continue
       this.slots.set(key, { value, at: ms })
     }
+    if (charging) {
+      for (const key of CHARGE_STATE_SLOTS) {
+        const entry = this.slots.get(key)
+        // A new entry, not a mutation: `clone` shares entries with its copy.
+        if (entry) this.slots.set(key, { value: entry.value, at: ms })
+      }
+    }
     this.newestAt = ms
     this.pendingSince ??= ms
+  }
+
+  /** Positive power, or an energy counter above where it stood. See CHARGE_STATE_SLOTS. */
+  private showsCharging(update: TeslaFieldUpdate): boolean {
+    for (const key of CHARGING_POWER_SLOTS) {
+      const value = update[key]
+      if (typeof value === 'number' && value > 0) return true
+    }
+    for (const key of CHARGING_ENERGY_SLOTS) {
+      const value = update[key]
+      const before = this.slots.get(key)?.value
+      if (typeof value === 'number' && typeof before === 'number' && value > before) return true
+    }
+    return false
   }
 
   /** Is there a pending sample, and is it time to emit it at `now`? */
@@ -352,10 +382,8 @@ export class FieldAccumulator {
     if (this.newestAt === null) return null
     const ts = this.newestAt
     const state: Record<string, unknown> = {}
-    const charging = this.chargingAt(ts)
     for (const [key, entry] of this.slots) {
-      const held = charging && CHARGE_STATE_SLOTS.has(key)
-      if (ts - entry.at >= staleWindowFor(key) && !held) {
+      if (ts - entry.at >= staleWindowFor(key)) {
         this.slots.delete(key)
         continue
       }
@@ -365,17 +393,6 @@ export class FieldAccumulator {
     this.pendingSince = null
     // newestAt is kept: it is the anchor for the staleness of what remains.
     return { state: state as TeslaFieldUpdate, ts: new Date(ts) }
-  }
-
-  /** Does a rail report fresh, non-zero power at `ts`? See CHARGE_STATE_SLOTS. */
-  private chargingAt(ts: number): boolean {
-    return CHARGING_POWER_SLOTS.some((key) => {
-      const entry = this.slots.get(key)
-      return entry !== undefined
-        && ts - entry.at < staleWindowFor(key)
-        && typeof entry.value === 'number'
-        && entry.value > 0
-    })
   }
 
   /** Deep enough copy for transaction rollback. Entries are immutable. */
