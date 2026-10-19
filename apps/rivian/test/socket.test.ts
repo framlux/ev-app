@@ -271,6 +271,47 @@ describe('openSocket: an acknowledged socket', () => {
     expect(calls.close[0]?.[0]).toBe('unauthenticated')
   })
 
+  it('reads the verdict from the leading token of a longer close reason, and never echoes the rest', async () => {
+    const cases: [string, CloseReason][] = [
+      ['Unauthenticated: session expired', 'unauthenticated'],
+      ['UNAUTHENTICATED - token=abc123', 'unauthenticated'],
+      ['  unauthenticated, please sign in again', 'unauthenticated'],
+      ['Rate limited, retry in 30s', 'rate_limited'],
+      ['rate   limited: slow down', 'rate_limited'],
+      ['RATE LIMITED', 'rate_limited'],
+    ]
+    for (const [text, expected] of cases) {
+      const { calls, handlers } = recorder()
+      await open(handlers)
+      server.closeWith(4401, text)
+      await server.until(() => calls.close.length === 1)
+      expect(calls.close[0]?.[0], text).toBe(expected)
+      // The detail is one of two fixed strings: none of the server's text.
+      expect(calls.close[0]?.[1], text).toMatch(/^websocket closed: (unauthenticated|rate limited)$/)
+    }
+  })
+
+  it('does not read a verdict out of a reason that only contains the words, or only starts a longer word', async () => {
+    // Leading token only. "not unauthenticated" is not the server saying the
+    // session is dead, and "unauthenticatedness" is not the word at all; both
+    // are ordinary closes, which are retried after the backoff.
+    for (const text of [
+      'not unauthenticated',
+      'user is unauthenticated',
+      'was rate limited',
+      'unauthenticatedness',
+      'rate limitedly',
+      'rate',
+      '',
+    ]) {
+      const { calls, handlers } = recorder()
+      await open(handlers)
+      server.closeWith(4401, text)
+      await server.until(() => calls.close.length === 1)
+      expect(calls.close[0]?.[0], text).toBe('closed')
+    }
+  })
+
   it('close() ends the connection and then tells the handlers nothing', async () => {
     // Shutdown, and a credential change, close the socket on purpose. If the
     // close came back as onClose the connector would schedule a reconnect for a

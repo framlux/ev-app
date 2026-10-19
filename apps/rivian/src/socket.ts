@@ -78,15 +78,23 @@ export class SocketOpenError extends Error {
 const SUBPROTOCOL = 'graphql-transport-ws'
 
 /**
- * The reasons Rivian closes with that mean something, matched without regard
- * to case or surrounding space. Matching is deliberately a little forgiving
- * for `Unauthenticated`: missing it turns a dead session into an ordinary
- * close, which is retried.
+ * The reasons Rivian closes with that mean something. The reason is matched by
+ * its LEADING token, ignoring case and surrounding space: "Unauthenticated",
+ * " unauthenticated ", and "Unauthenticated: session expired" all say the
+ * session is dead, and "Rate limited" and "rate limited, retry later" both say
+ * to slow down. Leading-token only, on purpose: the word in the middle of some
+ * other sentence ("not unauthenticated") is not a verdict, and neither is a
+ * longer word that merely starts with it ("unauthenticatedness").
+ *
+ * The matching leans towards `Unauthenticated`. Missing it turns a dead session
+ * into an ordinary close, which is retried, and retrying a dead session is how
+ * accounts get flagged (design §5.2). Only the verdict leaves this function:
+ * the rest of the reason text is remote text and is never echoed anywhere.
  */
 function closeReasonOf(text: string): 'rate_limited' | 'unauthenticated' | null {
   const reason = text.trim().toLowerCase()
-  if (reason === 'rate limited') return 'rate_limited'
-  if (reason === 'unauthenticated') return 'unauthenticated'
+  if (/^unauthenticated\b/.test(reason)) return 'unauthenticated'
+  if (/^rate\s+limited\b/.test(reason)) return 'rate_limited'
   return null
 }
 
@@ -206,8 +214,14 @@ export function openSocket(opts: {
       if (phase !== 'acked') return
       switch (type) {
         // The protocol's keep-alive. A server that sends a ping and hears no
-        // pong closes the connection, so it is answered here, and is not a
-        // frame as far as the caller's silence timer is concerned.
+        // pong closes the connection, so it is answered here.
+        //
+        // It is deliberately NOT surfaced to the handlers, so a ping does not
+        // reset the connector's 60 s silence clock. Silence exists for the case
+        // of a live socket whose subscriptions have gone quiet, and resubscribing
+        // is what un-sticks that. A server that pings through the quiet would
+        // otherwise keep the clock at zero for ever and the resubscribe would
+        // never happen, which is the failure it is there to repair (design §5.2).
         case 'ping':
           send({ type: 'pong' })
           break

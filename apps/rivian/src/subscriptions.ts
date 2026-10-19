@@ -159,6 +159,12 @@ export class SubscriptionPlan {
    *
    * The connector must discard any probe it is holding for a delayed
    * `activate`. Those belong to the numbering that has just been reset.
+   *
+   * ONLY FOR A REPLACED SOCKET. Forgetting the ids is right when the old
+   * connection is gone and took its server-side subscriptions with it. On a
+   * socket that is still open, use `renewAll`: `initial()` discards the old ids
+   * without handing them back, so the connector could never `complete` them,
+   * and the server would keep delivering under subscriptions nobody can name.
    */
   initial(): { id: string; sub: PlannedSubscription }[] {
     this.#live.clear()
@@ -305,6 +311,13 @@ export class SubscriptionPlan {
    * field would be reported missing for ever. The price is a short window in
    * which a property being reprobed is not in `dropped`; a restart inside it
    * finds the property in a normal group and bisects again.
+   *
+   * HOW TO CALL IT. Only while the socket is acknowledged, and `activate` every
+   * probe it returns at once: a probe handed out and not subscribed is
+   * forgotten (it has left `dropped` or the unavailable set, and nothing will
+   * bring it back for a day, or for ever if it was a dropped property). Then
+   * persist `dropped` again, because it shrinks as the probes are handed out;
+   * the stored list is otherwise stale until the next rejection.
    */
   dueForReprobe(now: number): PlannedSubscription[] {
     const due: PlannedSubscription[] = []

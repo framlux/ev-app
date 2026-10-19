@@ -319,6 +319,14 @@ describe('SubscriptionPlan.rejected: bisection (design §5.4)', () => {
     const names = props(16)
     const plan = planOf(names)
     bisect(plan, plan.initial(), new Set([names[3]!]))
+
+    // A renewal (silence, or a queue overflow) on the same socket.
+    const renewed = plan.renewAll()
+    const renewedProperties = stateSubs(renewed).flatMap((s) => s.properties!)
+    expect(renewedProperties).not.toContain(names[3])
+    expect(renewedProperties).toHaveLength(15)
+
+    // And a replaced socket.
     const again = plan.initial()
     expect(stateSubs(again).flatMap((s) => s.properties!)).not.toContain(names[3])
     expect(stateSubs(again).flatMap((s) => s.properties!)).toHaveLength(15)
