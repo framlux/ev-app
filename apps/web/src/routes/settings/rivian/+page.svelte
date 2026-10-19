@@ -25,7 +25,7 @@
 	 * properties) says "None" for `[]` rather than dashing it, because an empty
 	 * list is an observation and a dash is the absence of one. Before the
 	 * connector has subscribed to anything it is not an observation either, and
-	 * says "not probed yet" (`BEFORE_SUBSCRIBING`).
+	 * says "not probed yet" (`probed`).
 	 *
 	 * THE PASSWORD IS NEVER KEPT HERE. It is sent once, and the field is emptied
 	 * the moment Rivian has answered with anything but a refusal. A refusal keeps
@@ -134,23 +134,26 @@
 	}
 
 	/**
-	 * The states in which the connector has not yet subscribed to anything, so
-	 * an empty dropped list is not an answer: Rivian has not been asked, and
-	 * "None" would say it had been and accepted everything. The list is saved
-	 * and survives a restart, so a name in it is shown whatever the state; only
-	 * an EMPTY list is read this way. `connecting` is not here: a reconnecting
-	 * connector may already have a plan whose empty list is an answer.
+	 * Whether an empty dropped list is an answer. "None" says Rivian was asked
+	 * and accepted every property, which needs a subscribe that went through, and
+	 * the report shows one of two things that mean it did: the state is
+	 * `subscribed`, or a frame has been heard (`lastFrameAt`), which could only
+	 * have come over a subscription, whatever state the connector has dropped
+	 * into since. Anything else (a connector that is `backing_off`,
+	 * `unauthenticated` or `connecting` and has never heard a frame, as much as
+	 * one still before the first subscribe) has not been told anything, and the
+	 * list is `[]` because it has not got to it. Judged from what the row shows
+	 * and not from the state alone, since a state like `backing_off` is reached
+	 * both with and without a subscribe behind it.
+	 *
+	 * The list is saved and survives a restart, so a name in it is shown whatever
+	 * the state; only an EMPTY list is read this way.
 	 */
-	const BEFORE_SUBSCRIBING: ReadonlySet<RivianConnectorState> = new Set([
-		'signed_out',
-		'starting',
-		'credential_invalid',
-		'finding_vehicle',
-		'waiting_for_vehicle'
-	])
+	let probed = $derived(
+		status ? status.state === 'subscribed' || status.lastFrameAt !== null : false
+	)
 
 	let streaming = $derived(status?.state === 'subscribed' && status.lastFrameAt !== null)
-	let probed = $derived(status ? !BEFORE_SUBSCRIBING.has(status.state) : false)
 
 	let stateWords = $derived.by(() => {
 		if (!status) return null

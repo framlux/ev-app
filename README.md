@@ -511,8 +511,10 @@ easy to misread.
   The connector finds them by splitting a rejected group, saves the list in
   `rivian_status.dropped_properties`, reads it back at start, and tries each
   saved name again an hour after start (spread over the hour after that); a
-  newly dropped name is tried again after a day. Before the connector has
-  subscribed to anything the page says *not probed yet*, not *None*.
+  newly dropped name is tried again after a day. An empty list reads *None*
+  only once the connector is `subscribed` or has heard a frame; before the
+  connector has subscribed to anything (including a connector backing off or
+  unauthenticated that has never heard a frame) the page says *not probed yet*.
 - **Whole-request rejection drops nothing.** If Rivian rejects *every*
   `vehicleState` group of a subscribe (or a group on every one of its
   properties), the fault is the request and not any field, so the connector

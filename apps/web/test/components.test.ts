@@ -1197,13 +1197,19 @@ describe('the Rivian settings page renders in every state that occurs', () => {
 		'starting',
 		'credential_invalid',
 		'finding_vehicle',
-		'waiting_for_vehicle'
+		'waiting_for_vehicle',
+		'connecting',
+		'backing_off',
+		'unauthenticated'
 	])(
-		'says "not probed yet", and not None, for an empty dropped list in %s, where nothing has been subscribed',
+		'says "not probed yet", and not None, for an empty dropped list in %s with no frame ever heard',
 		(state) => {
-			// "None" is a claim that Rivian accepted everything, and before the first
-			// subscribe nobody has asked it anything. The list is `[]` there because
-			// the connector has not got to it, not because the answer was no.
+			// "None" is a claim that Rivian accepted everything, and that needs a
+			// subscribe that went through: the state `subscribed`, or a frame heard
+			// at some point (`lastFrameAt`). A connector backing off or
+			// unauthenticated that has never been either has not been asked anything;
+			// the list is `[]` there because it has not got to it, not because the
+			// answer was no.
 			const cell = droppedCell(rivianPage({ status: status({ state }) }))
 			expect(cell).toContain('not probed yet')
 			expect(cell).not.toContain('None')
@@ -1220,10 +1226,18 @@ describe('the Rivian settings page renders in every state that occurs', () => {
 		expect(droppedCell(body)).not.toContain('not probed yet')
 	})
 
-	it('says None once the connector is past subscribing, and a dash while it has reported nothing', () => {
-		for (const state of ['connecting', 'subscribed', 'backing_off', 'unauthenticated']) {
-			expect(droppedCell(rivianPage({ status: status({ state }) }))).toContain('None')
+	it('says None once subscribed, or once any frame has been heard, whatever the state is now', () => {
+		// Subscribed is an answer from Rivian even before the first frame.
+		expect(droppedCell(rivianPage({ status: status({ state: 'subscribed' }) }))).toContain('None')
+		// A frame heard means a subscribe went through at some point, so a
+		// connector that has since dropped into a backoff still knows its list is empty.
+		for (const state of ['connecting', 'backing_off', 'unauthenticated']) {
+			const heard = status({ state, lastFrameAt: '2026-10-19T11:30:00.000Z' })
+			const cell = droppedCell(rivianPage({ status: heard }))
+			expect(cell, state).toContain('None')
+			expect(cell, state).not.toContain('not probed yet')
 		}
+		// And a dash while the connector has reported nothing at all.
 		expect(droppedCell(rivianPage({}))).toContain('—')
 	})
 

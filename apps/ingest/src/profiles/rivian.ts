@@ -5,6 +5,7 @@ import {
   RIVIAN_VOLATILE_SLOTS,
   decodeRivian,
   rivianStateToSample,
+  type RivianNamedSlot,
 } from '@ev/rivian'
 import type { VendorProfile } from '../profile.js'
 import { STALE_VALUE_MS, VOLATILE_STALE_MS } from '../timing.js'
@@ -58,6 +59,18 @@ import { STALE_VALUE_MS, VOLATILE_STALE_MS } from '../timing.js'
  * hours so an old `charging_active` cannot hold a session open. Everything else
  * is a level that is true until contradicted.
  *
+ * THE PER-SESSION VALUES ARE NOT LEVELS. `chargeEnergyAddedKwh` counts from zero
+ * at each charge and `timeToFullChargeHours` is the ETA of the one in progress,
+ * so a value left over from the last session is not a stale reading of this
+ * car's state, it is another session's. Carried for a week, the counter of a
+ * charge that ended at 20 kWh sat in the accumulator for the next, and when the
+ * plug-in word emitted a sample before the first liveData frame (a gap past the
+ * 2 s quiet period) that sample reported 20 kWh. Core metrics read the first
+ * sample's counter as where the session started, so a day-later charge that
+ * delivered 30 kWh came up 20 kWh short. They take the charge words' six hours
+ * (`STALE_VALUE_MS`): long enough to carry a session's counter through a pause
+ * and a restart, short enough that it is gone before the next one begins.
+ *
  * Why seven days and not for ever: it bounds how long an abandoned accumulator
  * may describe a car it has not heard from, as `STALE_VALUE_MS` does for Tesla.
  * A parked car's levels go unchanged for days (a week away from the driveway is
@@ -82,9 +95,20 @@ const VOLATILE: ReadonlySet<string> = new Set<string>(RIVIAN_VOLATILE_SLOTS)
 /** The slots a charge's state lives in: the window is Tesla's, so an old word cannot hold a session open. */
 const CHARGE_STATE: ReadonlySet<string> = new Set<string>(RIVIAN_CHARGE_STATE_SLOTS)
 
+/**
+ * The values that belong to one charge session and mean nothing in the next (see
+ * the per-session note above). Typed against the named slots, as the lists in
+ * `@ev/rivian` are, so a misspelling is a compile error and not a slot that
+ * quietly gets the week.
+ */
+const PER_SESSION: ReadonlySet<string> = new Set<string>([
+  'chargeEnergyAddedKwh',
+  'timeToFullChargeHours',
+] as const satisfies readonly RivianNamedSlot[])
+
 export function rivianStaleWindowFor(slot: string): number {
   if (VOLATILE.has(slot)) return VOLATILE_STALE_MS
-  if (CHARGE_STATE.has(slot)) return STALE_VALUE_MS
+  if (CHARGE_STATE.has(slot) || PER_SESSION.has(slot)) return STALE_VALUE_MS
   return RIVIAN_LEVEL_STALE_MS
 }
 

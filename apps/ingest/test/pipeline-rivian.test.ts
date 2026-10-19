@@ -119,7 +119,7 @@ describe('the Rivian profile', () => {
     expect(RIVIAN_LEVEL_STALE_MS).toBe(7 * 24 * HOUR)
     for (const slot of [
       'lat', 'lon', 'gear', 'socPct', 'odometerKm', 'tpmsFl', 'cloudOnline', 'powerStateRaw',
-      'chargeEnergyAddedKwh', 'doorFrontLeftLocked',
+      'doorFrontLeftLocked',
     ]) {
       expect(rivianProfile.staleWindowFor(slot)).toBe(RIVIAN_LEVEL_STALE_MS)
     }
@@ -679,6 +679,45 @@ describe('Pipeline with the Rivian profile: arrival-stamped values re-sent uncha
     expect(sampleAt(db, ms('16:30:10')).chargePowerKw).toBe(11.5)
   })
 
+  it('keeps what the stream last said through a transaction that rolls back', async () => {
+    // A message whose transaction fails is redelivered, and the accumulator is put
+    // back to a snapshot taken before it. The memory of what the stream last said
+    // is part of that snapshot: restored without it, the redelivered re-send would
+    // find nothing held and nothing remembered, land as news, and bring the
+    // expired charging word back as a charge.
+    const live = { powerKW: 7.2, totalChargedEnergy: 6, vehicleChargerState: 'charging_active' }
+    const { db, pipeline } = setup()
+    await pipeline.handle(stateFrame(ms('08:00:00'), {
+      chargerStatus: 'chrgr_sts_connected_charging', chargerState: 'charging_active',
+    }))
+    for (let j = 0; j <= 6; j++) {
+      await pipeline.handle(chargingFrame(ms('08:00:00') + j * 5 * MIN, { ...live, totalChargedEnergy: j }))
+    }
+    for (let at = ms('08:31:00'); at <= ms('14:29:00'); at += MIN) {
+      await pipeline.handle(chargingFrame(at, live))
+    }
+    // The word ran out at 14:00. A level change at 14:30 emits a sample at the
+    // next frame, and `take()` drops the word with it.
+    await pipeline.handle(stateFrame(ms('14:30:00'), { batteryLevel: 70 }))
+    await pipeline.handle(chargingFrame(ms('14:31:00'), live))
+
+    // The re-send at 14:32 commits nothing: its transaction fails.
+    db.failNextCommit = new Error('commit failed')
+    await expect(pipeline.handle(chargingFrame(ms('14:32:00'), live))).rejects.toThrow('commit failed')
+    // And is redelivered, as the broker would.
+    const redelivered = await pipeline.handle(chargingFrame(ms('14:32:00'), live))
+    expect(redelivered.unmapped).toBe(1)
+    expect(redelivered.fieldsApplied).toBe(0)
+
+    for (let at = ms('14:33:00'); at <= ms('15:00:00'); at += MIN) await pipeline.handle(chargingFrame(at, live))
+    await finish(pipeline, '15:10:00')
+
+    expect(sessionsOf(db, 'charge')).toHaveLength(1)
+    const after = db.state.samples.filter((x) => x.ts.getTime() >= ms('14:30:00'))
+    expect(after.length).toBeGreaterThan(0)
+    expect(after.every((x) => x.chargeState === null)).toBe(true)
+  })
+
   it('a real charge stays one charge past six hours, its charging word re-sent unchanged', async () => {
     // The other half: what keeps a long charge's word alive is the car's power
     // and counter moving, through the charge refresh, with no help from the
@@ -829,6 +868,57 @@ describe('Pipeline with the Rivian profile: a car parked for longer than the cha
     const sample = sampleAt(db, ms('10:00:00'))
     expect(sample.socPct).toBeNull()
     expect(sample.rangeKm).toBe(300)
+  })
+})
+
+describe('Pipeline with the Rivian profile: values that belong to one charge session', () => {
+  // `chargeEnergyAddedKwh` counts from zero at each session, so a value carried
+  // from the last one is not a stale level but somebody else's reading. Core
+  // metrics take the first sample's counter as where the session started, so a
+  // new session whose first sample (the plug-in word, before any liveData)
+  // carried the old counter measured from there and came up short.
+  /** The plug-in word, then a reading every 5 minutes: 1 kWh, 2, ... `deliveredKwh` + 1. */
+  function chargeSession(start: number, deliveredKwh: number): RawMessage[] {
+    const frames: RawMessage[] = [stateFrame(start, {
+      chargerStatus: 'chrgr_sts_connected_charging', chargerState: 'charging_active',
+    })]
+    // The liveData follows the plug-in word by 5 s: past the 2 s quiet period, so
+    // the word emits a sample of its own, with whatever the accumulator carries.
+    for (let j = 0; j <= deliveredKwh; j++) {
+      frames.push(chargingFrame(start + 5 * SEC + j * 5 * MIN, { powerKW: 7.2, totalChargedEnergy: 1 + j }))
+    }
+    return frames
+  }
+
+  it('does not carry the last session\'s counter into the first sample of the next', async () => {
+    const { db, pipeline } = setup()
+    const first = ms('08:00:00')
+    const second = first + 24 * HOUR
+    // Session 1 ends with its counter at 21 kWh.
+    await feed(pipeline, chargeSession(first, 20))
+    await pipeline.handle(stateFrame(first + 2 * HOUR, { chargerState: 'charging_complete' }))
+    // Session 2, a day later, delivers 30 kWh: its counter runs 1 to 31.
+    await feed(pipeline, chargeSession(second, 30))
+    await pipeline.handle(stateFrame(second + 4 * HOUR, { chargerState: 'charging_complete' }))
+    await pipeline.flush(date(second + 5 * HOUR), true)
+
+    // The plug-in word's own sample, before the first reading: nothing to report.
+    const plugIn = sampleAt(db, second)
+    expect(plugIn.chargeState).toBe('charging')
+    expect(plugIn.chargeEnergyAddedKwh).toBeNull()
+
+    const charges = sessionsOf(db, 'charge')
+    expect(charges).toHaveLength(2)
+    expect(charges[0]!.summary!.energyKwh).toBeCloseTo(20, 3)
+    // Measured from the session's own first reading (1 kWh) to its last (31):
+    // from the 21 left over from the last session it would have come up 20 short.
+    expect(charges[1]!.summary!.energyKwh).toBeCloseTo(30, 3)
+  })
+
+  it('gives the counter and the time to full the charge words\' six hours', () => {
+    for (const slot of ['chargeEnergyAddedKwh', 'timeToFullChargeHours']) {
+      expect(rivianProfile.staleWindowFor(slot)).toBe(STALE_VALUE_MS)
+    }
   })
 })
 
