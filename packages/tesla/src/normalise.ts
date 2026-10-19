@@ -524,8 +524,12 @@ const scaled = (v: unknown, factor: number): number | null => {
 const INT_MAX = 2_147_483_647
 
 /**
- * Postgres `REAL` is float4, and it OVERFLOWS rather than saturating: binding
- * 1e39 raises "value out of range: overflow" and takes the transaction with it.
+ * A `REAL` column's decoder: a number that column can actually hold, or null.
+ *
+ * Postgres `REAL` is float4, and it refuses BOTH ends of its range rather than
+ * saturating: binding 1e39 raises "value out of range: overflow", and binding
+ * 1e-50 raises "out of range for type real" on underflow. Either takes the
+ * transaction with it.
  *
  * Same argument as INT_MAX, and the same consequence, which is why it is not
  * merely tidiness: a rejected bind rolls back in `transactionally`, the message
@@ -533,11 +537,14 @@ const INT_MAX = 2_147_483_647
  * module's own header warns that a field's JSON type drifts between vehicle
  * software builds, so an absurd numeric string is an in-contract input, not a
  * hypothetical.
- */
-const FLOAT4_MAX = 3.4028234663852886e38
-
-/**
- * A `REAL` column's decoder: a number that column can actually hold, or null.
+ *
+ * `Math.fround` is the float4 rounding Postgres applies, so it is the check
+ * itself and not an approximation of one: a value that rounds to infinity
+ * overflows, and a non-zero value that rounds to zero underflows. A denormal
+ * (1e-40) rounds to a non-zero float4 and Postgres accepts it, so do we; a
+ * genuine zero is a reading and is kept. (This was a `> 3.4028234663852886e38`
+ * test, which let underflow through and refused 3.4028235e38, a value that
+ * rounds down to the largest float4 and that Postgres accepts.)
  *
  * `DOUBLE PRECISION` keeps plain `num` — float8 spans the whole of what
  * `Number.isFinite` admits, so there is nothing left to guard against.
@@ -545,7 +552,8 @@ const FLOAT4_MAX = 3.4028234663852886e38
 function real(v: unknown): number | null {
   const n = num(v)
   if (n === null) return null
-  return Math.abs(n) > FLOAT4_MAX ? null : n
+  const f = Math.fround(n)
+  return Number.isFinite(f) && (f !== 0 || n === 0) ? n : null
 }
 
 /**

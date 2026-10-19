@@ -20,9 +20,13 @@
  * claim that the car is stationary; it is only ever written for a speed the car
  * actually reported.
  *
+ * ONE ABSENCE IS DELIBERATELY NOT "NOTHING": a gear the decoder cannot name,
+ * placeholders included, is an explicit null `gear`, so that it overwrites a
+ * carried D instead of letting it hold a drive open (design §7.5).
+ *
  * A WRONG TYPE MUST NEVER BECOME A BIND ERROR EITHER. `insertSample` binds every
  * column in one statement inside the ingest transaction, so a value its column
- * rejects (a float4 overflow, a NUL in a TEXT) rolls the transaction back, is
+ * rejects (a float4 overflow or underflow, a NUL in a TEXT) rolls the transaction back, is
  * never acked, and is redelivered for ever: a permanent stall and not a hole in
  * one series. The `REAL` columns therefore refuse what float4 cannot hold, the
  * text slots refuse a NUL, and `rivianStateToSample` reads each slot by its
@@ -177,10 +181,18 @@ const CHARGE_STATE = [
 const CHARGING_POWER = ['chargePowerKw'] as const satisfies readonly RivianNamedSlot[]
 const CHARGING_ENERGY = ['chargeEnergyAddedKwh'] as const satisfies readonly RivianNamedSlot[]
 
-export const RIVIAN_VOLATILE_SLOTS: readonly string[] = VOLATILE
-export const RIVIAN_CHARGE_STATE_SLOTS: readonly string[] = CHARGE_STATE
-export const RIVIAN_CHARGING_POWER_SLOTS: readonly string[] = CHARGING_POWER
-export const RIVIAN_CHARGING_ENERGY_SLOTS: readonly string[] = CHARGING_ENERGY
+/**
+ * Exported as lists of NAMED slots, not of strings. A `string[]` is what the
+ * profile consumes, and a named-slot list is assignable to it, so nothing is
+ * lost; but the narrower type is what the exported declarations are held to, so
+ * a non-slot added to one of them stops compiling at the declaration itself,
+ * even if the `satisfies` above were ever deleted. `typecheck` compiles the
+ * tests, and `normalise.test.ts` pins that the exports keep this type.
+ */
+export const RIVIAN_VOLATILE_SLOTS: readonly RivianNamedSlot[] = VOLATILE
+export const RIVIAN_CHARGE_STATE_SLOTS: readonly RivianNamedSlot[] = CHARGE_STATE
+export const RIVIAN_CHARGING_POWER_SLOTS: readonly RivianNamedSlot[] = CHARGING_POWER
+export const RIVIAN_CHARGING_ENERGY_SLOTS: readonly RivianNamedSlot[] = CHARGING_ENERGY
 
 /**
  * Below this, GPS speed is noise (design §7.2). A receiver reports a few tenths
@@ -210,8 +222,11 @@ export interface RivianDecoded {
 /**
  * Rivian's stand-ins for a value (design §2.5). Any property can carry one, and
  * none is a reading: carried as a string into a numeric decoder each fails, but
- * a TEXT slot or a gear would happily take it for a word, so they are screened
- * out first, for every property alike.
+ * a TEXT slot would happily take one for a word, so they are screened out first
+ * and the property contributes nothing (§7.1), its previous value carrying.
+ *
+ * The one exception is `gearStatus`, which does not use this screen: a gear we
+ * cannot name, a placeholder included, is an explicit null gear (§7.5).
  */
 const PLACEHOLDERS: ReadonlySet<string> = new Set(['fault', 'signal_not_available', 'undefined'])
 
@@ -268,16 +283,23 @@ function num(v: unknown): number | null {
 }
 
 /**
- * Postgres `REAL` is float4, and it OVERFLOWS rather than saturating: binding
- * 1e39 raises "value out of range" and takes the ingest transaction with it, so
+ * Postgres `REAL` is float4, and it refuses BOTH ends of its range rather than
+ * saturating: '1e39'::real raises "out of range" on overflow, and so does
+ * '1e-50'::real on underflow. Either takes the ingest transaction with it, so
  * the message is never acked and is redelivered for ever. A `DOUBLE PRECISION`
  * column spans everything `Number.isFinite` admits, so only the `REAL` ones are
  * checked.
+ *
+ * `Math.fround` is the float4 rounding Postgres applies, so it is the check
+ * itself and not an approximation of one: a value that rounds to infinity
+ * overflows, and a non-zero value that rounds to zero underflows. A denormal
+ * (1e-40) rounds to a non-zero float4 and Postgres accepts it, and so do we; a
+ * genuine zero is a reading and is kept.
  */
-const FLOAT4_MAX = 3.4028234663852886e38
-
 function fitsReal(n: number | null): number | null {
-  return n !== null && Math.abs(n) <= FLOAT4_MAX ? n : null
+  if (n === null) return null
+  const f = Math.fround(n)
+  return Number.isFinite(f) && (f !== 0 || n === 0) ? n : null
 }
 
 /** A number for a `REAL` column. */
@@ -400,21 +422,24 @@ const powerState: Property = {
 }
 
 /**
- * `gearStatus`. A word we cannot name is an EXPLICIT null gear, not nothing
- * (design §7.5): an explicit null overwrites an earlier D, where nothing would
- * carry the D forward and hold a drive open. `rivianGear` makes the three-way
- * call; a non-string (`undefined`) writes nothing.
+ * `gearStatus`. Any string we cannot name is an EXPLICIT null gear, not nothing
+ * (design §7.5, "anything else is an explicit null"): an explicit null
+ * overwrites an earlier D, where nothing would carry the D forward and hold a
+ * drive open, the bug 71aa244 fixed for Tesla. `rivianGear` makes the three-way
+ * call, and a non-string (a null, an absent value, a number) writes nothing.
  *
- * The placeholders never get this far. `sayable` has already refused them, per
- * §7.1, so `signal_not_available` carries the previous gear rather than
- * clearing it.
+ * This INCLUDES the placeholders. `fault` and `signal_not_available` on the
+ * selector are the Rivian analogue of Tesla's `ShiftStateSNA`: the drive system
+ * has stopped vouching for its gear, which is when it is powering down, and
+ * carrying the last D through that is how a parked car reads as one waiting in
+ * gear. So `gearStatus` does not go through `sayable`, whose placeholder screen
+ * would make `signal_not_available` carry the previous gear instead of clearing
+ * it. Every other property takes that screen (design §7.1).
  */
 const gearStatus: Property = {
   timed: true,
   read(prop) {
-    const value = sayable(prop)
-    if (value === undefined) return null
-    const gear = rivianGear(value)
+    const gear = rivianGear(prop['value'])
     return gear === undefined ? null : ({ gear } satisfies Partial<RivianNamedSlots>)
   },
 }

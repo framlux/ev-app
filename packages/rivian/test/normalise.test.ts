@@ -29,6 +29,8 @@ const W = (s: string) =>
     ? SPEED_WINDOW_MS
     : VALUE_WINDOW_MS
 
+const PLACEHOLDERS = ['signal_not_available', 'fault', 'undefined']
+
 /** An ISO timestamp `offsetMs` away from the frame's arrival. */
 const at = (offsetMs: number) => new Date(RECEIVED.getTime() + offsetMs).toISOString()
 /** A timestamp a second before the frame: fresh enough for every slot. */
@@ -148,6 +150,33 @@ describe('decodeRivian: units and conversions', () => {
     expect(slotsOf({ vehicleMileage: tv(TS, 1e39) })).toEqual({ odometerKm: 1e39 / 1000 })
   })
 
+  it('refuses a number its REAL column would UNDERFLOW, which wedges the insert too', () => {
+    // '1e-50'::real is "out of range for type real" in Postgres, just as '1e39'
+    // is: float4 refuses a non-zero value that rounds to zero.
+    expect(slotsOf({ batteryLevel: tv(TS, 1e-50) })).toEqual({})
+    expect(slotsOf({ batteryLevel: tv(TS, '-1e-50') })).toEqual({})
+    expect(slotsOf({ batteryLevel: tv(TS, 1e-46) })).toEqual({})
+    // The conversion happens before the check here too: 1e-44 minutes is a
+    // float4 denormal, but the hours it converts to (1.7e-46) are not.
+    expect(slotsOf({ timeToEndOfCharge: tv(TS, 1e-44) })).toEqual({})
+    // A DOUBLE PRECISION column holds the same tiny number without complaint.
+    expect(slotsOf({ vehicleMileage: tv(TS, 1e-50) })).toEqual({ odometerKm: 1e-50 / 1000 })
+  })
+
+  it('keeps what a REAL column CAN hold at both ends: zero, denormals, the largest', () => {
+    // Zero is a reading, and it is the one value Math.fround(n) === 0 must not refuse.
+    expect(slotsOf({ batteryLevel: tv(TS, 0) })).toEqual({ socPct: 0 })
+    expect(slotsOf({ batteryLevel: tv(TS, '-0') })).toEqual({ socPct: -0 })
+    // 1e-40 and 1e-45 are float4 denormals, which Postgres accepts.
+    expect(slotsOf({ batteryLevel: tv(TS, 1e-40) })).toEqual({ socPct: 1e-40 })
+    expect(slotsOf({ batteryLevel: tv(TS, 1e-45) })).toEqual({ socPct: 1e-45 })
+    // 3.4028235e38 is above the exact largest float4 but rounds down to it, and
+    // Postgres accepts it; the next decimal digit up rounds to infinity and is refused.
+    expect(slotsOf({ batteryLevel: tv(TS, 3.4028235e38) })).toEqual({ socPct: 3.4028235e38 })
+    expect(slotsOf({ batteryLevel: tv(TS, 3.4028236e38) })).toEqual({})
+    expect(slotsOf({ batteryLevel: tv(TS, 3.4e38) })).toEqual({ socPct: 3.4e38 })
+  })
+
   it('refuses a version that is not a plain string', () => {
     expect(slotsOf({ otaCurrentVersion: tv(TS, 2026) })).toEqual({})
     expect(slotsOf({ otaCurrentVersion: tv(TS, '') })).toEqual({})
@@ -207,14 +236,63 @@ describe('decodeRivian: nulls and placeholders', () => {
     expect(slotsOf({ gearStatus: tv(TS, undefined) })).toEqual({})
   })
 
-  it.each(['signal_not_available', 'fault', 'undefined'])(
-    'contributes nothing for the placeholder %s, whatever the property',
+  /**
+   * A property object with `placeholder` where THAT property keeps its value.
+   * Most keep a `value`; `gnssLocation` keeps its pair in `latitude` and
+   * `longitude`, and `cloudConnection` has no `value` at all, only `isOnline`.
+   * Handing those two a `{timeStamp, value}` object would pass for the wrong
+   * reason: they read neither field, so they would decode nothing whatever the
+   * placeholder handling did.
+   */
+  const placeholderProp = (name: string, placeholder: string) => {
+    if (name === 'gnssLocation') {
+      return { timeStamp: TS, latitude: placeholder, longitude: placeholder }
+    }
+    if (name === 'cloudConnection') return { isOnline: placeholder, lastSync: placeholder }
+    return tv(TS, placeholder)
+  }
+
+  it.each(PLACEHOLDERS)(
+    'contributes nothing for the placeholder %s, whatever the property but gearStatus',
     (placeholder) => {
       for (const name of RIVIAN_DECODED_PROPERTIES) {
-        expect(slotsOf({ [name]: tv(TS, placeholder) })).toEqual({})
+        if (name === 'gearStatus') continue
+        expect(slotsOf({ [name]: placeholderProp(name, placeholder) }), name).toEqual({})
       }
     },
   )
+
+  it.each(PLACEHOLDERS)('reads the placeholder %s on gearStatus as an explicit null gear', (p) => {
+    expect(slotsOf({ gearStatus: placeholderProp('gearStatus', p) })).toEqual({ gear: null })
+  })
+
+  it('reads the structured properties\' own fields, so the cases above are not vacuous', () => {
+    // The same two shapes, with real values in the fields the placeholders
+    // occupied above, DO decode.
+    expect(
+      slotsOf({ gnssLocation: { timeStamp: TS, latitude: 47.6, longitude: -122.3 } }),
+    ).toEqual({ lat: 47.6, lon: -122.3 })
+    expect(slotsOf({ cloudConnection: { isOnline: true, lastSync: TS } })).toEqual({
+      cloudOnline: true,
+    })
+  })
+
+  it.each(PLACEHOLDERS)('refuses the placeholder %s in a location field, and the pair', (p) => {
+    const at47 = { timeStamp: TS, latitude: 47.6, longitude: -122.3 }
+    expect(slotsOf({ gnssLocation: { ...at47, latitude: p } })).toEqual({})
+    expect(slotsOf({ gnssLocation: { ...at47, longitude: p } })).toEqual({})
+    expect(slotsOf({ gnssLocation: { ...at47, latitude: p, longitude: p } })).toEqual({})
+  })
+
+  it.each(PLACEHOLDERS)('refuses the placeholder %s as isOnline, on property and stream', (p) => {
+    expect(slotsOf({ cloudConnection: { isOnline: p, lastSync: TS } })).toEqual({})
+    const cloud = decodeRivian(
+      envelope('cloud', { data: { vehicleCloudConnection: { isOnline: p } } }),
+      RECEIVED,
+      W,
+    )
+    expect(cloud?.slots).toEqual({})
+  })
 
   it('leaves a placeholder in one property from touching its neighbours', () => {
     expect(
@@ -315,7 +393,34 @@ describe('decodeRivian: gear', () => {
   })
 
   it('writes nothing for a gear that is not a string', () => {
-    expect(slotsOf({ gearStatus: tv(TS, 4) })).toEqual({})
+    for (const value of [4, true, {}, [], null, undefined]) {
+      expect(slotsOf({ gearStatus: tv(TS, value) }), String(value)).toEqual({})
+    }
+  })
+
+  it.each(PLACEHOLDERS)(
+    'lets the placeholder %s overwrite a carried D, as an explicit null gear',
+    (placeholder) => {
+      // The car was in Drive, then the selector stopped vouching for itself. The
+      // accumulator overwrites a slot only with a key that is PRESENT, so the
+      // null must be a key: nothing would carry the D and hold the drive open.
+      const carried = mustDecode({ gearStatus: tv(at(-60_000), 'drive') })
+      const cleared = mustDecode({ gearStatus: tv(TS, placeholder) })
+      expect(Object.hasOwn(cleared.slots, 'gear')).toBe(true)
+      expect(cleared.slots['gear']).toBeNull()
+      // Stamped like any gear, and newer than the D it clears.
+      expect(cleared.observedAt['gear']).toBe(RECEIVED.getTime() - 1000)
+      expect(cleared.observedAt['gear']).toBeGreaterThan(carried.observedAt['gear']!)
+      // The accumulator's overwrite, in miniature: later keys replace earlier ones.
+      expect({ ...carried.slots, ...cleared.slots }['gear']).toBeNull()
+      // Control: the same placeholder on any other property leaves the D alone.
+      const other = mustDecode({ batteryLevel: tv(TS, placeholder) })
+      expect({ ...carried.slots, ...other.slots }['gear']).toBe('D')
+    },
+  )
+
+  it('does not apply a placeholder gear that is already too old, as with any gear', () => {
+    expect(slotsOf({ gearStatus: tv(at(-VALUE_WINDOW_MS), 'fault') })).toEqual({})
   })
 
   it('treats a sleeping car as in Park, as Tesla\'s null gear is', () => {
@@ -374,6 +479,33 @@ describe('decodeRivian: gear', () => {
     ]) {
       expect(mustDecode(props).slots['gear']).toBe('D')
     }
+  })
+
+  it.each(PLACEHOLDERS)(
+    'resolves a same-timestamp sleeping powerState and gearStatus %s to gear null',
+    (placeholder) => {
+      // The inferred P and the placeholder are equally old, so the tie goes to
+      // gearStatus, the car's own report, whichever order the frame lists them
+      // in. Its explicit null is the more cautious answer: it clears a carried D
+      // and claims no Park the car did not report.
+      for (const props of [
+        { powerState: tv(TS, 'sleep'), gearStatus: tv(TS, placeholder) },
+        { gearStatus: tv(TS, placeholder), powerState: tv(TS, 'sleep') },
+      ]) {
+        const decoded = mustDecode(props)
+        expect(Object.hasOwn(decoded.slots, 'gear')).toBe(true)
+        expect(decoded.slots['gear']).toBeNull()
+        expect(decoded.slots['powerStateRaw']).toBe('sleep')
+      }
+    },
+  )
+
+  it('still lets a newer sleeping powerState win over an older placeholder gear', () => {
+    const decoded = mustDecode({
+      gearStatus: tv(at(-120_000), 'fault'),
+      powerState: tv(at(-60_000), 'sleep'),
+    })
+    expect(decoded.slots['gear']).toBe('P')
   })
 
   it('treats an untimed property as the newest candidate for a slot, as arrival is', () => {
@@ -600,9 +732,25 @@ describe('the property table and the catalogue', () => {
     expect(RIVIAN_CHARGING_ENERGY_SLOTS).toEqual(['chargeEnergyAddedKwh'])
   })
 
-  it('refuses a misspelt volatile slot at compile time', () => {
-    // @ts-expect-error 'gpsHeadng' is not a slot, and `satisfies` must say so
-    const misspelt = ['speedKph', 'gpsHeadng'] as const satisfies readonly RivianNamedSlot[]
+  it('holds the exported slot lists to named slots, so a misspelling cannot compile', () => {
+    // The first assignment is the real declarations' constraint: each exported
+    // list must be assignable to `readonly RivianNamedSlot[]`. `typecheck`
+    // compiles this file (tsconfig.test.json), so loosening an export back to
+    // `readonly string[]`, or putting a non-slot in a list, fails it here as
+    // well as at the declaration.
+    const lists: ReadonlyArray<readonly RivianNamedSlot[]> = [
+      RIVIAN_VOLATILE_SLOTS,
+      RIVIAN_CHARGE_STATE_SLOTS,
+      RIVIAN_CHARGING_POWER_SLOTS,
+      RIVIAN_CHARGING_ENERGY_SLOTS,
+    ]
+    expect(lists.every((list) => list.length > 0)).toBe(true)
+
+    // The control: the same annotation does refuse a misspelling. Without it the
+    // assignment above proves nothing, since a type that accepts everything
+    // would pass it too.
+    // @ts-expect-error 'gpsHeadng' is not a slot
+    const misspelt: readonly RivianNamedSlot[] = ['speedKph', 'gpsHeadng']
     expect(misspelt).toHaveLength(2)
   })
 })

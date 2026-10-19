@@ -572,7 +572,9 @@ describe('per-type decoders (§3.4)', () => {
  * The §3.4 bindability tests above feed each column a value of the WRONG TYPE
  * and check it decodes to null. That misses the case that actually wedges
  * ingest: a value of the RIGHT type that the column still refuses. Postgres
- * float4 overflows above ~3.4e38 and int4 above 2^31-1, and a text parameter
+ * float4 overflows above ~3.4e38 and UNDERFLOWS below ~1e-45 (a non-zero value
+ * that rounds to zero is "out of range for type real"), int4 overflows above
+ * 2^31-1, and a text parameter
  * rejects a NUL byte outright — each raises on BIND, which rolls the
  * transaction back, leaves the message unacked, and has MQTT redeliver it
  * forever. The car cannot send these today; the module header records that JSON
@@ -583,6 +585,10 @@ describe('decoders refuse values their column cannot hold', () => {
 		['REAL', 1e39, 'float4 overflows above ~3.4e38'],
 		['REAL', '1e39', 'and the same as the numeric string the wire may send'],
 		['REAL', -1e39, 'in both directions'],
+		['REAL', 1e-50, 'float4 UNDERFLOWS too: a non-zero value that rounds to zero is out of range'],
+		['REAL', '1e-50', 'and the same as the numeric string the wire may send'],
+		['REAL', -1e-50, 'in both directions'],
+		['REAL', 3.4028236e38, 'a decimal digit past the largest float4 rounds to infinity'],
 		['INT', 3e9, 'int4 stops at 2147483647'],
 		['TEXT', 'before\u0000after', 'a NUL byte cannot be stored in text at all'],
 	]
@@ -597,7 +603,15 @@ describe('decoders refuse values their column cannot hold', () => {
 		// The guard must not be a blanket refusal of large numbers: a real
 		// lifetime-energy counter is legitimately large.
 		expect(SQL_DECODERS['REAL'](3.4e38)).toBe(3.4e38)
+		// Rounds down to the largest float4, which Postgres accepts.
+		expect(SQL_DECODERS['REAL'](3.4028235e38)).toBe(3.4028235e38)
+		// A real reading of zero is not an underflow, and a denormal float4 is
+		// held by the column (Postgres accepts '1e-40'::real and '1e-45'::real).
+		expect(SQL_DECODERS['REAL'](0)).toBe(0)
+		expect(SQL_DECODERS['REAL'](1e-40)).toBe(1e-40)
+		expect(SQL_DECODERS['REAL'](1e-45)).toBe(1e-45)
 		expect(SQL_DECODERS['INT'](2_147_483_647)).toBe(2_147_483_647)
 		expect(SQL_DECODERS['DOUBLE PRECISION'](1e39)).toBe(1e39)
+		expect(SQL_DECODERS['DOUBLE PRECISION'](1e-50)).toBe(1e-50)
 	})
 })
