@@ -88,7 +88,7 @@ The connector therefore renews the app session at every start, and once more bef
 | `parallaxMessages(vehicleId, rvms)` | `{ payload timestamp rvm }`: a base64 protobuf for topic `rvm`. A null `rvms` means all topics. |
 | `chargingSession(vehicleId)` | `liveData { powerKW kilometersChargedPerHour rangeAddedThisSession totalChargedEnergy timeElapsed timeRemaining price currency isFreeSession vehicleChargerState startTime }` and `chartData [{ soc powerKW startTime endTime timeEstimationValidityStatus vehicleChargerState }]` |
 | `vehicleCloudConnection(id)` | `{ lastSync isOnline }` |
-| `otaInstallState(vehicleId)`, `otaInstallSchedules(vehicleId)`, `vehicleGeofences(vehicleId)` | Parallax-shaped messages |
+| `otaInstallState(vehicleId)`, `otaInstallSchedules(vehicleId)`, `vehicleGeofences(vehicleId)` | `ParallaxMessageResponse { payload sequenceNumber }`: a base64 protobuf with no topic field |
 | `vehicleDepartureSchedules(vehicleId)` | A list of schedules |
 
 **Schema drift.** Rivian rejects a selection containing an unknown field with `GRAPHQL_VALIDATION_FAILED` errors that **do not name the offending field** (upstream PR #214, 2026-10-10). Upstream found the cause by bisecting by hand. Two fields changed in that same week.

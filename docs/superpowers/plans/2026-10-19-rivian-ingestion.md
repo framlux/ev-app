@@ -750,7 +750,7 @@ The header comment must explain:
 **Subscription documents.** The variable names are the API's: `vehicleState` uses `$vehicleID`; the others use `$vehicleId` or `$id`, as in spec §2.3.
 - `chargingSessionDocument`: `subscription ChargingSession($vehicleId: String!) { chargingSession(vehicleId: $vehicleId) { liveData { powerKW kilometersChargedPerHour rangeAddedThisSession totalChargedEnergy timeElapsed timeRemaining price currency isFreeSession vehicleChargerState startTime } chartData { soc powerKW startTime endTime timeEstimationValidityStatus vehicleChargerState } } }`
 - `cloudConnectionDocument`: `subscription VehicleCloudConnection($id: String!) { vehicleCloudConnection(id: $id) { lastSync isOnline } }`
-- `otaInstallStateDocument` / `otaInstallSchedulesDocument` / `geofencesDocument`: select `{ payload timestamp rvm }`.
+- `otaInstallStateDocument` / `otaInstallSchedulesDocument` / `geofencesDocument`: select `{ payload sequenceNumber }` (`ParallaxMessageResponse` in the gateway schema).
 - `departureSchedulesDocument`: `{ id name isEnabled occurrence { __typename ... on RepeatsWeekly { days startsAtMin skippedOn } } departureSettings { shouldOverrideChargeSchedule comfortSettings { cabinTempCelsius frontDefogDefrost surfaceHeatVentLevels { frontLeftSeat frontRightSeat rearLeftSeat rearRightSeat steeringWheel } } } }`.
 
 **`protobuf.ts`.** A cursor over the bytes:
