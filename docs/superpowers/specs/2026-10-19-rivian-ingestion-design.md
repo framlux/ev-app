@@ -254,7 +254,7 @@ The user sees one of these messages:
 - Matching is by VIN, and yields Rivian's vehicle `id`.
 - If the car is listed before delivery, the connector subscribes anyway. A subscription to a car that never reports costs one resubscribe a minute, exactly what the reference client does for every parked car (§2.3).
 
-**HTTP `UNAUTHENTICATED`.** Call `CreateCSRFToken` once and retry. A second `UNAUTHENTICATED` means `unauthenticated`.
+**HTTP `UNAUTHENTICATED`.** Call `CreateCSRFToken` once and retry. A second `UNAUTHENTICATED` means `unauthenticated`. This applies on the path to a socket (`getUserInfo` while finding the vehicle, including the hourly retry). The slow periodic calls (the 6 h `userInfo` refresh, `vehicle`, charging summaries, introspection) only log a refusal: the websocket close is the authoritative session signal, and an unverified endpoint must not take down a healthy stream.
 
 **Websocket close `"Unauthenticated"`** means `unauthenticated` straight away. In both cases the connector stops and waits until `updated_at` changes. It never retries a dead session: retrying one is how accounts get flagged.
 
