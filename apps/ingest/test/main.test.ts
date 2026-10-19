@@ -42,6 +42,9 @@ describe('worker entrypoint', () => {
       // Postgres, and this test needs the refusal.
       env: {
         PATH: process.env['PATH'],
+        // Required, and with no default: without it the worker fails on config
+        // before it can fail on Postgres, and this test would pass for the wrong reason.
+        EV_VENDOR: 'tesla',
         EV_VEHICLE_ID: 'exit-test',
         EV_USABLE_CAPACITY_KWH: '75',
         MQTT_PASSWORD: 'unused',

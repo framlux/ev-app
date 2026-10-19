@@ -25,7 +25,7 @@ import {
   type VehicleChange,
 } from '@ev/db'
 import type { Config } from './config.js'
-import type { RawMessage } from './deps.js'
+import type { RawMessage, Vendor } from './deps.js'
 import {
   STALE_VALUE_MS,
   type OpenRow,
@@ -53,13 +53,19 @@ import {
  * when EV_VEHICLE_VIN is unset keeps the (vendor, vendor_vehicle_id) unique
  * constraint satisfiable rather than blocking startup on a value the worker can
  * run without.
+ *
+ * `vendor` is the worker's own (EV_VENDOR): one image serves both vendors, a
+ * Deployment each, and a worker registers the car it was configured for under
+ * its own vendor rather than assuming one.
  */
-export async function registerVehicle(pool: DbPool, vehicle: Config['vehicle']): Promise<void> {
+export async function registerVehicle(
+  pool: DbPool,
+  vehicle: Config['vehicle'],
+  vendor: Vendor,
+): Promise<void> {
   await withTransaction(pool, (client) =>
     ensureVehicle(client, {
-      // This worker decodes Tesla fleet-telemetry and nothing else; the Rivian
-      // adapter gets its own worker rather than a vendor switch here.
-      vendor: 'tesla',
+      vendor,
       id: vehicle.id,
       vendorVehicleId: vehicle.vin ?? vehicle.id,
       displayName: vehicle.displayName,

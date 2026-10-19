@@ -1,5 +1,6 @@
 import { createServer, type Server } from 'node:http'
 import { Counter, Gauge, Registry, collectDefaultMetrics } from 'prom-client'
+import { RIVIAN_STREAMS, type Vendor } from './deps.js'
 
 /**
  * Instrumentation for the failure this worker exists to prevent: not crashing,
@@ -66,6 +67,20 @@ export const parseFailuresTotal = new Counter({
   registers: [registry],
 })
 
+/**
+ * Rivian values that arrived without a usable timestamp of their own (spec
+ * §6.4). The decoder stamps each property with the time the car observed it, so
+ * that a subscribe snapshot of hours-old values does not look fresh; one with no
+ * timestamp falls back to arrival, which is the one case where an old value can
+ * pass as new. Counted so a rise is visible: it means Rivian changed the shape
+ * of `timeStamp`, and the freshness guarantee is quietly weakening.
+ */
+export const untimedValuesTotal = new Counter({
+  name: 'ev_ingest_untimed_values_total',
+  help: 'Rivian values whose own timestamp was missing or unparseable, stamped with arrival instead (spec §6.4).',
+  registers: [registry],
+})
+
 /** Messages whose handling threw. These are NOT acked and will be redelivered. */
 export const handlerErrorsTotal = new Counter({
   name: 'ev_ingest_handler_errors_total',
@@ -93,22 +108,30 @@ export const handlerErrorsTotal = new Counter({
  *
  * Call once, at startup, from the worker entrypoint.
  */
-export function initialiseSeries(vehicleId: string, vendor = 'tesla'): void {
+export function initialiseSeries(vehicleId: string, vendor: Vendor): void {
   lastSampleTimestampSeconds.set({ vehicle: vehicleId }, 0)
   mqttConnected.set(0)
   samplesWrittenTotal.inc({ vendor }, 0)
   sessionsOpenedTotal.inc(0)
   sessionsClosedTotal.inc(0)
   handlerErrorsTotal.inc(0)
-  for (const record of RECORD_KINDS) messagesTotal.inc({ vendor, record }, 0)
+  untimedValuesTotal.inc(0)
+  for (const record of RECORD_KINDS[vendor]) messagesTotal.inc({ vendor, record }, 0)
   for (const reason of PARSE_FAILURE_REASONS) parseFailuresTotal.inc({ reason }, 0)
 }
 
-/** Every value `MqttHooks.onRecord` can report. Kept here so the series exist. */
-const RECORD_KINDS = ['metrics', 'alert', 'error', 'connectivity'] as const
+/**
+ * Every value `MqttHooks.onRecord` can report, per vendor. Kept here so the
+ * series exist. Tesla's are record kinds the topic parser names; Rivian's are
+ * the stream names, which are the last segment of the topic.
+ */
+const RECORD_KINDS: Record<Vendor, readonly string[]> = {
+  tesla: ['metrics', 'alert', 'error', 'connectivity'],
+  rivian: RIVIAN_STREAMS,
+}
 
 /** Every value `MqttHooks.onParseFailure` can report. */
-const PARSE_FAILURE_REASONS = ['topic', 'json', 'empty', 'unknown-vehicle'] as const
+const PARSE_FAILURE_REASONS = ['topic', 'json', 'empty', 'unknown-vehicle', 'envelope'] as const
 
 export function startMetricsServer(port: number): Server {
   const server = createServer((req, res) => {

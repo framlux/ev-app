@@ -1,5 +1,5 @@
 import mqtt from 'mqtt'
-import type { RawMessage } from './deps.js'
+import { parseRivianTopic, tapeRivianBody, type RawMessage, type Vendor } from './deps.js'
 import type { RecordKind, TeslaEnvelope } from './pipeline.js'
 
 export interface MqttOptions {
@@ -7,11 +7,15 @@ export interface MqttOptions {
   username: string
   password: string
   /**
-   * MUST be 'ev-ingest', and MUST NOT be the receiver's 'ev-fleet-telemetry'.
-   * MQTT permits one live connection per client id: a collision disconnects the
-   * incumbent, which reconnects and disconnects us, forever. It is also the key
-   * the broker files our durable session under, so changing it silently
-   * abandons whatever backlog the old id was holding.
+   * The vendor's own id ('ev-ingest' for Tesla, 'ev-ingest-rivian' for Rivian),
+   * and MUST NOT be any other process's: the receiver's 'ev-fleet-telemetry',
+   * the connector's 'ev-rivian', or the other vendor's worker (config.ts refuses
+   * them at startup). MQTT permits one live connection per client id: a
+   * collision disconnects the incumbent, which reconnects and disconnects us,
+   * forever. It is also the key the broker files our durable session under, so
+   * changing it silently abandons whatever backlog the old id was holding, and
+   * taking another worker's id inherits ITS backlog, which we would then ack as
+   * parse failures.
    */
   clientId: string
   topic: string
@@ -22,7 +26,11 @@ export interface MqttOptions {
 }
 
 export interface MqttHooks {
-  onRecord?(record: RecordKind): void
+  /**
+   * A string, not `RecordKind`: for Tesla it is the record kind, for Rivian the
+   * stream name, and a Rivian stream is not a Tesla record kind.
+   */
+  onRecord?(record: string): void
   onParseFailure?(reason: ParseFailure): void
   onHandlerError?(err: unknown): void
   onConnectionChange?(connected: boolean): void
@@ -33,8 +41,13 @@ export interface MqttHooks {
  * things operationally: a rise in `topic` means fleet-telemetry changed its
  * layout under us, a rise in `json` means a broken publisher, and
  * `unknown-vehicle` is usually just a second car on a shared broker.
+ *
+ * `envelope` is the odd one out: Rivian only, and the message was NOT
+ * discarded. The body was JSON, so it was taped, but it was not a v1 envelope
+ * with a usable `receivedAt`. A rise means the connector and this reader have
+ * drifted apart, and the taped frames are waiting for a reader that can use them.
  */
-export type ParseFailure = 'topic' | 'json' | 'empty' | 'unknown-vehicle'
+export type ParseFailure = 'topic' | 'json' | 'empty' | 'unknown-vehicle' | 'envelope'
 
 /** The part of a PUBLISH packet this module needs. Keeps fakes tiny. */
 export interface PublishPacketLike {
@@ -115,7 +128,8 @@ export function vinOf(topic: string): string | null {
 }
 
 /**
- * Build the QoS 1 message handler.
+ * Build the Tesla QoS 1 message handler. Rivian's is `makeRivianMessageHandler`;
+ * the ack discipline below is shared by both.
  *
  * ACK ORDERING IS THE POINT OF THIS FUNCTION. The receiver runs with
  * `reliable_ack_sources {"V":"mqtt"}`, which chains the vehicle's own
@@ -194,7 +208,7 @@ export function makeMessageHandler(
       value,
     }
 
-    onMessage({
+    handOff(onMessage({
       vehicleId: opts.vehicleId,
       vendor: 'tesla',
       // The metrics transport carries no timestamp of its own: `getDatumValue`
@@ -202,14 +216,110 @@ export function makeMessageHandler(
       receivedAt: new Date(),
       source: 'telemetry',
       payload: envelope,
-    }).then(
-      () => done(),
-      (err: unknown) => {
-        hooks.onHandlerError?.(err)
-        done(err instanceof Error ? err : new Error(String(err)))
-      },
-    )
+    }), hooks, done)
   }
+}
+
+/**
+ * Build the Rivian QoS 1 message handler.
+ *
+ * The ack discipline is `makeMessageHandler`'s, unchanged, and the reason is
+ * the same even though one link is missing. Rivian has no `reliable_ack_sources`
+ * chain behind it: the connector's publish is not held until we acknowledge it
+ * and the vehicle is not waiting on us. But the broker's queue for our durable
+ * session is still the ONLY buffer between the connector and the tape, and a
+ * frame acked before its commit and then lost to a crash is gone from every
+ * place it could be recovered from. So `done()` is called strictly after
+ * `onMessage` resolves, which is after COMMIT.
+ *
+ * The outcomes, and what separates them:
+ *
+ * - UNUSABLE, counted and ACKED: a topic that is not `rivian/<VIN>/<stream>`, a
+ *   VIN that is not ours, an empty body, or text that is not JSON. Redelivering
+ *   one would not change it, and an unacked message is redelivered ahead of
+ *   everything behind it.
+ * - HANDLING FAILED, counted and NOT acked: the database is down. The broker
+ *   keeps it and delivers it again.
+ * - TAPED, acked after the commit. That includes a body that is JSON but not a
+ *   v1 envelope, or whose `receivedAt` is unusable: those are taped as they are
+ *   (at arrival time, for the stamp) and counted under `envelope`, because a
+ *   frame we cannot read today is one a later reader can read, and only if it
+ *   is on the tape. A connector deployed ahead of this reader loses nothing.
+ *
+ * The parsing is in `deps.ts` (`parseRivianTopic`, `tapeRivianBody`): this
+ * module may not import `@ev/rivian`. What it adds is the ordering, and that
+ * nothing here throws: one bad message must not kill the worker.
+ */
+export function makeRivianMessageHandler(
+  opts: MqttOptions,
+  onMessage: (m: RawMessage) => Promise<void>,
+  hooks: MqttHooks = {},
+): MessageHandler {
+  return (packet, done) => {
+    const topic = packet.topic === undefined ? '' : packet.topic.toString()
+    const info = parseRivianTopic(topic)
+    if (!info) {
+      hooks.onParseFailure?.('topic')
+      done()
+      return
+    }
+    // The stream, as the topic spelled it. Counted before the checks below, as
+    // the Tesla handler does, so a message for another vehicle still shows up in
+    // the volume the worker is being offered.
+    hooks.onRecord?.(info.stream)
+
+    // See the Tesla handler: a VIN that is not ours has no `vehicle` row to
+    // attach to, and inserting it would fail its foreign key on every redelivery.
+    if (opts.vin !== null && info.vin !== opts.vin) {
+      hooks.onParseFailure?.('unknown-vehicle')
+      done()
+      return
+    }
+
+    const body = bodyOf(packet)
+    if (body.length === 0) {
+      hooks.onParseFailure?.('empty')
+      done()
+      return
+    }
+
+    const taped = tapeRivianBody(body, new Date())
+    if ('error' in taped) {
+      hooks.onParseFailure?.('json')
+      done()
+      return
+    }
+    if (!taped.envelopeOk) hooks.onParseFailure?.('envelope')
+
+    handOff(onMessage({
+      vehicleId: opts.vehicleId,
+      vendor: 'rivian',
+      // The connector's clock, which is when the frame arrived; ours would be
+      // when it got through the broker, hours later after a backlog.
+      receivedAt: taped.receivedAt,
+      source: 'graphql_ws',
+      payload: taped.payload,
+    }), hooks, done)
+  }
+}
+
+/**
+ * The tail both handlers share: ack after the write resolves, never before, and
+ * on a failure report it and pass the error to `done`, which withholds the
+ * PUBACK so the broker redelivers.
+ */
+function handOff(
+  written: Promise<void>,
+  hooks: MqttHooks,
+  done: (err?: Error) => void,
+): void {
+  written.then(
+    () => done(),
+    (err: unknown) => {
+      hooks.onHandlerError?.(err)
+      done(err instanceof Error ? err : new Error(String(err)))
+    },
+  )
 }
 
 /**
@@ -227,8 +337,9 @@ export function attach(
   opts: MqttOptions,
   onMessage: (m: RawMessage) => Promise<void>,
   hooks: MqttHooks = {},
+  makeHandler: typeof makeMessageHandler = makeMessageHandler,
 ): void {
-  client.handleMessage = makeMessageHandler(opts, onMessage, hooks)
+  client.handleMessage = makeHandler(opts, onMessage, hooks)
 
   client.on('connect', (() => {
     hooks.onConnectionChange?.(true)
@@ -246,8 +357,13 @@ export function attach(
   client.on('error', ((err: Error) => hooks.onHandlerError?.(err)) as (...args: never[]) => void)
 }
 
+/**
+ * Connect and wire the handler for `opts.vendor`. The vendor picks the topic
+ * parser and the body reader; everything else, the durable session included,
+ * is the same.
+ */
 export function subscribe(
-  opts: MqttOptions,
+  opts: MqttOptions & { vendor: Vendor },
   onMessage: (m: RawMessage) => Promise<void>,
   hooks: MqttHooks = {},
 ): mqtt.MqttClient {
@@ -264,7 +380,10 @@ export function subscribe(
     // process is OOM-killed, which loses more than the outage did.
     queueQoSZero: false,
   })
-  attach(client, opts, onMessage, hooks)
+  attach(
+    client, opts, onMessage, hooks,
+    opts.vendor === 'rivian' ? makeRivianMessageHandler : makeMessageHandler,
+  )
   return client
 }
 

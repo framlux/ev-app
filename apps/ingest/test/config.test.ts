@@ -3,6 +3,7 @@ import { RECEIVER_CLIENT_ID, loadConfig } from '../src/config.js'
 import { initialiseSeries, registry } from '../src/metrics.js'
 
 const BASE = {
+  EV_VENDOR: 'tesla',
   MQTT_PASSWORD: 'secret',
   EV_VEHICLE_ID: 'veh-1',
   EV_USABLE_CAPACITY_KWH: '75',
@@ -27,7 +28,7 @@ describe('loadConfig', () => {
       .toBe('ev-ingest-2')
   })
 
-  it.each(['MQTT_PASSWORD', 'EV_VEHICLE_ID', 'EV_USABLE_CAPACITY_KWH'])(
+  it.each(['EV_VENDOR', 'MQTT_PASSWORD', 'EV_VEHICLE_ID', 'EV_USABLE_CAPACITY_KWH'])(
     'fails fast when %s is missing', (name) => {
       const env: Record<string, string> = { ...BASE }
       delete env[name]
@@ -48,6 +49,69 @@ describe('loadConfig', () => {
     // every drive's energy figure instead of failing.
     if (rejected) expect(run).toThrow()
     else expect(run().usableCapacityKwh).toBe(Number(value))
+  })
+})
+
+describe('loadConfig: the vendor', () => {
+  const RIVIAN = { ...BASE, EV_VENDOR: 'rivian' }
+
+  it('requires EV_VENDOR, and only knows the two vendors', () => {
+    // No default: a worker that guessed would decode one vendor's payloads as
+    // the other's and tape them under the wrong vendor, silently and for good.
+    const { EV_VENDOR: _omitted, ...without } = BASE
+    expect(() => loadConfig(without)).toThrow(/EV_VENDOR/)
+    expect(() => loadConfig({ ...BASE, EV_VENDOR: 'ford' })).toThrow(/EV_VENDOR/)
+    expect(() => loadConfig({ ...BASE, EV_VENDOR: 'Tesla' })).toThrow(/EV_VENDOR/)
+    expect(() => loadConfig({ ...BASE, EV_VENDOR: '' })).toThrow(/EV_VENDOR/)
+  })
+
+  it('derives the Tesla defaults exactly as before', () => {
+    const c = loadConfig({ ...BASE })
+    expect([c.vendor, c.mqtt.clientId, c.mqtt.topic, c.cursorSource])
+      .toEqual(['tesla', 'ev-ingest', 'ev/#', 'tesla:mqtt'])
+  })
+
+  it('derives the Rivian defaults', () => {
+    const c = loadConfig({ ...RIVIAN })
+    expect([c.vendor, c.mqtt.clientId, c.mqtt.topic, c.cursorSource])
+      .toEqual(['rivian', 'ev-ingest-rivian', 'rivian/#', 'rivian:mqtt'])
+  })
+
+  it('lets an explicit cursor source override the vendor default', () => {
+    expect(loadConfig({ ...RIVIAN, EV_CURSOR_SOURCE: 'rivian:r1' }).cursorSource).toBe('rivian:r1')
+  })
+
+  it.each(['ev-ingest', 'ev-fleet-telemetry', 'ev-rivian'])(
+    'refuses a Rivian worker with client id %s', (id) => {
+      // A Rivian worker that took over `ev-ingest`'s durable session would be
+      // handed the Tesla backlog, ack every message as a parse failure, and the
+      // car would already have discarded what it had been waiting to hear acked.
+      expect(() => loadConfig({ ...RIVIAN, MQTT_CLIENT_ID: id }))
+        .toThrow(/MQTT_CLIENT_ID.*must not be|must not be.*MQTT_CLIENT_ID/)
+    })
+
+  it.each(['ev-ingest-rivian', 'ev-fleet-telemetry', 'ev-rivian'])(
+    'refuses a Tesla worker with client id %s', (id) => {
+      expect(() => loadConfig({ ...BASE, MQTT_CLIENT_ID: id }))
+        .toThrow(/MQTT_CLIENT_ID.*must not be|must not be.*MQTT_CLIENT_ID/)
+    })
+
+  it('still accepts each worker its own client id, spelled out', () => {
+    expect(loadConfig({ ...BASE, MQTT_CLIENT_ID: 'ev-ingest' }).mqtt.clientId).toBe('ev-ingest')
+    expect(loadConfig({ ...RIVIAN, MQTT_CLIENT_ID: 'ev-ingest-rivian' }).mqtt.clientId)
+      .toBe('ev-ingest-rivian')
+  })
+
+  it('refuses a topic outside the vendor root', () => {
+    expect(() => loadConfig({ ...RIVIAN, MQTT_TOPIC: 'ev/#' })).toThrow(/MQTT_TOPIC/)
+    expect(() => loadConfig({ ...BASE, MQTT_TOPIC: 'rivian/#' })).toThrow(/MQTT_TOPIC/)
+    // A bare wildcard reaches both vendors' topics, which is the same theft.
+    expect(() => loadConfig({ ...RIVIAN, MQTT_TOPIC: '#' })).toThrow(/MQTT_TOPIC/)
+    expect(() => loadConfig({ ...BASE, MQTT_TOPIC: '#' })).toThrow(/MQTT_TOPIC/)
+  })
+
+  it('accepts a narrower topic under the vendor root', () => {
+    expect(loadConfig({ ...RIVIAN, MQTT_TOPIC: 'rivian/VIN1/#' }).mqtt.topic).toBe('rivian/VIN1/#')
   })
 })
 
@@ -135,7 +199,7 @@ describe('metrics series initialisation', () => {
     expect(await registry.metrics())
       .not.toMatch(/^ev_ingest_last_sample_timestamp_seconds\{/m)
 
-    initialiseSeries('veh-1')
+    initialiseSeries('veh-1', 'tesla')
 
     const body = await registry.metrics()
     // 0 is 1970: an honest "no sample ever", and time() - 0 is enormous, so the
@@ -145,7 +209,7 @@ describe('metrics series initialisation', () => {
   })
 
   it('seeds the labelled counters the failure alerts read', async () => {
-    initialiseSeries('veh-1')
+    initialiseSeries('veh-1', 'tesla')
     const body = await registry.metrics()
     // rate() and increase() over an absent series return nothing at all, so an
     // unseeded counter cannot be alerted on either.
@@ -154,11 +218,33 @@ describe('metrics series initialisation', () => {
       'ev_ingest_parse_failures_total{reason="json"} 0',
       'ev_ingest_parse_failures_total{reason="empty"} 0',
       'ev_ingest_parse_failures_total{reason="unknown-vehicle"} 0',
+      'ev_ingest_parse_failures_total{reason="envelope"} 0',
+      'ev_ingest_untimed_values_total 0',
       'ev_ingest_messages_total{vendor="tesla",record="metrics"} 0',
       'ev_ingest_samples_written_total{vendor="tesla"} 0',
       'ev_ingest_handler_errors_total 0',
     ]) {
       expect(body).toContain(line)
     }
+  })
+})
+
+describe('metrics series initialisation, per vendor', () => {
+  it('seeds a Rivian worker\'s message series under the stream names', async () => {
+    // The record label is the stream for Rivian, and an unseeded series cannot
+    // be rate()d, so a quiet stream would be indistinguishable from an absent one.
+    initialiseSeries('veh-r', 'rivian')
+    const body = await registry.metrics()
+    for (const stream of ['state', 'parallax', 'charging', 'cloud', 'ota', 'geofence', 'departure', 'meta']) {
+      expect(body).toContain(`ev_ingest_messages_total{vendor="rivian",record="${stream}"} 0`)
+    }
+    expect(body).toContain('ev_ingest_samples_written_total{vendor="rivian"} 0')
+  })
+
+  it('does not seed the Tesla record kinds under the Rivian vendor', async () => {
+    initialiseSeries('veh-r', 'rivian')
+    const body = await registry.metrics()
+    expect(body).not.toContain('ev_ingest_messages_total{vendor="rivian",record="metrics"}')
+    expect(body).not.toContain('ev_ingest_messages_total{vendor="tesla",record="state"}')
   })
 })

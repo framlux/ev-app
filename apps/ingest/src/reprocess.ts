@@ -20,7 +20,7 @@ import {
   type DbClient,
   type OpenSessionRow,
 } from '@ev/db'
-import { loadConfig } from './config.js'
+import { loadConfig, type Config } from './config.js'
 import { profileFor } from './deps.js'
 import { Pipeline } from './pipeline.js'
 import { replayStoreOn } from './store.js'
@@ -61,76 +61,104 @@ function valueOf(argv: string[], flag: string): string | undefined {
   return i === -1 ? undefined : argv[i + 1]
 }
 
+/** What a replay needs of the worker's configuration: the car, its vendor and how it prices. */
+export type ReplayConfig =
+  Pick<Config, 'vendor' | 'vehicle' | 'cursorSource' | 'usableCapacityKwh' | 'home'>
+
+/**
+ * Delete and rebuild one vehicle's derived rows over `w`, on `client`, and
+ * return how many taped messages were replayed. The caller owns the
+ * transaction: it is what makes an interrupted run leave the old rows intact.
+ */
+export async function replayWindow(
+  client: DbClient,
+  config: ReplayConfig,
+  w: Window,
+): Promise<number> {
+  const { from, to } = w
+  const adoptable = openOutsideWindow(await findOpenSessions(client, config.vehicle.id), w)
+  if (adoptable.length > 0) {
+    const names = adoptable.map((s) => `${s.kind} ${s.id} (started ${s.startedAt.toISOString()})`)
+    throw new Error(
+      `open outside the window, so the replay would adopt it: ${names.join(', ')}. ` +
+        'Widen the window to cover it.')
+  }
+  await ensurePartitions(client, from)
+  await deleteDerived(client, config.vehicle.id, from, to)
+
+  // One client, so every write joins the enclosing transaction rather than
+  // committing message by message.
+  //
+  // `replayStoreOn`, not `storeOn`: a replay must be able to write onto a
+  // sample row that already exists, and the live path's insert does nothing
+  // on conflict by design (spec §4's last row). Without it, backfilling a
+  // signal we taped but never had a column for (`gear`, `charge_amps`) can
+  // run to completion, print a count, and change nothing.
+  //
+  // `deleteDerived` above clears this vehicle's rows in the window first, so
+  // the conflict is not the common case, and the replay below streams only this
+  // vehicle's tape, so another vehicle's surviving rows are never replayed into
+  // the DO NOTHING. The replay store is for whatever conflict is left: a
+  // backfill that silently skips a row is exactly the failure it is here to
+  // remove.
+  const pipeline = new Pipeline(
+    // The worker's own vendor: a replay decodes the tape with the same profile
+    // the live worker did, or it would rebuild a different history from the
+    // same messages.
+    profileFor(config.vendor),
+    { run: (fn) => fn(replayStoreOn(client, config.cursorSource)) },
+    { usableCapacityKwh: config.usableCapacityKwh },
+    // The same home the live worker prices with, and not optional here. A
+    // replay re-derives every session and re-prices it through the same
+    // `finish()`, so a replay without this would rewrite `cost_basis` from
+    // 'home' to 'unknown' on every charge whose home-ness came from the
+    // coordinate fallback rather than from Tesla's own `locatedAtHome`.
+    config.home,
+  )
+
+  let count = 0
+  // This vehicle's tape and no other. `deleteDerived` clears ONE vehicle's rows
+  // while the tape holds every vehicle's, and the pipeline is built for one:
+  // its segmenter holds a single car's sessions and its profile is a single
+  // vendor's. Streaming the whole tape (as this once did, harmlessly only
+  // because every vehicle was a Tesla and the table held one) would push another
+  // car's messages through this car's segmenter, and another vendor's through
+  // this vendor's decoder. The page size is `streamRaw`'s default.
+  for await (const row of streamRaw(client, from, to, undefined, config.vehicle.id)) {
+    await pipeline.handle({
+      vehicleId: row.vehicleId,
+      vendor: row.vendor,
+      receivedAt: row.receivedAt,
+      source: row.source,
+      payload: row.payload,
+    })
+    count++
+  }
+
+  // Flush what is still accumulating, or the tail of every replay is lost.
+  //
+  // Emission is arrival-triggered: a pending burst is written when the NEXT
+  // message shows it is complete. The final burst has no next message, so
+  // without this it is discarded along with the Pipeline object - silently,
+  // and only at the end of the window, which is the hardest place to notice.
+  //
+  // force=true because the quiet period cannot have elapsed: there is no
+  // later arrival to measure it against.
+  await pipeline.flush(new Date(), true)
+
+  return count
+}
+
 async function main(): Promise<void> {
   const config = loadConfig()
-  const { from, to } = parseArgs(process.argv.slice(2))
+  const window = parseArgs(process.argv.slice(2))
   const pool = getPool()
 
-  const replayed = await withTransaction(pool, async (client: DbClient) => {
-    const adoptable = openOutsideWindow(await findOpenSessions(client, config.vehicle.id), { from, to })
-    if (adoptable.length > 0) {
-      const names = adoptable.map((s) => `${s.kind} ${s.id} (started ${s.startedAt.toISOString()})`)
-      throw new Error(
-        `open outside the window, so the replay would adopt it: ${names.join(', ')}. ` +
-          'Widen the window to cover it.')
-    }
-    await ensurePartitions(client, from)
-    await deleteDerived(client, config.vehicle.id, from, to)
+  const replayed = await withTransaction(pool, (client: DbClient) =>
+    replayWindow(client, config, window))
 
-    // One client, so every write joins the enclosing transaction rather than
-    // committing message by message.
-    //
-    // `replayStoreOn`, not `storeOn`: a replay must be able to write onto a
-    // sample row that already exists, and the live path's insert does nothing
-    // on conflict by design (spec §4's last row). Without it, backfilling a
-    // signal we taped but never had a column for (`gear`, `charge_amps`) can
-    // run to completion, print a count, and change nothing.
-    //
-    // `deleteDerived` above clears most of that away first, so the conflict is
-    // not the common case — but it deletes for ONE vehicle while `streamRaw`
-    // replays the whole tape, so any other vehicle's rows survive it and would
-    // be replayed straight into the DO NOTHING. A backfill that silently skips
-    // a vehicle is exactly the failure this is here to remove.
-    const pipeline = new Pipeline(
-      // Tesla until the vendor is wired through config.
-      profileFor('tesla'),
-      { run: (fn) => fn(replayStoreOn(client, config.cursorSource)) },
-      { usableCapacityKwh: config.usableCapacityKwh },
-      // The same home the live worker prices with, and not optional here. A
-      // replay re-derives every session and re-prices it through the same
-      // `finish()`, so a replay without this would rewrite `cost_basis` from
-      // 'home' to 'unknown' on every charge whose home-ness came from the
-      // coordinate fallback rather than from Tesla's own `locatedAtHome`.
-      config.home,
-    )
-
-    let count = 0
-    for await (const row of streamRaw(client, from, to)) {
-      await pipeline.handle({
-        vehicleId: row.vehicleId,
-        vendor: row.vendor,
-        receivedAt: row.receivedAt,
-        source: row.source,
-        payload: row.payload,
-      })
-      count++
-    }
-
-    // Flush what is still accumulating, or the tail of every replay is lost.
-    //
-    // Emission is arrival-triggered: a pending burst is written when the NEXT
-    // message shows it is complete. The final burst has no next message, so
-    // without this it is discarded along with the Pipeline object - silently,
-    // and only at the end of the window, which is the hardest place to notice.
-    //
-    // force=true because the quiet period cannot have elapsed: there is no
-    // later arrival to measure it against.
-    await pipeline.flush(new Date(), true)
-
-    return count
-  })
-
-  console.log(`reprocessed ${replayed} raw messages from ${from.toISOString()} to ${to.toISOString()}`)
+  console.log(
+    `reprocessed ${replayed} raw messages from ${window.from.toISOString()} to ${window.to.toISOString()}`)
   await closePool()
 }
 

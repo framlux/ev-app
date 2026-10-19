@@ -69,7 +69,7 @@ describe.skipIf(!hasDb)('worker startup', () => {
   })
 
   it('registers the configured vehicle, so the first message is ingested', async () => {
-    await registerVehicle(getPool(), identity)
+    await registerVehicle(getPool(), identity, 'tesla')
 
     const pipeline = new Pipeline(teslaProfile, pgRunner(getPool(), 'startup-test', VEHICLE), {
       usableCapacityKwh: 75,
@@ -84,10 +84,10 @@ describe.skipIf(!hasDb)('worker startup', () => {
   })
 
   it('is idempotent across restarts and does not overwrite the display name', async () => {
-    await registerVehicle(getPool(), identity)
+    await registerVehicle(getPool(), identity, 'tesla')
     await getPool().query('UPDATE vehicle SET display_name=$2 WHERE id=$1', [VEHICLE, 'Renamed'])
     // The restart.
-    await registerVehicle(getPool(), identity)
+    await registerVehicle(getPool(), identity, 'tesla')
 
     const { rows } = await getPool().query(
       'SELECT display_name FROM vehicle WHERE id=$1',
@@ -112,7 +112,7 @@ describe.skipIf(!hasDb)('worker startup', () => {
 
   it('resumes from the tape, closing an open drive the tape shows had parked', async () => {
     const pool = getPool()
-    await registerVehicle(pool, identity)
+    await registerVehicle(pool, identity, 'tesla')
     const tape = [
       ...[0, 1, 2, 3, 4, 5].flatMap((m) => drive(m, { VehicleSpeed: 40, Odometer: 1000 + m })),
       ...[6, 7, 8, 9, 10, 11, 12, 13].flatMap((m) => drive(m, { VehicleSpeed: 0 })),
@@ -153,7 +153,7 @@ describe.skipIf(!hasDb)('worker startup', () => {
    */
   it('closes an orphaned session when the worker starts', async () => {
     const pool = getPool()
-    await registerVehicle(pool, identity)
+    await registerVehicle(pool, identity, 'tesla')
     const orphan = await withTransaction(pool, (c) =>
       openSession(c, VEHICLE, 'drive', new Date('2026-01-01T09:00:00.000Z')))
 
@@ -173,6 +173,7 @@ describe.skipIf(!hasDb)('worker startup', () => {
         PGHOST: process.env['PGHOST'], PGPORT: process.env['PGPORT'],
         PGUSER: process.env['PGUSER'], PGPASSWORD: process.env['PGPASSWORD'],
         PGDATABASE: process.env['PGDATABASE'],
+        EV_VENDOR: 'tesla',
         EV_VEHICLE_ID: VEHICLE, EV_VEHICLE_VIN: VIN, EV_USABLE_CAPACITY_KWH: '75',
         MQTT_PASSWORD: 'unused', MQTT_URL: `mqtt://127.0.0.1:${await closed()}`,
         METRICS_PORT: String(metricsPort),

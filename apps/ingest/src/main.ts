@@ -1,6 +1,7 @@
 import { closePool, getPool, type DbPool } from '@ev/db'
 import { loadConfig } from './config.js'
 import { profileFor } from './deps.js'
+import { flushClock } from './flush-clock.js'
 import {
   handlerErrorsTotal,
   initialiseSeries,
@@ -12,6 +13,7 @@ import {
   sessionsClosedTotal,
   sessionsOpenedTotal,
   startMetricsServer,
+  untimedValuesTotal,
 } from './metrics.js'
 import { subscribe } from './mqtt.js'
 import {
@@ -70,7 +72,7 @@ async function main(): Promise<void> {
   // ingests nothing at all - the exact outage the stall alert exists for - would
   // be invisible to it. Initialising the series at zero makes "never" a value
   // the alert can see.
-  initialiseSeries(config.vehicle.id)
+  initialiseSeries(config.vehicle.id, config.vendor)
 
   const metricsServer = startMetricsServer(config.metricsPort)
   const pool = getPool()
@@ -80,7 +82,7 @@ async function main(): Promise<void> {
   // is rolled back, and — never having been acked — is redelivered forever:
   // a worker that appears healthy while recording nothing at all. Failing
   // startup here instead is the honest outcome, and the pod restarts.
-  await registerVehicle(pool, config.vehicle)
+  await registerVehicle(pool, config.vehicle, config.vendor)
 
   // Also BEFORE subscribing, and after the vehicle exists: carry on the session
   // and the field values the previous worker had, rebuilt from its tape. A
@@ -88,8 +90,9 @@ async function main(): Promise<void> {
   // merged into the next one (see Pipeline.resume).
   const { pipeline, report } = await resumeOrStartCold(
     () => new Pipeline(
-      // Tesla until the vendor is wired through config.
-      profileFor('tesla'),
+      // EV_VENDOR picks the profile: decode, staleness, the charge refresh and
+      // the sample row are all the vendor's, and everything else is shared.
+      profileFor(config.vendor),
       pgRunner(pool, config.cursorSource, config.vehicle.id),
       { usableCapacityKwh: config.usableCapacityKwh },
       // Where the car lives, for the charges its own `locatedAtHome` never
@@ -103,8 +106,11 @@ async function main(): Promise<void> {
 
   const record = (result: PipelineResult): void => {
     if (result.samples > 0) {
-      samplesWrittenTotal.inc({ vendor: 'tesla' }, result.samples)
+      samplesWrittenTotal.inc({ vendor: config.vendor }, result.samples)
     }
+    // Rivian values stamped with arrival because their own timestamp was missing
+    // or unparseable (spec §6.4). Always 0 for Tesla, which supplies no stamps.
+    if (result.untimed > 0) untimedValuesTotal.inc(result.untimed)
     if (result.sessionsOpened > 0) sessionsOpenedTotal.inc(result.sessionsOpened)
     if (result.sessionsClosed > 0) sessionsClosedTotal.inc(result.sessionsClosed)
     if (result.lastSampleTs) {
@@ -128,11 +134,26 @@ async function main(): Promise<void> {
         (report.discarded.length ? `; discarded ${report.discarded.map(row).join(', ')}` : ''))
   }
 
+  // The clock the flush timer judges "is this burst due?" by.
+  //
+  // The connector's clock, not ours, stamps a Rivian message (spec §6.2): during
+  // a backlog drain every pending burst would look overdue against our wall
+  // clock and be written alone. So the timer asks "is it due?" in the stamp's
+  // timeline, offset by how far behind the newest message we are. For Tesla the
+  // stamp IS our arrival time and the skew is ~0, so nothing changes.
+  const clock = flushClock()
+
   const client = subscribe(
     // vehicleId/vin come from the vehicle config rather than the mqtt block:
     // the VIN is how a message is attributed, and a shared broker carrying a
     // second car is exactly what the unknown-vehicle counter exists to report.
-    { ...config.mqtt, vehicleId: config.vehicle.id, vin: config.vehicle.vin },
+    // The vendor picks the topic parser and the body reader.
+    {
+      ...config.mqtt,
+      vehicleId: config.vehicle.id,
+      vin: config.vehicle.vin,
+      vendor: config.vendor,
+    },
     async (raw) => {
       // Throwing here is what stops the ack: makeMessageHandler only calls
       // done() after this resolves, and this resolves only after the
@@ -140,10 +161,15 @@ async function main(): Promise<void> {
       // rows were rolled back, and reliable_ack_sources chains the CAR's ack to
       // ours - so the vehicle would drop it from its buffer too, and it would be
       // gone for good.
+      //
+      // Observed BEFORE the handle, so the timer is already in this message's
+      // timeline while it is being written, and not only once it has finished.
+      clock.observe(raw.receivedAt)
       record(await pipeline.handle(raw))
     },
     {
-      onRecord: (kind) => messagesTotal.inc({ vendor: 'tesla', record: kind }),
+      // The Tesla record kind, or the Rivian stream.
+      onRecord: (record) => messagesTotal.inc({ vendor: config.vendor, record }),
       onParseFailure: (reason) => parseFailuresTotal.inc({ reason }),
       onHandlerError: () => handlerErrorsTotal.inc(),
       onConnectionChange: (connected) => mqttConnected.set(connected ? 1 : 0),
@@ -154,7 +180,7 @@ async function main(): Promise<void> {
     // Fire-and-forget with an explicit catch: an unhandled rejection from a
     // timer takes the process down, and a transient database blip must not
     // restart a worker whose MQTT session is healthy.
-    pipeline.flush(new Date()).then(record, (err: unknown) => {
+    pipeline.flush(clock.now()).then(record, (err: unknown) => {
       handlerErrorsTotal.inc()
       console.error('flush failed', err)
     })
@@ -204,7 +230,7 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => void shutdown('SIGINT'))
 
   console.log(
-    `ev-ingest listening: broker=${config.mqtt.url} topic=${config.mqtt.topic} ` +
+    `ev-ingest (${config.vendor}) listening: broker=${config.mqtt.url} topic=${config.mqtt.topic} ` +
       `client=${config.mqtt.clientId} metrics=:${config.metricsPort}`,
   )
 }

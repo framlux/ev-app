@@ -10,6 +10,7 @@ COPY apps/ingest/ apps/ingest/
 RUN pnpm install --frozen-lockfile
 RUN pnpm --filter @ev/core build \
  && pnpm --filter @ev/tesla build \
+ && pnpm --filter @ev/rivian build \
  && pnpm --filter @ev/db build \
  && pnpm --filter @ev/ingest build
 

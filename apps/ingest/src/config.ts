@@ -1,3 +1,4 @@
+import type { Vendor } from './deps.js'
 import type { HomeLocation } from './pricing.js'
 
 /**
@@ -5,6 +6,12 @@ import type { HomeLocation } from './pricing.js'
  * immediately rather than on the first message of the day.
  */
 export interface Config {
+  /**
+   * Which car maker this worker ingests. One image serves both, a Deployment
+   * per vendor, and this is what picks the profile, the topic parser, the
+   * `vendor` stamped on the tape and on `vehicle`, and the metrics label.
+   */
+  vendor: Vendor
   mqtt: {
     url: string
     username: string
@@ -52,22 +59,67 @@ export const DEFAULT_HOME_RADIUS_KM = 0.1
  */
 export const RECEIVER_CLIENT_ID = 'ev-fleet-telemetry'
 
+/**
+ * What each vendor's worker answers to when nothing is configured, and the one
+ * topic tree it may subscribe within.
+ *
+ * Everything that could land a worker on the OTHER vendor's broker session
+ * derives from here rather than from a shared default, because the failure is
+ * silent and unrecoverable. MQTT files a durable session, and the backlog the
+ * broker holds for it, under the client id. A Rivian worker that connected as
+ * `ev-ingest` would be handed the Tesla backlog, fail to parse every message as
+ * an envelope, and ACK them as parse failures; the Tesla car's own
+ * `reliable_ack_sources` chain would then have it discard what it had been
+ * waiting to hear acknowledged. No error, no alert, and the data is gone from
+ * the car as well. The same worker on a topic outside its own root would do the
+ * same to messages that were never meant for it.
+ */
+const OWN = {
+  tesla: { clientId: 'ev-ingest', topic: 'ev/#', root: 'ev/', cursor: 'tesla:mqtt' },
+  rivian: { clientId: 'ev-ingest-rivian', topic: 'rivian/#', root: 'rivian/', cursor: 'rivian:mqtt' },
+} as const satisfies Record<Vendor, { clientId: string; topic: string; root: string; cursor: string }>
+
+/**
+ * Every client id some process in this system holds: the receiver, the Rivian
+ * connector, and each vendor's ingest worker. A worker may use its own default
+ * by name, and no other id on this list.
+ */
+const RESERVED_CLIENT_IDS: readonly string[] = [
+  RECEIVER_CLIENT_ID, 'ev-rivian', OWN.tesla.clientId, OWN.rivian.clientId,
+]
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  const clientId = env['MQTT_CLIENT_ID'] ?? 'ev-ingest'
-  if (clientId === RECEIVER_CLIENT_ID) {
+  const vendor = vendorOf(env)
+  const own = OWN[vendor]
+
+  const clientId = env['MQTT_CLIENT_ID'] ?? own.clientId
+  if (clientId !== own.clientId && RESERVED_CLIENT_IDS.includes(clientId)) {
     throw new Error(
-      `MQTT_CLIENT_ID must not be '${RECEIVER_CLIENT_ID}': that is the telemetry ` +
-      'receiver\'s id, and two connections sharing one id evict each other forever',
+      `MQTT_CLIENT_ID must not be '${clientId}' for a ${vendor} worker: that id belongs to ` +
+      'another process in this system (the telemetry receiver, the Rivian connector, or the ' +
+      'other vendor\'s ingest worker), and two connections sharing one id evict each other ' +
+      'forever, or worse, one inherits the other\'s durable session and acks its backlog. ' +
+      `A ${vendor} worker's own id is '${own.clientId}'`,
+    )
+  }
+
+  const topic = env['MQTT_TOPIC'] ?? own.topic
+  if (!topic.startsWith(own.root)) {
+    throw new Error(
+      `MQTT_TOPIC must start with '${own.root}' for a ${vendor} worker, got ${JSON.stringify(topic)}: ` +
+      'a topic outside the vendor\'s own tree (a bare "#" included) would deliver another ' +
+      'vendor\'s messages to a worker that can only ack them as parse failures',
     )
   }
 
   return {
+    vendor,
     mqtt: {
       url: env['MQTT_URL'] ?? 'tcp://ev-mqtt.ev.svc.cluster.local:1883',
       username: env['MQTT_USERNAME'] ?? 'telemetry',
       password: required(env, 'MQTT_PASSWORD'),
       clientId,
-      topic: env['MQTT_TOPIC'] ?? 'ev/#',
+      topic,
     },
     vehicle: {
       id: required(env, 'EV_VEHICLE_ID'),
@@ -78,10 +130,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // efficiency figure, and the error is plausible enough never to be noticed.
     usableCapacityKwh: positiveNumber(env, 'EV_USABLE_CAPACITY_KWH'),
     metricsPort: Number(env['METRICS_PORT'] ?? 9090),
-    cursorSource: env['EV_CURSOR_SOURCE'] ?? 'tesla:mqtt',
+    cursorSource: env['EV_CURSOR_SOURCE'] ?? own.cursor,
     home: homeLocation(env),
     openEiApiKey: env['OPENEI_API_KEY'] ?? null,
   }
+}
+
+/**
+ * EV_VENDOR, exactly `tesla` or `rivian`, with no default.
+ *
+ * A default would let a Deployment whose manifest forgot the variable decode
+ * one vendor's payloads as the other's and tape them under the wrong vendor:
+ * silent, and permanent, since the tape is the record everything is rebuilt
+ * from. A crashing pod is the symptom an operator can act on.
+ */
+function vendorOf(env: NodeJS.ProcessEnv): Vendor {
+  const raw = env['EV_VENDOR']
+  if (raw === 'tesla' || raw === 'rivian') return raw
+  throw new Error(`EV_VENDOR must be 'tesla' or 'rivian', got ${raw === undefined ? 'nothing' : JSON.stringify(raw)}`)
 }
 
 /**
