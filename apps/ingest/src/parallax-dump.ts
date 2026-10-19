@@ -37,49 +37,78 @@ export interface DumpArgs {
 const USAGE = 'usage: parallax-dump --rvm <topic> [--from <date>] [--to <date>] [--limit <n>]'
 
 /**
- * The value after `flag`, or undefined if the flag is absent.
+ * A command line that cannot be run, as opposed to a run that failed.
  *
- * A flag with nothing after it, or with another flag after it, is an error and
- * not an absent flag: `--from` as the last word would otherwise read as "no
- * lower bound" and dump the whole tape from a command that asked for a window.
+ * Its message is the whole of what should be printed: the usage line, with the
+ * reason above it. It is its own type so that `reportFailure` can print that
+ * and exit, where an unexpected error (a database that is down) still gets
+ * logged with its stack: a stack trace under a mistyped flag reads as a bug in
+ * the tool and sends the operator looking in the wrong place.
  */
-function valueOf(argv: string[], flag: string): string | undefined {
-  const i = argv.indexOf(flag)
-  if (i === -1) return undefined
-  const value = argv[i + 1]
-  if (value === undefined || value.startsWith('--')) {
-    throw new Error(`${flag} needs a value\n${USAGE}`)
+export class UsageError extends Error {
+  constructor(reason?: string) {
+    super(reason === undefined ? USAGE : `${reason}\n${USAGE}`)
+    this.name = 'UsageError'
   }
-  return value
 }
 
-function dateOf(argv: string[], flag: string): Date | null {
-  const raw = valueOf(argv, flag)
+const FLAGS: ReadonlySet<string> = new Set(['--rvm', '--from', '--to', '--limit'])
+
+/**
+ * Every flag's value, refusing anything else on the command line.
+ *
+ * Each token is a known flag followed by its value, or a bare `--` (pnpm passes
+ * the one in `pnpm parallax-dump -- --rvm x` through to the script). Anything
+ * else is an error and not something to skip: `--limit=5` read as an unknown
+ * word would be dropped, the limit left off, and a command meant to read five
+ * rows would stream the whole tape. A flag with nothing after it, or with
+ * another flag after it, is the same mistake (`--from` as the last word would
+ * otherwise read as "no lower bound"), and so is a flag given twice, where the
+ * one that wins is a guess.
+ */
+function flagValues(argv: string[]): Map<string, string> {
+  const values = new Map<string, string>()
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
+    if (arg === '--') continue
+    if (!FLAGS.has(arg)) throw new UsageError(`unknown argument ${JSON.stringify(arg)}`)
+    if (values.has(arg)) throw new UsageError(`${arg} given more than once`)
+    const value = argv[i + 1]
+    if (value === undefined || value.startsWith('--')) throw new UsageError(`${arg} needs a value`)
+    values.set(arg, value)
+    i++
+  }
+  return values
+}
+
+function dateOf(values: Map<string, string>, flag: string): Date | null {
+  const raw = values.get(flag)
   if (raw === undefined) return null
   const date = new Date(raw)
-  if (Number.isNaN(date.getTime())) throw new Error(`unparseable date in ${flag} ${raw}`)
+  if (Number.isNaN(date.getTime())) throw new UsageError(`unparseable date in ${flag} ${raw}`)
   return date
 }
 
 export function parseDumpArgs(argv: string[]): DumpArgs {
-  const rvm = valueOf(argv, '--rvm')
-  if (rvm === undefined || rvm === '') throw new Error(USAGE)
+  const values = flagValues(argv)
+  const rvm = values.get('--rvm')
+  if (rvm === undefined || rvm === '') throw new UsageError()
 
-  const from = dateOf(argv, '--from')
-  const to = dateOf(argv, '--to')
+  const from = dateOf(values, '--from')
+  const to = dateOf(values, '--to')
   // As in `reprocess`: an inverted window reads nothing, which looks exactly
   // like a topic that was never taped.
   if (from !== null && to !== null && to.getTime() <= from.getTime()) {
-    throw new Error('--to must be after --from')
+    throw new UsageError('--to must be after --from')
   }
 
   let limit: number | null = null
-  const rawLimit = valueOf(argv, '--limit')
+  const rawLimit = values.get('--limit')
   if (rawLimit !== undefined) {
     // Digits only, and not zero: `Number('')` is 0 and `Number('2.5')` is not a
     // count, and a limit that reads as "stop at once" is a silent empty run.
     if (!/^[1-9]\d*$/.test(rawLimit) || !Number.isSafeInteger(Number(rawLimit))) {
-      throw new Error(`--limit must be a positive whole number, got ${JSON.stringify(rawLimit)}`)
+      throw new UsageError(`--limit must be a positive whole number, got ${JSON.stringify(rawLimit)}`)
     }
     limit = Number(rawLimit)
   }
@@ -180,13 +209,28 @@ async function main(): Promise<void> {
   }
 }
 
+/**
+ * Say why a run ended badly, and return the exit code.
+ *
+ * A usage error prints its message alone and exits 2, the conventional code for
+ * a command line that could not be run. Anything else is unexpected and keeps
+ * the logging `reprocess` gives it, the error and its stack, with exit 1.
+ */
+export function reportFailure(err: unknown, log: (...args: unknown[]) => void): number {
+  if (err instanceof UsageError) {
+    log(err.message)
+    return 2
+  }
+  log('parallax-dump failed', err)
+  return 1
+}
+
 // Only run when executed directly: `parseDumpArgs` and `dumpRows` are imported by
 // tests, and a top-level main() would open a database connection just to read
 // the flags.
 const entry = process.argv[1]
 if (entry && import.meta.url === pathToFileURL(entry).href) {
   main().catch((err: unknown) => {
-    console.error('parallax-dump failed', err)
-    process.exit(1)
+    process.exit(reportFailure(err, console.error))
   })
 }

@@ -112,7 +112,9 @@ describe('FieldAccumulator: the charge refresh and the observation guard', () =>
     const acc = fresh()
     acc.apply({ slots: { state: 'charging', power: 0 }, observedAt: { state: 0, power: 2_000 } }, at(2_000))
     acc.apply({ slots: { power: 7 }, observedAt: { power: 1_000 } }, at(STALE_VALUE_MS))
-    expect(acc.take()?.state.state).toBeUndefined()
+    // Read at the replay's arrival. A frame that landed nothing does not move
+    // the accumulator's clock, so a bare frame is what asks the question.
+    expect(carried(acc, STALE_VALUE_MS).state).toBeUndefined()
   })
 
   it('does refresh it when the same power value is observed newer', () => {
@@ -127,7 +129,7 @@ describe('FieldAccumulator: the charge refresh and the observation guard', () =>
     const acc = fresh()
     acc.apply({ slots: { state: 'charging', energy: 10 }, observedAt: { state: 0, energy: 2_000 } }, at(2_000))
     acc.apply({ slots: { energy: 11 }, observedAt: { energy: 1_000 } }, at(STALE_VALUE_MS))
-    expect(acc.take()?.state.state).toBeUndefined()
+    expect(carried(acc, STALE_VALUE_MS).state).toBeUndefined()
   })
 
   it('does refresh it when the counter really rose, judged against the value held before the frame', () => {
@@ -146,6 +148,65 @@ describe('FieldAccumulator: the charge refresh and the observation guard', () =>
     acc.apply({ slots: { power: 7 }, observedAt: { power: 1_000 } }, at(STALE_VALUE_MS + 1_000))
     // Refreshed once, at 1s, so exactly six hours old by the replay's arrival.
     // Had the replay refreshed it again it would be brand new.
-    expect(acc.take()?.state.state).toBeUndefined()
+    expect(carried(acc, STALE_VALUE_MS + 1_000).state).toBeUndefined()
+  })
+})
+
+describe('FieldAccumulator: a message that changes nothing', () => {
+  const MINUTE = 60_000
+
+  it('reports that nothing landed, and schedules no sample, when every slot is superseded', () => {
+    const acc = fresh()
+    expect(acc.apply(
+      { slots: { speed: 50, state: 'charging' }, observedAt: { speed: 1_000, state: 1_000 } },
+      at(1_000),
+    )).toBe(true)
+    acc.take()
+    expect(acc.pending).toBe(false)
+
+    // A resubscribe's snapshot: an older observation of one slot, and the very
+    // same observation of the same value for the other.
+    const landed = acc.apply(
+      { slots: { speed: 99, state: 'charging' }, observedAt: { speed: 500, state: 1_000 } },
+      at(1_000 + MINUTE),
+    )
+    expect(landed).toBe(false)
+    expect(acc.pending).toBe(false)
+    expect(acc.due(at(1_000 + 10 * MINUTE))).toBe(false)
+  })
+
+  it('leaves a pending burst\'s timing where it was', () => {
+    // The burst was last added to at 1s. A superseded frame at 2.5s is not part
+    // of it, so the quiet period still runs from 1s: due at 3s, and stamped 1s.
+    // Counted as the burst's newest member it would push both to 2.5s.
+    const acc = fresh()
+    acc.apply({ slots: { speed: 50 }, observedAt: { speed: 1_000 } }, at(1_000))
+    expect(acc.apply({ slots: { speed: 99 }, observedAt: { speed: 500 } }, at(2_500))).toBe(false)
+    expect(acc.due(at(3_000))).toBe(true)
+    expect(acc.take()?.ts).toEqual(at(1_000))
+  })
+
+  it('schedules a sample when even one slot among the superseded ones is newer', () => {
+    const acc = fresh()
+    acc.apply({ slots: { speed: 50 }, observedAt: { speed: 1_000 } }, at(1_000))
+    acc.take()
+    expect(acc.pending).toBe(false)
+
+    const landed = acc.apply(
+      { slots: { speed: 99, odometer: 7 }, observedAt: { speed: 500, odometer: 2_000 } },
+      at(2_500),
+    )
+    expect(landed).toBe(true)
+    expect(acc.pending).toBe(true)
+    const taken = acc.take()
+    expect(taken?.ts).toEqual(at(2_500))
+    // The newer slot landed and the superseded one did not overwrite anything.
+    expect(taken?.state).toEqual({ speed: 50, odometer: 7 })
+  })
+
+  it('always lands what carries no observation time, as every Tesla value does', () => {
+    const acc = fresh()
+    expect(acc.apply({ slots: { state: 'charging' } }, at(1_000))).toBe(true)
+    expect(acc.apply({ slots: { state: 'charging' } }, at(2_000))).toBe(true)
   })
 })

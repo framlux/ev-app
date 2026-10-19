@@ -126,7 +126,11 @@ export interface PipelineResult {
   sessionsClosed: number
   /** Field messages whose value landed in the accumulator. */
   fieldsApplied: number
-  /** Messages carrying nothing we could place: unknown field, unreadable value. */
+  /**
+   * Messages carrying nothing we could place: an unknown field, an unreadable
+   * value, or values the accumulator already held (a resubscribe's re-sent
+   * snapshot), none of which landed.
+   */
   unmapped: number
   /**
    * Properties that arrived without a usable timestamp of their own and were
@@ -191,8 +195,22 @@ export class FieldAccumulator {
   /**
    * Fold one decoded message in. `at` is the message's arrival, which drives the
    * emit timing whatever the values inside say about when they were observed.
+   *
+   * Returns whether ANY slot landed. A message whose every slot was superseded
+   * (an older observation than the one held, or the same observation of the same
+   * value) changes nothing, and it must not look like something did: it leaves
+   * `newestAt` and `pendingSince` alone, so no sample is scheduled for it, and
+   * the caller counts it as unmapped rather than applied. The connector
+   * resubscribes after every 60 s of silence and the snapshot re-sends the car's
+   * last-known values with their original stamps, so a parked car delivers a
+   * message of exactly this kind every minute. Scheduled as news, each would emit
+   * a carried-state sample stamped at ITS arrival: a charge last seen at 08:30
+   * kept getting samples through the afternoon, which defeated the segmenter's
+   * one-hour gap close, and a drive last seen in D was held open the same way.
+   * Tesla never sets `observedAt`, so every defined value lands there and this is
+   * always true for it.
    */
-  apply(decoded: Decoded, at: Date): void {
+  apply(decoded: Decoded, at: Date): boolean {
     const ms = at.getTime()
     // Decide what lands BEFORE anything moves, so that "is this charging" is
     // judged over the slots that actually land, against the values held before
@@ -222,6 +240,7 @@ export class FieldAccumulator {
       }
       landing.set(key, { value, at: stamp, observed: observed === undefined ? undefined : stamp })
     }
+    if (landing.size === 0) return false
     // Over what landed, not over what arrived: an older power or energy value
     // that was skipped above is a replay, and must not refresh the charge state
     // as if the car had just said it.
@@ -239,6 +258,7 @@ export class FieldAccumulator {
     }
     this.newestAt = ms
     this.pendingSince ??= ms
+    return true
   }
 
   /**
@@ -398,13 +418,15 @@ export class Pipeline {
       }
 
       const decoded = this.profile.decode(raw)
-      if (decoded) {
-        acc.apply(decoded, raw.receivedAt)
+      // Applied only if something LANDED. A message that decodes but is wholly
+      // superseded (a resubscribe's re-sent snapshot) is the same as one that
+      // decodes to nothing: counted unmapped, and no sample scheduled for it.
+      if (decoded !== null && acc.apply(decoded, raw.receivedAt)) {
         result.fieldsApplied = 1
-        result.untimed = decoded.untimed ?? 0
       } else {
         result.unmapped = 1
       }
+      result.untimed = decoded?.untimed ?? 0
 
       // Inside the transaction: a watermark that survived a rolled-back message
       // would claim progress that never happened.

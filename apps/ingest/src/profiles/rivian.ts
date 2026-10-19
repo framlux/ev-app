@@ -59,10 +59,17 @@ export const rivianProfile: VendorProfile = {
   decode(raw) {
     if (raw.vendor !== 'rivian') return null
     const d = decodeRivian(raw.payload, raw.receivedAt, rivianStaleWindowFor)
-    // A frame carrying nothing we place (only unknown or null properties, or
-    // values too old to apply) is unmapped, not an applied field: counting it
-    // would schedule an emit of carried-only state on every 60 s resubscribe,
-    // a sample row a minute for a car that has said nothing.
+    // A frame that decodes to NOTHING (only unknown or null properties, or
+    // values too old to apply) is unmapped, not an applied field.
+    //
+    // This is only half of what a 60 s resubscribe delivers, and not the half
+    // that bit. A snapshot also re-sends values that DO decode (a charger state
+    // from 08:00, still inside its six hours) but that the accumulator already
+    // holds at that very observation, so they land nowhere. The profile cannot
+    // see that: it has no state. `FieldAccumulator.apply` does, reports that
+    // nothing landed, schedules no sample, and `Pipeline.handle` counts the
+    // frame unmapped, so a parked car's replays neither emit a carried-state
+    // sample a minute nor keep a session open past the segmenter's gap close.
     if (d === null || (Object.keys(d.slots).length === 0 && d.untimed === 0)) return null
     return { slots: d.slots, observedAt: d.observedAt, untimed: d.untimed }
   },

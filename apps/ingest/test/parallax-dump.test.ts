@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { RawRow } from '@ev/db'
-import { dumpRows, parseDumpArgs } from '../src/parallax-dump.js'
+import { UsageError, dumpRows, parseDumpArgs, reportFailure } from '../src/parallax-dump.js'
 
 const RVM = 'charging.session.notification'
 const VIN = 'VIN1'
@@ -78,6 +78,67 @@ describe('parseDumpArgs', () => {
 
   it('ignores the bare -- that pnpm passes through', () => {
     expect(parseDumpArgs(['--', '--rvm', RVM]).rvm).toBe(RVM)
+  })
+
+  it('refuses an argument that is not a known flag or its value', () => {
+    // `--limit=5` is the one that matters: skipped as an unknown word it would
+    // leave the limit off and stream the whole tape.
+    for (const bad of [
+      ['--rvm', RVM, '--limit=5'],
+      ['--rvm=' + RVM],
+      ['--rvm', RVM, '--lmit', '5'],
+      ['--rvm', RVM, '-n', '5'],
+      ['--rvm', RVM, 'extra'],
+      ['stray', '--rvm', RVM],
+      // A value that is not a flag's is stray too: `5` here belongs to nothing.
+      ['--rvm', RVM, '--limit', '5', '5'],
+    ]) {
+      expect(() => parseDumpArgs(bad), bad.join(' ')).toThrow(/unknown argument/)
+    }
+  })
+
+  it('refuses a flag given twice, where the winner would be a guess', () => {
+    expect(() => parseDumpArgs(['--rvm', RVM, '--limit', '1', '--limit', '2']))
+      .toThrow(/--limit given more than once/)
+  })
+
+  it('names the usage in every error, as a UsageError', () => {
+    for (const bad of [
+      [],
+      ['--rvm'],
+      ['--rvm', RVM, '--limit', '0'],
+      ['--rvm', RVM, '--from', 'yesterday'],
+      ['--rvm', RVM, '--from', '2026-10-02', '--to', '2026-10-01'],
+      ['--rvm', RVM, '--limit=5'],
+    ]) {
+      expect(() => parseDumpArgs(bad), bad.join(' ')).toThrow(UsageError)
+      expect(() => parseDumpArgs(bad), bad.join(' ')).toThrow(/usage: parallax-dump --rvm/)
+    }
+  })
+})
+
+describe('reportFailure', () => {
+  it('prints a usage error\'s message alone, with no stack, and exits 2', () => {
+    const logged: unknown[][] = []
+    const code = reportFailure(
+      (() => { try { parseDumpArgs(['--rvm', RVM, '--limit=5']) } catch (e) { return e } })(),
+      (...args) => logged.push(args),
+    )
+    expect(code).toBe(2)
+    expect(logged).toHaveLength(1)
+    // One string, the reason and the usage; the error object itself (and so its
+    // stack) is not passed to the logger.
+    expect(logged[0]).toEqual([
+      'unknown argument "--limit=5"\n' +
+        'usage: parallax-dump --rvm <topic> [--from <date>] [--to <date>] [--limit <n>]',
+    ])
+  })
+
+  it('logs anything else with its error, and exits 1', () => {
+    const failure = new Error('connect ECONNREFUSED')
+    const logged: unknown[][] = []
+    expect(reportFailure(failure, (...args) => logged.push(args))).toBe(1)
+    expect(logged).toEqual([['parallax-dump failed', failure]])
   })
 })
 
