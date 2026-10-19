@@ -157,6 +157,8 @@ interface VehicleAdapter {
 
 Nothing downstream of `normalise` knows the vendor. Writing this now costs nothing and is the entire reason the second car is cheap later.
 
+> **Superseded 2026-10-19:** `VehicleAdapter` was replaced by `VendorProfile` (`apps/ingest/src/profile.ts`); the Rivian implementation and the reasons for the change are in `2026-10-19-rivian-ingestion-design.md` §6.1.
+
 ---
 
 ## 5. Tesla integration
