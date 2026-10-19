@@ -89,7 +89,11 @@ describe('every failed-request path goes through it', () => {
 		// 400 saying which field is wrong is the entire value of that endpoint's
 		// messages, and reading it as JSON would replace all of them with
 		// "request failed (400)".
-		'src/routes/settings/energy/+page.svelte'
+		'src/routes/settings/energy/+page.svelte',
+		// The Rivian sign-in reads a refusal that is not a Rivian outcome (the
+		// session ended behind the open page) the same way. A Rivian refusal is a
+		// 200 with a message and never reaches this path.
+		'src/routes/settings/rivian/+page.svelte'
 	]
 
 	it('reads failed responses as text, never as JSON', () => {

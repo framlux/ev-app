@@ -72,6 +72,9 @@ importers:
       '@ev/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@ev/rivian':
+        specifier: workspace:*
+        version: link:../../packages/rivian
       '@ev/tesla':
         specifier: workspace:*
         version: link:../../packages/tesla

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
+import { settingsHref } from '../src/lib/settings-href.js'
 
 /**
  * Two rules about the UI that a typechecker cannot see and a test run against
@@ -94,13 +95,29 @@ describe('the settings link is reachable from a vehicle', () => {
 	})
 
 	/**
-	 * It must point AT the page that exists. A tab that 404s is worse than no
-	 * tab, and there is no per-vehicle settings route — this is a second door to
-	 * the global one, which is deliberate: the page is about this install's
+	 * It must point AT a page that exists. A tab that 404s is worse than no tab,
+	 * and there is no per-vehicle settings route — this is a second door to an
+	 * install-wide page, which is deliberate: the page is about this install's
 	 * plumbing (spec §3.8), not about the car.
+	 *
+	 * Which page depends on the vendor, and the layout cannot be rendered by the
+	 * component tests (it reads `$app/state` and the live store), so the decision
+	 * lives in `settingsHref` and these tests hold both ends: the layout must ask
+	 * it, rather than hard-code a path again, and it must answer correctly.
 	 */
-	it('points at the telemetry settings page itself', () => {
-		expect(layout).toMatch(/href: '\/settings\/telemetry'/)
+	it('asks settingsHref for the vendor, rather than hard-coding a page', () => {
+		expect(layout).toMatch(/href: settingsHref\(v\.vendor\), label: 'Settings'/)
+		expect(layout).not.toMatch(/href: '\/settings\//)
+	})
+
+	it('leads a Tesla to the telemetry page, which exists', () => {
+		expect(settingsHref('tesla')).toBe('/settings/telemetry')
+		expect(existsSync(join(SRC, 'routes/settings/telemetry/+page.svelte'))).toBe(true)
+	})
+
+	it('leads a Rivian to its own settings page, which exists', () => {
+		expect(settingsHref('rivian')).toBe('/settings/rivian')
+		expect(existsSync(join(SRC, 'routes/settings/rivian/+page.svelte'))).toBe(true)
 	})
 
 	/**

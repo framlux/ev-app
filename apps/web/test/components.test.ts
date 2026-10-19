@@ -32,6 +32,7 @@ import BatteryPage from '../src/routes/vehicles/[id]/battery/+page.svelte'
 import DriveDetailPage from '../src/routes/drives/[id]/+page.svelte'
 import ChargeDetailPage from '../src/routes/charges/[id]/+page.svelte'
 import TelemetryPage from '../src/routes/settings/telemetry/+page.svelte'
+import RivianPage from '../src/routes/settings/rivian/+page.svelte'
 
 import { nullState } from './support/state.js'
 
@@ -1096,6 +1097,158 @@ describe('the telemetry settings page renders in every state that occurs', () =>
 		expect(body).toContain('No vehicle')
 		expect(body).toMatch(/<button[^>]*disabled[^>]*>\s*Push configuration/)
 		assertNoBrokenValues(body)
+	})
+})
+
+/**
+ * The Rivian settings page (spec §4.3, §5.7).
+ *
+ * Its states are not edge cases, they are its whole life: a fresh install has
+ * no credential and no connector status, an operator part-way through a
+ * sign-in has a code box and no account, and a working install has an account
+ * and a status that may be days old, mostly null, or in any of nine states.
+ * Each is a different branch through one template, and the first two render
+ * little but nulls, which is the shape that ships broken because there is no
+ * data to see it break with.
+ *
+ * Rendering is server-side, so what is asserted is the markup a first paint
+ * would send. That the sealed credential never reaches the page is decided by
+ * the load, and rivian-page-load.test.ts is where it is pinned.
+ */
+describe('the Rivian settings page renders in every state that occurs', () => {
+	const NOW = '2026-10-19T12:00:00.000Z'
+
+	const ACCOUNT = { account: 'owner@example.com', updatedAt: '2026-10-18T12:00:00.000Z' }
+
+	/** The connector has written a row and observed nothing else yet. */
+	function status(overrides: Record<string, unknown> = {}) {
+		return {
+			state: 'starting',
+			vin: null,
+			lastFrameAt: null,
+			lastError: null,
+			backoffUntil: null,
+			droppedProperties: [],
+			updatedAt: '2026-10-19T11:59:00.000Z',
+			...overrides
+		}
+	}
+
+	function rivianPage(data: Record<string, unknown>): string {
+		return render(RivianPage as never, {
+			props: {
+				data: { credential: null, status: null, pendingOtp: false, now: NOW, ...data }
+			} as never
+		}).body
+	}
+
+	/** The template folds source line breaks into spaces, so compare as the browser reads it. */
+	const text = (body: string) => body.replace(/\s+/g, ' ')
+
+	it('day one: nobody is signed in and the connector has said nothing', () => {
+		const body = rivianPage({})
+		// The sign-in form, and no code box: no attempt is in progress.
+		expect(body).toMatch(/<input[^>]*name="email"/)
+		expect(body).toMatch(/<input[^>]*name="password"[^>]*type="password"|<input[^>]*type="password"[^>]*name="password"/)
+		expect(body).not.toContain('name="code"')
+		expect(body).not.toContain('Sign out')
+		// Not a negative answer: no row is not the same as a row saying signed out.
+		expect(body).toContain('The connector has not reported')
+		assertNoBrokenValues(body)
+	})
+
+	it('shows a dash for every observation the connector has not made', () => {
+		const body = rivianPage({ status: status() })
+		// State, VIN, last frame and backoff: one real value and three dashes,
+		// and an error line that is a dash, not an empty box.
+		expect(body).toContain('Starting')
+		expect((body.match(/—/g) ?? []).length).toBeGreaterThanOrEqual(4)
+		expect(body).not.toContain('error-text')
+		assertNoBrokenValues(body)
+	})
+
+	it('says None for an empty dropped list rather than dashing an observation away', () => {
+		const empty = text(rivianPage({ status: status({ state: 'subscribed' }) }))
+		expect(empty).toContain('Dropped properties')
+		// Svelte brackets a conditional branch with comments, hence the `<!--[1-->`.
+		expect(empty).toMatch(/Dropped properties<\/dt> <dd[^>]*><!--\[1-->None/)
+	})
+
+	it('lists dropped properties, and the last error exactly as the connector redacted it', () => {
+		const body = rivianPage({
+			credential: ACCOUNT,
+			status: status({
+				state: 'backing_off',
+				vin: '7FCTGAAA0PN000000',
+				lastFrameAt: '2026-10-19T11:30:00.000Z',
+				lastError: 'Rivian HTTP 400: UNAUTHENTICATED/expired',
+				backoffUntil: '2026-10-19T12:05:00.000Z',
+				droppedProperties: ['gnssLocation', 'batteryHvThermalEvent']
+			})
+		})
+		expect(body).toContain('Backing off')
+		expect(body).toContain('7FCTGAAA0PN000000')
+		expect(body).toContain('30 minutes ago')
+		expect(body).toContain('in 5 minutes')
+		expect(body).toContain('Rivian HTTP 400: UNAUTHENTICATED/expired')
+		expect(body).toContain('gnssLocation')
+		expect(body).toContain('batteryHvThermalEvent')
+		assertNoBrokenValues(body)
+	})
+
+	it('signed in: names the account and its age, offers sign-out, and hides the sign-in form', () => {
+		const body = text(rivianPage({ credential: ACCOUNT, status: status({ state: 'subscribed' }) }))
+		expect(body).toContain('Signed in as')
+		expect(body).toContain('owner@example.com')
+		// `numeric: 'auto'` says "yesterday" for exactly one day, and that is what
+		// the page shows beside the sign-in time.
+		expect(body).toContain('(yesterday)')
+		expect(body).toContain('Streaming')
+		expect(body).toMatch(/<button[^>]*>\s*Sign out/)
+		expect(body).not.toContain('name="password"')
+		// The confirmation is in the title, where the wording can be read before
+		// pressing and where a server render can see it.
+		expect(body).toMatch(/title="Sign out of Rivian\? The connector stops streaming/)
+		assertNoBrokenValues(body)
+	})
+
+	it('an attempt waiting for its code shows the code box beside the sign-in form', () => {
+		const body = rivianPage({ pendingOtp: true })
+		expect(body).toContain('name="code"')
+		expect(body).toMatch(/<input[^>]*name="email"/)
+		expect(body).toContain('Confirm code')
+		assertNoBrokenValues(body)
+	})
+
+	it.each([
+		['signed_out', 'Signed out'],
+		['starting', 'Starting'],
+		['credential_invalid', 'Credential unreadable'],
+		['finding_vehicle', 'Finding the vehicle'],
+		['waiting_for_vehicle', 'Waiting for the vehicle'],
+		['connecting', 'Connecting'],
+		['subscribed', 'Streaming'],
+		['backing_off', 'Backing off'],
+		['unauthenticated', 'Session refused']
+	])('puts the connector state %s in words', (state, words) => {
+		const body = rivianPage({ status: status({ state }) })
+		expect(body).toContain(words)
+		// Never the raw identifier standing in for a sentence.
+		expect(body).not.toContain(`>${state}<`)
+		assertNoBrokenValues(body)
+	})
+
+	it('shows a state it has not heard of as it came, rather than as a blank', () => {
+		const body = rivianPage({ status: status({ state: 'rate_limited_for_a_while' }) })
+		expect(body).toContain('rate_limited_for_a_while')
+		assertNoBrokenValues(body)
+	})
+
+	it('gives the account advice, word for word', () => {
+		const body = text(rivianPage({}))
+		expect(body).toContain(
+			"Use the owner account until the car is delivered. Whether a secondary-driver account can see an undelivered car is unknown. After delivery, a secondary-driver account can be revoked from the Rivian app without changing the owner's password."
+		)
 	})
 })
 

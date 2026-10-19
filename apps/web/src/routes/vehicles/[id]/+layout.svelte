@@ -7,6 +7,7 @@
 	import LiveIndicator from '$lib/components/LiveIndicator.svelte'
 	import { DASH } from '$lib/format.js'
 	import { live } from '$lib/live.svelte.js'
+	import { settingsHref } from '$lib/settings-href.js'
 
 	let { data, children }: { data: LayoutData; children: Snippet } = $props()
 
@@ -23,18 +24,21 @@
 	let base = $derived(`/vehicles/${v.id}`)
 
 	// Settings is the odd one out and deliberately so: the other four switch the
-	// view of THIS car, while this one leaves for the install-wide telemetry page
-	// (spec §3.8 — it is about the plumbing, not the vehicle). It sits here
-	// because the header's `Telemetry` link is small, muted, not called
-	// "settings", and easy to never notice; the tab bar is where attention
-	// already is. It never highlights, because the active check compares against
-	// the current path and this one is never under /vehicles.
+	// view of THIS car, while this one leaves for an install-wide page (spec §3.8
+	// — it is about the plumbing, not the vehicle). WHICH page depends on the
+	// vendor: a Tesla goes to the telemetry configuration, a Rivian to its
+	// sign-in and connector status (`settingsHref`, which has a test of its own
+	// because this layout cannot be rendered by one). It sits here because the
+	// header's `Telemetry` link is small, muted, not called "settings", and easy
+	// to never notice; the tab bar is where attention already is. It never
+	// highlights, because the active check compares against the current path and
+	// this one is never under /vehicles.
 	let tabs = $derived([
 		{ href: base, label: 'Overview' },
 		{ href: `${base}/drives`, label: 'Drives' },
 		{ href: `${base}/charges`, label: 'Charges' },
 		{ href: `${base}/battery`, label: 'Battery' },
-		{ href: '/settings/telemetry', label: 'Settings' }
+		{ href: settingsHref(v.vendor), label: 'Settings' }
 	])
 
 	let subtitle = $derived(

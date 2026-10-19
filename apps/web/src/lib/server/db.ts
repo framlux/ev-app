@@ -35,3 +35,29 @@ export {
 	withTransaction
 } from '@ev/db'
 export type { DbClient, TelemetryCheck, TelemetryStatus } from '@ev/db'
+
+/**
+ * The Rivian credential and status repository, for `/settings/rivian` (§4.3).
+ *
+ * Re-exported UNCONDITIONALLY, like everything above, so that the routes, the
+ * page load and `rivian-auth.ts` all reach it through this one module and a
+ * test can `vi.mock` it and be sure it never touches a real row.
+ *
+ * What is deliberately NOT here: `writeRivianStatus` and
+ * `readRivianCredentialStamp`. The connector is the only writer of the status
+ * row (§5.7) and the only reader of the credential stamp (§5.2), so the web has
+ * no reason to be able to do either, and a name that cannot be imported cannot
+ * be called by mistake.
+ *
+ * `readRivianCredential` returns the sealed value along with the account. The
+ * page load calls it for the account and the stamp and passes on nothing else;
+ * the sealed string is useless without the connector's private key, which this
+ * pod never holds.
+ */
+export {
+	deleteRivianCredential,
+	readRivianCredential,
+	readRivianStatus,
+	upsertRivianCredential
+} from '@ev/db'
+export type { RivianCredentialRow, RivianStatusRow } from '@ev/db'
