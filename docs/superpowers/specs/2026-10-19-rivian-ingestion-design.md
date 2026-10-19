@@ -328,7 +328,7 @@ Every `next` frame is published, at QoS 1 and not retained, under topic `rivian/
 | `meta.kind` | Source | Cadence |
 |---|---|---|
 | `userInfo` | `getUserInfo` (§2.4 selection) | at start; hourly while the VIN is absent; then every 6 h |
-| `vehicle` | `getVehicle(id)` with `mobileConfiguration` (trim, drive system, pack) | at start once found; every 24 h |
+| `vehicle` | `getVehicle(id)` with `mobileConfiguration` (trim, drive system, exterior and interior colour: the options the gateway snapshot declares) | at start once found; every 24 h |
 | `chargingSummaries` | `getCompletedSessionSummaries(vehicleId)` | every 6 h once found |
 | `schema` | introspection: `__type(name: "VehicleState") { fields { name type { name kind ofType { name } } } }` | every 24 h |
 | `connection` | lifecycle transitions `{state, reason}` | on change |
