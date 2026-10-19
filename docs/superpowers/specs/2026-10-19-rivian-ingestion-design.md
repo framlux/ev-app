@@ -503,7 +503,7 @@ Each slot is named for the column it fills. The exceptions are the inputs combin
 | `distanceToEmpty` | `rangeKm` → `range_km` | as is (km) |
 | `vehicleMileage` | `odometerKm` → `odometer_km` | m ÷ 1000 |
 | `gnssLocation` | `lat`, `lon` | both or neither |
-| `gnssSpeed` | `speedKph` → `speed_kph` | m/s × 3.6; below 0.5 m/s → 0 (GPS noise floor) |
+| `gnssSpeed` | `speedKph` → `speed_kph` | m/s × 3.6; 0 to below 0.5 m/s → 0 (GPS noise floor); negative → nothing |
 | `gnssBearing` | `gpsHeading` → `gps_heading` | as is |
 | `powerState` | `powerStateRaw` † | §7.3 |
 | `cloudConnection.isOnline`, `vehicleCloudConnection.isOnline` | `cloudOnline` † | §7.3 |
@@ -536,7 +536,7 @@ Every column named here exists in `signals.ts` today; the implementation's catal
 | `chargerStatus = chrgr_sts_not_connected` | `disconnected` (wins) |
 | `chargerState = charging_active` | `charging` |
 | `chargerState = charging_complete` | `complete` |
-| any other `chargerState` and `chargerStatus` starting `chrgr_sts_connected` | `connected` |
+| any other or absent `chargerState`, and `chargerStatus` starting `chrgr_sts_connected` | `connected` |
 | anything else | null; the raw value is on the tape |
 
 `charging_connecting` is **not** `charging`. No energy flows yet, and a session opened on a handshake starts before the energy does.
