@@ -7,7 +7,7 @@ import {
   vinOf,
   type MqttClientLike,
   type MqttHooks,
-  type MqttOptions,
+  type VendorMqttOptions,
   type ParseFailure,
   type PublishPacketLike,
 } from '../src/mqtt.js'
@@ -15,7 +15,8 @@ import { FakeDb } from './support/fake-db.js'
 
 const VIN = '5YJ3E1EA1JF000001'
 
-const OPTS: MqttOptions = {
+const OPTS: VendorMqttOptions = {
+  vendor: 'tesla',
   url: 'tcp://localhost:1883',
   username: 'telemetry',
   password: 'secret',

@@ -53,7 +53,7 @@ describe('loadConfig', () => {
 })
 
 describe('loadConfig: the vendor', () => {
-  const RIVIAN = { ...BASE, EV_VENDOR: 'rivian' }
+  const RIVIAN = { ...BASE, EV_VENDOR: 'rivian', EV_VEHICLE_VIN: '7PDSGABA1RN000001' }
 
   it('requires EV_VENDOR, and only knows the two vendors', () => {
     // No default: a worker that guessed would decode one vendor's payloads as
@@ -75,6 +75,20 @@ describe('loadConfig: the vendor', () => {
     const c = loadConfig({ ...RIVIAN })
     expect([c.vendor, c.mqtt.clientId, c.mqtt.topic, c.cursorSource])
       .toEqual(['rivian', 'ev-ingest-rivian', 'rivian/#', 'rivian:mqtt'])
+  })
+
+  it('requires EV_VEHICLE_VIN for Rivian, and leaves it optional for Tesla', () => {
+    // The Rivian vehicle row's vendor id is the VIN (spec §8.2), and the handler
+    // checks every topic against it: without one, frames for any VIN on
+    // `rivian/#` would be taped as this vehicle's.
+    const { EV_VEHICLE_VIN: _omitted, ...without } = RIVIAN
+    expect(() => loadConfig(without)).toThrow(/EV_VEHICLE_VIN/)
+    expect(() => loadConfig({ ...without, EV_VEHICLE_VIN: '' })).toThrow(/EV_VEHICLE_VIN/)
+    expect(loadConfig({ ...RIVIAN }).vehicle.vin).toBe('7PDSGABA1RN000001')
+
+    expect(loadConfig({ ...BASE }).vehicle.vin).toBeNull()
+    expect(loadConfig({ ...BASE, EV_VEHICLE_VIN: '5YJ3E1EA1JF000001' }).vehicle.vin)
+      .toBe('5YJ3E1EA1JF000001')
   })
 
   it('lets an explicit cursor source override the vendor default', () => {
@@ -239,6 +253,8 @@ describe('metrics series initialisation, per vendor', () => {
       expect(body).toContain(`ev_ingest_messages_total{vendor="rivian",record="${stream}"} 0`)
     }
     expect(body).toContain('ev_ingest_samples_written_total{vendor="rivian"} 0')
+    // The bounded label for a stream we do not list (see makeRivianMessageHandler).
+    expect(body).toContain('ev_ingest_messages_total{vendor="rivian",record="other"} 0')
   })
 
   it('does not seed the Tesla record kinds under the Rivian vendor', async () => {

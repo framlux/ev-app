@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RawMessage } from '@ev/core'
-import { parseRivianTopic, tapeRivianBody } from '../src/deps.js'
+import { RIVIAN_STREAMS, parseRivianTopic, rivianRecordLabel, tapeRivianBody } from '../src/deps.js'
 import {
   makeRivianMessageHandler,
   type MqttOptions,
@@ -202,13 +202,30 @@ describe('the Rivian message handler', () => {
       expect(out.acked).toBe(true)
     })
 
-  it('takes any non-empty last segment as the stream', async () => {
+  it('tapes a stream it does not list, and counts it as `other`', async () => {
     // Which streams exist is the envelope's business. A topic for one we do not
     // list is still a message we can tape, and dropping it would lose data that
-    // nothing can ever re-send.
+    // nothing can ever re-send. But the topic's last segment is whatever the
+    // publisher sent, and the record label becomes a Prometheus series, so it is
+    // counted under one bounded label rather than under the name it spelled.
     const out = await deliver(`rivian/${VIN}/brand-new-stream`, JSON.stringify(envelope()))
     expect(out.taped).toHaveLength(1)
-    expect(out.records).toEqual(['brand-new-stream'])
+    expect(out.acked).toBe(true)
+    expect(out.records).toEqual(['other'])
+  })
+
+  it.each(RIVIAN_STREAMS)('counts the %s stream under its own name', async (stream) => {
+    const out = await deliver(`rivian/${VIN}/${stream}`, JSON.stringify(envelope({ stream })))
+    expect(out.records).toEqual([stream])
+  })
+
+  it('keeps the series count bounded however many stream names arrive', async () => {
+    const labels = new Set<string>()
+    for (let i = 0; i < 50; i++) {
+      const out = await deliver(`rivian/${VIN}/made-up-${i}`, JSON.stringify(envelope()))
+      for (const r of out.records) labels.add(r)
+    }
+    expect([...labels]).toEqual(['other'])
   })
 
   it('does not ack a message whose write failed, and reports it', async () => {
@@ -237,6 +254,16 @@ describe('the Rivian message handler', () => {
     handler({ topic: 'rivian/ANYVIN/state', payload: JSON.stringify(envelope()) }, () => { acked = true })
     await vi.advanceTimersByTimeAsync(0)
     expect(acked).toBe(true)
+  })
+})
+
+describe('rivianRecordLabel', () => {
+  it('passes a listed stream and folds anything else into `other`', () => {
+    expect(rivianRecordLabel('state')).toBe('state')
+    expect(rivianRecordLabel('meta')).toBe('meta')
+    expect(rivianRecordLabel('')).toBe('other')
+    expect(rivianRecordLabel('State')).toBe('other')
+    expect(rivianRecordLabel('constructor')).toBe('other')
   })
 })
 

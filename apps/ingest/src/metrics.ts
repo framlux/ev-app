@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http'
 import { Counter, Gauge, Registry, collectDefaultMetrics } from 'prom-client'
-import { RIVIAN_STREAMS, type Vendor } from './deps.js'
+import { OTHER_STREAM, RIVIAN_STREAMS, type Vendor } from './deps.js'
 
 /**
  * Instrumentation for the failure this worker exists to prevent: not crashing,
@@ -123,11 +123,13 @@ export function initialiseSeries(vehicleId: string, vendor: Vendor): void {
 /**
  * Every value `MqttHooks.onRecord` can report, per vendor. Kept here so the
  * series exist. Tesla's are record kinds the topic parser names; Rivian's are
- * the stream names, which are the last segment of the topic.
+ * the stream names, which are the last segment of the topic, plus `other` for a
+ * stream the handler does not list (the label is bounded on purpose: see
+ * `makeRivianMessageHandler`).
  */
 const RECORD_KINDS: Record<Vendor, readonly string[]> = {
   tesla: ['metrics', 'alert', 'error', 'connectivity'],
-  rivian: RIVIAN_STREAMS,
+  rivian: [...RIVIAN_STREAMS, OTHER_STREAM],
 }
 
 /** Every value `MqttHooks.onParseFailure` can report. */

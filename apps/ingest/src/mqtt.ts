@@ -1,5 +1,11 @@
 import mqtt from 'mqtt'
-import { parseRivianTopic, tapeRivianBody, type RawMessage, type Vendor } from './deps.js'
+import {
+  parseRivianTopic,
+  rivianRecordLabel,
+  tapeRivianBody,
+  type RawMessage,
+  type Vendor,
+} from './deps.js'
 import type { RecordKind, TeslaEnvelope } from './pipeline.js'
 
 export interface MqttOptions {
@@ -263,10 +269,12 @@ export function makeRivianMessageHandler(
       done()
       return
     }
-    // The stream, as the topic spelled it. Counted before the checks below, as
-    // the Tesla handler does, so a message for another vehicle still shows up in
-    // the volume the worker is being offered.
-    hooks.onRecord?.(info.stream)
+    // The stream, counted before the checks below, as the Tesla handler does, so
+    // a message for another vehicle still shows up in the volume the worker is
+    // being offered. A stream we do not list is counted as `other` (see
+    // `rivianRecordLabel`: the label becomes a series, and a topic is whatever a
+    // publisher sent). The frame itself is untouched and still taped.
+    hooks.onRecord?.(rivianRecordLabel(info.stream))
 
     // See the Tesla handler: a VIN that is not ours has no `vehicle` row to
     // attach to, and inserting it would fail its foreign key on every redelivery.
@@ -323,6 +331,33 @@ function handOff(
 }
 
 /**
+ * Options for a worker that is wired to a vendor: the connection and the car,
+ * plus which vendor's handler reads what arrives on it.
+ */
+export type VendorMqttOptions = MqttOptions & { vendor: Vendor }
+
+/**
+ * The one place a vendor chooses its message handler.
+ *
+ * It is a function of its own so that the choice can be tested: a flipped branch
+ * here would hand a Rivian worker the Tesla topic parser, which would ack every
+ * `rivian/...` message as a `topic` failure. That is the worst failure this
+ * worker has, an ack for a message that was dropped, and nothing but the
+ * parse-failure counter would show it.
+ */
+export function handlerFor(
+  vendor: Vendor,
+  opts: MqttOptions,
+  onMessage: (m: RawMessage) => Promise<void>,
+  hooks: MqttHooks = {},
+): MessageHandler {
+  switch (vendor) {
+    case 'tesla': return makeMessageHandler(opts, onMessage, hooks)
+    case 'rivian': return makeRivianMessageHandler(opts, onMessage, hooks)
+  }
+}
+
+/**
  * Wire the handler into a client.
  *
  * `handleMessage` is overridden rather than listening on `'message'`. mqtt.js
@@ -334,12 +369,11 @@ function handOff(
  */
 export function attach(
   client: MqttClientLike,
-  opts: MqttOptions,
+  opts: VendorMqttOptions,
   onMessage: (m: RawMessage) => Promise<void>,
   hooks: MqttHooks = {},
-  makeHandler: typeof makeMessageHandler = makeMessageHandler,
 ): void {
-  client.handleMessage = makeHandler(opts, onMessage, hooks)
+  client.handleMessage = handlerFor(opts.vendor, opts, onMessage, hooks)
 
   client.on('connect', (() => {
     hooks.onConnectionChange?.(true)
@@ -363,7 +397,7 @@ export function attach(
  * is the same.
  */
 export function subscribe(
-  opts: MqttOptions & { vendor: Vendor },
+  opts: VendorMqttOptions,
   onMessage: (m: RawMessage) => Promise<void>,
   hooks: MqttHooks = {},
 ): mqtt.MqttClient {
@@ -380,10 +414,7 @@ export function subscribe(
     // process is OOM-killed, which loses more than the outage did.
     queueQoSZero: false,
   })
-  attach(
-    client, opts, onMessage, hooks,
-    opts.vendor === 'rivian' ? makeRivianMessageHandler : makeMessageHandler,
-  )
+  attach(client, opts, onMessage, hooks)
   return client
 }
 

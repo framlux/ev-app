@@ -15,6 +15,7 @@ export { RIVIAN_STREAMS } from '@ev/rivian'
 
 import type { Vendor } from '@ev/core'
 import {
+  RIVIAN_STREAMS,
   RIVIAN_TOPIC_ROOT,
   cleanStrings,
   readRivianEnvelope,
@@ -32,6 +33,25 @@ export function profileFor(vendor: Vendor): VendorProfile {
     case 'tesla': return teslaProfile
     case 'rivian': throw new Error('no profile for vendor rivian yet')
   }
+}
+
+/** The `record` label for a Rivian stream that is not in `RIVIAN_STREAMS`. */
+export const OTHER_STREAM = 'other'
+
+const KNOWN_STREAMS: ReadonlySet<string> = new Set(RIVIAN_STREAMS)
+
+/**
+ * The label a Rivian message is counted under: its stream if the stream is one
+ * we list, else `other`.
+ *
+ * Bounded on purpose. The topic's last segment is whatever the publisher chose,
+ * `parseRivianTopic` accepts any non-empty one so that no frame is dropped for
+ * its name, and the label becomes a Prometheus series, so spelling it through
+ * would let one misbehaving publisher mint series without bound. `metrics.ts`
+ * seeds exactly `RIVIAN_STREAMS` and `other`.
+ */
+export function rivianRecordLabel(stream: string): string {
+  return KNOWN_STREAMS.has(stream) ? stream : OTHER_STREAM
 }
 
 /** What a Rivian topic said. */

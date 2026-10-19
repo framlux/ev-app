@@ -21,6 +21,7 @@ export interface Config {
   }
   vehicle: {
     id: string
+    /** Optional for Tesla. Never null for Rivian: `loadConfig` refuses to start without it. */
     vin: string | null
     displayName: string
   }
@@ -123,7 +124,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     },
     vehicle: {
       id: required(env, 'EV_VEHICLE_ID'),
-      vin: env['EV_VEHICLE_VIN'] ?? null,
+      vin: vendor === 'rivian' ? requiredVin(env) : env['EV_VEHICLE_VIN'] ?? null,
       displayName: env['EV_VEHICLE_NAME'] ?? required(env, 'EV_VEHICLE_ID'),
     },
     // No default. A guessed capacity silently rescales every drive's energy and
@@ -198,6 +199,27 @@ function coordinate(env: NodeJS.ProcessEnv, name: string, limit: number): number
       `got ${JSON.stringify(raw)}`)
   }
   return n
+}
+
+/**
+ * EV_VEHICLE_VIN, which a Rivian worker cannot start without.
+ *
+ * Optional for Tesla, where the VIN only keys the vehicle row and the worker
+ * falls back to the local id. Not for Rivian (spec §8.2): the vehicle row's
+ * vendor id IS the VIN, and it is also what the Rivian handler checks every
+ * topic against. With none, the handler accepts any VIN on `rivian/#` and tapes
+ * every car's frames under this one vehicle, silently misattributing them, and
+ * the sample table has no way to tell that apart afterwards. A crashing pod is
+ * the symptom an operator can act on.
+ */
+function requiredVin(env: NodeJS.ProcessEnv): string {
+  const vin = env['EV_VEHICLE_VIN']
+  if (!vin) {
+    throw new Error(
+      'EV_VEHICLE_VIN is required for a rivian worker: it is the vehicle\'s vendor id, and ' +
+      'without it frames for any VIN on the topic tree would be taped as this vehicle\'s')
+  }
+  return vin
 }
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
