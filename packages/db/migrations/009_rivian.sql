@@ -44,9 +44,15 @@ CREATE TABLE rivian_credential (
 -- WRITTEN ONLY BY THE CONNECTOR, asynchronously and best-effort: a failed write
 -- is logged and retried with the next change, and the socket never waits on it
 -- (Postgres is not on its critical path, §5.2). That makes every column here a
--- report and none a command. Nothing reads this row to decide what the
--- connector does next, so a stale row can mislead a person but cannot misdirect
--- the connector.
+-- report EXCEPT ONE: `dropped_properties`, which the connector reads back once,
+-- at `starting`, to leave those properties out of its subscription groups so a
+-- restart does not repeat the bisection (§5.4); if that read fails it starts
+-- from `[]` and searches again. For every other column a stale row can mislead
+-- a person but cannot misdirect the connector. For that one it can, and the
+-- cost is bounded and visible: a property wrongly on the list is simply not
+-- subscribed until the daily re-probe (§5.4) accepts it and the connector
+-- rewrites the list without it, and a list that is missing a bad property just
+-- costs one more bisection.
 --
 -- ONE ROW, for the same reason as the credential: there is one connector for
 -- one car.
@@ -65,7 +71,8 @@ CREATE TABLE rivian_credential (
 -- like a healthy idle.
 --
 -- `dropped_properties` are the vehicleState properties the gateway schema
--- rejected and bisection removed (§5.4). A NOT NULL list rather than a nullable
+-- rejected and bisection removed (§5.4), persisted so a restart can honour
+-- them (see the exception above). A NOT NULL list rather than a nullable
 -- one, because "none dropped" is an answer the page prints and `NULL` would
 -- leave it unable to tell that from "never reported".
 CREATE TABLE rivian_status (

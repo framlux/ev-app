@@ -90,10 +90,14 @@ describe.skipIf(!hasDb)('009_rivian', () => {
 
       await sleep(10)
       await withTransaction(getPool(), (c) =>
-        upsertRivianCredential(c, { sealed: 'jwe-two', account: 'owner@example.com' }))
+        upsertRivianCredential(c, { sealed: 'jwe-two', account: 'second@example.com' }))
       const second = await withTransaction(getPool(), (c) => readRivianCredential(c))
 
       expect(second?.sealed).toBe('jwe-two')
+      // The account moves with the session: a re-sign-in as a different user
+      // that kept showing the old email would tell the owner the wrong car is
+      // connected.
+      expect(second?.account).toBe('second@example.com')
       expect(second!.updatedAt.getTime()).toBeGreaterThan(first!.updatedAt.getTime())
       expect(second?.createdAt.getTime()).toBe(first?.createdAt.getTime())
 

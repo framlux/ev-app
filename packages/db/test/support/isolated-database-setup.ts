@@ -50,6 +50,24 @@ export default async function setup(
   const name = config.env?.['PGDATABASE']
   if (!name || !process.env['PGHOST']) return
 
+  // This drops a database by a name built from the environment, so it checks
+  // the name is what isolated-database.ts would have made before it drops
+  // anything. Both conditions are ways a
+  // misconfigured project could point DROP at the database the developer or CI
+  // named - which holds real data on a developer machine - rather than at a
+  // disposable one: a config that set `env.PGDATABASE` by hand, and a vitest
+  // that applied the override to this process, where `process.env` would then
+  // already BE the isolated name and the admin connection below would land on a
+  // database it is about to drop.
+  if (!name.includes('_test_')) {
+    throw new Error(
+      `refusing to drop database "${name}": a test database's name must contain "_test_"`)
+  }
+  if (name === process.env['PGDATABASE']) {
+    throw new Error(
+      `refusing to drop database "${name}": it is the database PGDATABASE names, not an isolated one`)
+  }
+
   const admin = new Client()
   await admin.connect()
   try {

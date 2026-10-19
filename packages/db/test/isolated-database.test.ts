@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { isolatedDatabase } from './support/isolated-database.js'
+import setup from './support/isolated-database-setup.js'
 
 /**
  * The per-project database, and the proof that this project is using one.
@@ -39,6 +40,25 @@ describe('isolatedDatabase', () => {
     process.env['PGDATABASE'] = 'ev'
 
     expect(isolatedDatabase('web')).toEqual({ env: {}, globalSetup: [] })
+  })
+
+  it('refuses to drop a database that is not marked as a test one', async () => {
+    // Both refusals happen before a connection is opened, so this needs no
+    // Postgres. PGDATABASE is what a developer or CI named, and is the one
+    // database this setup must never drop.
+    process.env['PGHOST'] = 'localhost'
+    process.env['PGDATABASE'] = 'ev'
+
+    await expect(setup({ config: { env: { PGDATABASE: 'ev' } } }))
+      .rejects.toThrow(/must contain "_test_"/)
+  })
+
+  it('refuses to drop the database PGDATABASE itself names', async () => {
+    process.env['PGHOST'] = 'localhost'
+    process.env['PGDATABASE'] = 'ev_test_db'
+
+    await expect(setup({ config: { env: { PGDATABASE: 'ev_test_db' } } }))
+      .rejects.toThrow(/not an isolated one/)
   })
 
   it.skipIf(!hasDb)('is in effect for this project\'s own workers', () => {

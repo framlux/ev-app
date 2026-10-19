@@ -11,10 +11,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
  * It is a data migration, so reading its text proves nothing: the claims that
  * matter are what it does to rows that already exist - ShiftStateD becomes D, an
  * unnameable position becomes NULL, a Rivian's D is left alone on the way back
- * down - and those need a database that is at 007 with rows in it. The shared
- * `ev` database cannot be that. Every other test file migrates it to head and
- * writes to it concurrently, and this test has to take a schema DOWN a step, so
- * it gets a database of its own for the length of the file.
+ * down - and those need a database that is at 007 with rows in it. The
+ * project's test database (`<PGDATABASE>_test_db`, see
+ * support/isolated-database.ts) cannot be that. Every other file in this project
+ * migrates it to head and writes to it concurrently, and this test has to take a
+ * schema DOWN a step, so it gets a database of its own for the length of the
+ * file.
  *
  * It needs a real Postgres, like `migrate.test.ts`, and is skipped without one
  * on a developer machine but never in CI: a migration test that silently never
