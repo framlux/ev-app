@@ -262,7 +262,7 @@ The user sees one of these messages:
 
 **Silence.** With 60 s of nothing on an acknowledged socket, every active subscription is resubscribed. The connector sends `complete` for the old id, then `subscribe` under a **fresh** id: `graphql-transport-ws` forbids reusing a live id. It never reconnects on silence alone.
 
-**A server `complete` or `error` for one subscription** resubscribes that subscription after 30 s, under a fresh id. A `GRAPHQL_VALIDATION_FAILED` error goes to §5.4 instead.
+**A server `complete` or `error` for one subscription** resubscribes that subscription under a fresh id on its own backoff: 30 s × 2ⁿ plus 0–30 s of jitter, capped at 900 s, reset by that stream's next `next`. While any subscription is refused, `last_error` says which and with what code. An error coded `UNAUTHENTICATED` means the session is dead (as the close reason does). A `GRAPHQL_VALIDATION_FAILED` error goes to §5.4 instead. *(Amended after the final review: a flat 30 s retry of a refused subscription was 1,920 subscribes an hour, invisibly.)*
 
 **SIGTERM.**
 1. Stop reading the socket.
@@ -294,7 +294,7 @@ The `vehicleState` property list starts from `packages/rivian/src/catalogue.ts` 
 Rivian's validation errors don't name fields (§2.3), so the connector finds the bad field itself:
 
 - **Groups.** `vehicleState` is subscribed in groups of at most 16 properties, so a rejected field silences at most 15 others, and only until the bisection below finds it. Every non-`vehicleState` subscription is its own group.
-- **Bisection.** When a group is rejected with `GRAPHQL_VALIDATION_FAILED`, it's split in half and each half subscribed 30 s later. A single property that is rejected alone is **dropped**. 16 properties settle in at most 8 probes, a few minutes. Healthy halves keep flowing during the search.
+- **Bisection.** When a group is rejected with `GRAPHQL_VALIDATION_FAILED`, it's split in half and each half subscribed 30 s later. A single property that is rejected alone is **dropped**. **A document fault is not a field fault:** if every `vehicleState` group of a fresh subscribe wave is rejected, or a group's bisection ends with every property rejected, nothing is dropped; the groups are retried on the per-subscription backoff and `last_error` says so. Saved dropped properties loaded at start are first re-probed an hour later, staggered across the following hour. 16 properties settle in at most 8 probes, a few minutes. Healthy halves keep flowing during the search.
 - **A rejected subscription other than `vehicleState`**, with no properties to bisect, is marked unavailable and retried once a day.
 - **Persistence.** The dropped list is written to `rivian_status.dropped_properties` and published as `meta.droppedProperties`, so a restart doesn't repeat the search and the tape records what's missing.
 - **Retry.** Dropped properties are re-probed once a day, alone, in case a field comes back for the R2.
@@ -411,7 +411,7 @@ export interface VendorProfile {
 
 The Tesla decoder supplies no `observedAt`, so every slot is stamped with arrival time exactly as today. **The refactor is behaviour-neutral for the Tesla.** The existing suite proves it unchanged, plus a replay against a restored production copy (§10.3).
 
-**Registry.** `deps.ts` becomes `profileFor(vendor)`. After this change, `deps.ts` and the two profile files are the only places in `apps/ingest` that import a vendor package. A test greps for that.
+**Registry.** `deps.ts` becomes `profileFor(vendor)`. After this change, `deps.ts`, the two profile files and `parallax-dump.ts` (a Rivian-only tool that decodes Parallax payloads) are the only places in `apps/ingest` that import a vendor package. A test greps for that.
 
 **`VehicleAdapter`** is deleted from `@ev/core`. Nothing imports it.
 
@@ -591,9 +591,10 @@ Deriving energy from SoC × capacity was rejected: it makes `estimateCapacity` c
 
 ### 7.6 Staleness
 
-- `staleWindowFor` returns `VOLATILE_STALE_MS` for `speedKph`, `gpsHeading` and `chargePowerKw`, and `STALE_VALUE_MS` for everything else. That includes `lat`/`lon` and `gear`, for the reasons `CARRIED_DRIVE_FIELDS` gives.
+- `staleWindowFor` returns `VOLATILE_STALE_MS` (5 min) for `speedKph`, `gpsHeading` and `chargePowerKw`; `STALE_VALUE_MS` (6 h) for the charge-state slots, so an old charging word can't hold a session open; and `RIVIAN_LEVEL_STALE_MS` (7 days) for every other slot, `lat`/`lon` and `gear` included. **Amended after the final review:** Rivian streams changes only, so a re-sent unchanged level is the current value, and a 6 h window blanked a parked car's SoC, odometer and location (and broke home-charge classification). The same function feeds the decoder's too-old drop and `take()`. The resume window stays 6 h: a parked car's connector re-snapshots every minute, which repopulates levels after an ingest restart.
 - The volatile list is typed `satisfies readonly (keyof RivianFieldState)[]`, so a misspelling fails to compile.
 - Staleness is measured from `observedAt` (§6.4).
+- **Arrival-stamped values.** Where the decoder has no observation time of Rivian's and stamps a slot with `receivedAt` (`cloudOnline`, the `charging`-stream slots), an unchanged value refreshes the slot's carry but is not news: it does not schedule a sample. Otherwise every per-minute snapshot would emit a carried sample and hold sessions open (the failure §6.4's newer-wins rule exists to prevent).
 
 ### 7.7 Accumulation timing
 
@@ -612,7 +613,7 @@ No enum changes: `001_initial.sql` already declares `vendor AS ENUM ('tesla', 'r
 
 ### 8.2 The vehicle row
 
-`ev-ingest-rivian` registers `{vendor: 'rivian', id: EV_VEHICLE_ID, vendorVehicleId: EV_VEHICLE_VIN, displayName}` at startup, as the Tesla worker does. `registerVehicle` takes the vendor from config instead of hard-coding `'tesla'`. Rivian's own vehicle `id` is on the tape in `meta.userInfo`.
+`ev-ingest-rivian` registers `{vendor: 'rivian', id: EV_VEHICLE_ID, vendorVehicleId: EV_VEHICLE_VIN, displayName}` at startup, as the Tesla worker does. A worker refuses to start (and `reprocess` refuses to run) if a row with its `EV_VEHICLE_ID` already exists with a different vendor or VIN: reusing the Tesla's id would otherwise file the R2's data under the Tesla, silently and permanently. VINs are upper-cased in config on both sides. `registerVehicle` takes the vendor from config instead of hard-coding `'tesla'`. Rivian's own vehicle `id` is on the tape in `meta.userInfo`.
 
 ### 8.3 Capacity
 
@@ -663,7 +664,7 @@ Each is a migration plus `reprocess`, worked from the real tape:
 | Authentication | CSRF renewed at start; HTTP `UNAUTHENTICATED` renews once, then stops; ws `"Unauthenticated"` stops at once and resumes only on a new `updated_at` |
 | Backoff | the schedule and its floor, rate limit, missing ack |
 | Silence | resubscribe under fresh ids, never reconnect |
-| Server frames | server `complete`/`error` resubscribes after 30 s |
+| Server frames | server `complete`/`error` resubscribes on a per-subscription backoff (30 s × 2ⁿ, cap 900 s) |
 | Schema drift | bisection finds one bad property among 16 within 8 probes while the healthy half keeps flowing; dropped list persisted and re-probed daily; a non-state subscription marked unavailable |
 | Queue | overflow by bytes drops oldest, then resubscribes all; SIGTERM drains, sends `complete`, exits |
 | Envelope | shape and topic; `receivedAt` taken at frame arrival; string cleaning; the whole payload, `errors` included |
