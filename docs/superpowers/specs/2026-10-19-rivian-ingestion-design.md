@@ -461,7 +461,7 @@ A subscribe re-sends current values, which may be hours old (§2.3). Stamped wit
 
 - **The Rivian decoder sets `observedAt[slot]`** from the property's own `timeStamp`, clamped to at most `receivedAt`. A clock ahead of ours must not make a value look fresher than its frame.
 - **Too old to apply.** A property whose `timeStamp` is older than `receivedAt - staleWindowFor(slot)` contributes nothing. It would expire at the next emit anyway, and applying it would briefly resurrect it.
-- **Unparseable timestamps.** A missing or unparseable `timeStamp` falls back to `receivedAt` and is counted in `rivian_untimed_values_total`. That's an ingest metric, labelled by property.
+- **Unparseable timestamps.** A missing or unparseable `timeStamp` falls back to `receivedAt` and is counted in `ev_ingest_untimed_values_total`. That's an ingest metric, fed by `Decoded.untimed` through `PipelineResult.untimed`.
 - **`chargingSession`** has no per-field timestamps. Its values take `receivedAt`. It pushes only during a session, and its power slot is volatile (§7.6).
 - **Emit timing still uses `receivedAt`**: the debounce is about frames, not observations. Only the carry uses `observedAt`.
 
@@ -670,7 +670,7 @@ Each is a migration plus `reprocess`, worked from the real tape:
 | `meta` | change-only publishing; introspection-driven selection growth |
 
 **`apps/ingest`:**
-- **The Tesla profile reproduces today exactly:** the same `VOLATILE_FIELDS` set, slot lists and decode outputs. The existing pipeline, resume and reprocess suites pass **unchanged**, apart from gear strings becoming canonical in assertions.
+- **The Tesla profile reproduces today exactly:** the same `VOLATILE_FIELDS` set, slot lists and decode outputs. The existing pipeline, resume and reprocess suites pass with their logic and assertions unchanged. The only edits are mechanical: passing the Tesla profile to `new Pipeline(...)`, importing `VOLATILE_FIELDS`/`staleWindowFor` from `profiles/tesla.js`, and canonical gear strings.
 - **`EV_VENDOR`:** required; vendor-derived defaults; cross-vendor client ids and topics refused.
 - **The Rivian topic parser:** taped-not-dropped for unknown versions and missing fields; dropped for non-JSON; string cleaning.
 - **`receivedAt`** comes from the envelope, with the fallback.
