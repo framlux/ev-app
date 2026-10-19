@@ -869,6 +869,274 @@ describe('a field Rivian rejects', () => {
   })
 })
 
+/** The `vehicleState` properties a subscribe document selects. */
+const propertiesOf = (doc: { query: string }): string[] =>
+  [...doc.query.matchAll(/^ {4}(\w+) \{$/gm)].map((m) => m[1]!)
+
+describe('a fault in the documents is not a fault in a field (design §5.4)', () => {
+  const STATE_GROUPS = Math.ceil(RIVIAN_PROPERTIES.length / 16)
+  const FAULT_LINE = 'every vehicleState group refused: GRAPHQL_VALIDATION_FAILED'
+
+  it('does not bisect, drop or persist anything when every state group is rejected, however long it goes on', async () => {
+    h = await makeHarness()
+    const times = new Map<string, number[]>()
+    h.fake.respond = (socket, id, doc) => {
+      if (doc.operationName !== 'VehicleState') return
+      const key = id.split('#')[0]!
+      times.set(key, [...(times.get(key) ?? []), h.clock.now() - START])
+      socket.reject(id)
+    }
+    await h.connect()
+    expect(h.socket.subscribes.filter((s) => s.doc.operationName === 'VehicleState')).toHaveLength(STATE_GROUPS)
+
+    // Two minutes: the first retry is 30 s after the wave, and that is all.
+    await h.clock.tick(2 * MINUTE)
+    const stateAfterTwoMinutes = h.socket.subscribes.filter((s) => s.doc.operationName === 'VehicleState')
+    expect(stateAfterTwoMinutes).toHaveLength(STATE_GROUPS * 3)
+
+    await h.clock.tick(HOUR)
+
+    // Always the groups as first subscribed: never a half, never a single property.
+    const asked = new Set(
+      h.socket.subscribes.filter((s) => s.doc.operationName === 'VehicleState').map((s) => s.doc.query),
+    )
+    expect(asked.size).toBe(STATE_GROUPS)
+    // Each retried on the per-subscription schedule (30 s doubling, jitter 0 here).
+    expect(times.size).toBe(STATE_GROUPS)
+    for (const [key, at] of times) {
+      expect(at.slice(0, 5), key).toEqual([0, 30, 90, 210, 450].map((s) => s * SECOND))
+    }
+    // Nothing dropped, so nothing written, taped or counted as dropped.
+    expect(h.store.writes.every((w) => w.droppedProperties.length === 0)).toBe(true)
+    expect(h.meta('droppedProperties').every((m) => (m as { properties: string[] }).properties.length === 0)).toBe(true)
+    expect(Math.max(...h.metrics.droppedProps)).toBe(0)
+    expect(h.fake.opens).toHaveLength(1)
+    expect(h.connector.state).toBe('subscribed')
+    expect(h.store.writes.at(-1)!.lastError).toBe(FAULT_LINE)
+    // The other seven subscriptions were never affected.
+    expect(h.socket.liveIds.length).toBeGreaterThanOrEqual(7)
+  })
+
+  it('subscribes every state group again after a restart: nothing was persisted to leave them out', async () => {
+    h = await makeHarness()
+    h.fake.respond = (socket, id, doc) => {
+      if (doc.operationName === 'VehicleState') socket.reject(id)
+    }
+    await h.connect()
+    await h.clock.tick(10 * MINUTE)
+    const last = h.store.writes.at(-1)!
+    expect(last.droppedProperties).toEqual([])
+
+    // The next process starts from what the last one wrote.
+    const next = await makeHarness()
+    next.store.statusRow = { ...last, updatedAt: new Date(START) }
+    await next.connect()
+    expect(liveStateProperties(next.socket)).toHaveLength(RIVIAN_PROPERTIES.length)
+  })
+
+  it('goes back to bisecting once the documents are shown to be fine, so one bad field is still found', async () => {
+    h = await makeHarness()
+    const bad = RIVIAN_PROPERTIES[0]!.name
+    // The documents are wrong at first (every state group rejected), then fixed;
+    // from then on only a query that selects `bad` is rejected.
+    let fixed = false
+    h.fake.respond = (socket, id, doc) => {
+      if (doc.operationName !== 'VehicleState') return
+      if (!fixed || propertiesOf(doc).includes(bad)) socket.reject(id)
+    }
+    await h.connect()
+    await h.clock.tick(31 * SECOND)
+    expect(h.store.writes.at(-1)!.lastError).toBe(FAULT_LINE)
+
+    fixed = true
+    // Retried groups (each on its own schedule) are now accepted, and a frame arrives.
+    await h.clock.tick(5 * MINUTE)
+    const flowing = h.socket.subscribes
+      .filter((s) => s.doc.operationName === 'VehicleState' && !propertiesOf(s.doc).includes(bad))
+      .at(-1)!
+    h.socket.handlers.onNext(flowing.id, { data: {} })
+    await settle()
+
+    // Now the group with the bad field is searched, as it always was, and dropped.
+    await h.clock.tick(HOUR)
+    expect(h.store.writes.at(-1)!.droppedProperties).toEqual([bad])
+    expect(liveStateProperties(h.socket)).not.toContain(bad)
+    expect(liveStateProperties(h.socket)).toHaveLength(RIVIAN_PROPERTIES.length - 1)
+  })
+
+  it('still finds exactly one bad field when only its group is rejected (nothing changes for a field fault)', async () => {
+    h = await makeHarness()
+    const bad = RIVIAN_PROPERTIES[40]!.name
+    h.fake.respond = (socket, id, doc) => {
+      if (doc.operationName === 'VehicleState' && propertiesOf(doc).includes(bad)) socket.reject(id)
+    }
+    await h.connect()
+    await h.clock.tick(10 * MINUTE)
+
+    expect(h.store.writes.at(-1)!.droppedProperties).toEqual([bad])
+    expect(h.store.writes.at(-1)!.lastError).toBeNull()
+    expect(liveStateProperties(h.socket)).toHaveLength(RIVIAN_PROPERTIES.length - 1)
+  })
+
+  describe('a group whose every property is rejected', () => {
+    /** The first group's properties: the catalogue is grouped in order. */
+    const group0 = RIVIAN_PROPERTIES.slice(0, 16).map((p) => p.name)
+    const bad = new Set(group0)
+
+    /** A server that rejects any state query that selects any property of the first group. */
+    function rejectGroupZero(onWhole?: () => void): void {
+      h.fake.respond = (socket, id, doc) => {
+        const asked = propertiesOf(doc)
+        if (doc.operationName !== 'VehicleState' || !asked.some((p) => bad.has(p))) return
+        if (asked.length === group0.length) onWhole?.()
+        socket.reject(id)
+      }
+    }
+
+    it('is restored whole, drops nothing, and is retried on a backoff with last_error saying so', async () => {
+      h = await makeHarness()
+      const wholeAt: number[] = []
+      rejectGroupZero(() => wholeAt.push(h.clock.now() - START))
+      await h.connect()
+
+      // 16 bad leaves: five levels of rejection, 30 s apart, and then it stops.
+      await h.clock.tick(10 * MINUTE)
+      expect(h.store.writes.at(-1)!.droppedProperties).toEqual([])
+      expect(h.meta('droppedProperties').at(-1)).toEqual({ properties: [] })
+      expect(h.metrics.droppedProps.at(-1)).toBe(0)
+      expect(h.store.writes.at(-1)!.lastError).toBe(
+        'a vehicleState group refused on every property: GRAPHQL_VALIDATION_FAILED',
+      )
+      expect(h.connector.state).toBe('subscribed')
+
+      // The whole group is asked for again on the per-subscription schedule
+      // (the first subscribe, then 30 s, 60 s... after each rejection), and
+      // it is not searched a second time.
+      const before = h.socket.subscribes.length
+      await h.clock.tick(HOUR)
+      const later = h.socket.subscribes
+        .slice(before)
+        .filter((s) => s.doc.operationName === 'VehicleState' && propertiesOf(s.doc).some((p) => bad.has(p)))
+      expect(later.length).toBeGreaterThan(0)
+      expect(later.every((s) => propertiesOf(s.doc).length === group0.length)).toBe(true)
+      expect(wholeAt.length).toBeGreaterThanOrEqual(3)
+      // The other groups are untouched and flowing.
+      expect(liveStateProperties(h.socket).filter((n) => !bad.has(n))).toHaveLength(
+        RIVIAN_PROPERTIES.length - 16,
+      )
+    })
+
+    it('takes back what was dropped on the way, in the saved list as well as the live one', async () => {
+      h = await makeHarness()
+      // The leaves are refused a second apart, so the drops land one at a time
+      // and the saved list can be seen holding some of them.
+      h.fake.respond = (socket, id, doc) => {
+        const asked = propertiesOf(doc)
+        if (doc.operationName !== 'VehicleState' || !asked.some((p) => bad.has(p))) return
+        const delay = asked.length === 1 ? group0.indexOf(asked[0]!) * SECOND : 0
+        if (delay === 0) socket.reject(id)
+        else h.clock.setTimeout(() => socket.reject(id), delay)
+      }
+      await h.connect()
+
+      // Four levels of 30 s, and then the leaves: half of them are found.
+      await h.clock.tick(4 * 30 * SECOND + 8 * SECOND)
+      expect(h.store.writes.at(-1)!.droppedProperties.length).toBeGreaterThanOrEqual(7)
+
+      // And the last of them ends the search and takes them all back.
+      await h.clock.tick(MINUTE)
+      expect(h.store.writes.at(-1)!.droppedProperties).toEqual([])
+      expect(h.meta('droppedProperties').at(-1)).toEqual({ properties: [] })
+      expect(h.metrics.droppedProps.at(-1)).toBe(0)
+      expect(h.store.writes.at(-1)!.lastError).toBe(
+        'a vehicleState group refused on every property: GRAPHQL_VALIDATION_FAILED',
+      )
+    })
+
+    it('is a group again at the next connection, whole', async () => {
+      h = await makeHarness()
+      rejectGroupZero()
+      await h.connect()
+      await h.clock.tick(10 * MINUTE)
+
+      h.socket.handlers.onClose('closed', 'websocket closed with code 1006')
+      await settle()
+      await h.clock.tick(30 * SECOND)
+      await h.until(() => h.fake.opens.length === 2, 'the reconnect')
+      await h.until(() => h.connector.state === 'subscribed', 'subscribed')
+
+      const first = h.socket.subscribes.find((s) => s.doc.operationName === 'VehicleState')!
+      expect(propertiesOf(first.doc)).toEqual(group0)
+    })
+  })
+
+  describe('a property read back as dropped at start', () => {
+    const names = RIVIAN_PROPERTIES.filter((p) => p.shape === 'value')
+      .map((p) => p.name)
+      .slice(0, 60)
+    const saved = (droppedProperties: string[]) => ({
+      state: 'subscribed' as const,
+      vin: VIN,
+      rivianVehicleId: 'rv-1',
+      lastFrameAt: null,
+      lastError: null,
+      backoffUntil: null,
+      droppedProperties,
+      updatedAt: new Date(START - HOUR),
+    })
+
+    it('is first tried an hour after start, one or two a minute across the next hour', async () => {
+      h = await makeHarness()
+      h.store.statusRow = saved(names)
+      await h.connect()
+      expect(names.every((n) => !liveStateProperties(h.socket).includes(n))).toBe(true)
+
+      // Nothing at all for the first hour, not even at 23 h.
+      await h.clock.tick(HOUR - 1)
+      expect(names.filter((n) => h.socket.subscribeFor(n) !== undefined)).toEqual([])
+
+      const probed = (): number => names.filter((n) => h.socket.subscribeFor(n) !== undefined).length
+      let last = 0
+      let busiest = 0
+      let minutesWithProbes = 0
+      await h.clock.tick(1)
+      for (let minute = 0; minute <= 60; minute += 1) {
+        const now = probed()
+        busiest = Math.max(busiest, now - last)
+        if (now > last) minutesWithProbes += 1
+        last = now
+        await h.clock.tick(MINUTE)
+      }
+      expect(probed()).toBe(names.length)
+      // 60 names over an hour: spread, not a burst.
+      expect(busiest).toBeLessThanOrEqual(2)
+      expect(minutesWithProbes).toBeGreaterThanOrEqual(55)
+    })
+
+    it('goes back to a day for one that is still rejected, and the stored list keeps it meanwhile', async () => {
+      h = await makeHarness()
+      const name = names[0]!
+      h.store.statusRow = saved([name])
+      h.fake.respond = (socket, id, doc) => {
+        if (doc.operationName === 'VehicleState' && propertiesOf(doc).length === 1 && propertiesOf(doc)[0] === name) {
+          socket.reject(id)
+        }
+      }
+      await h.connect()
+      await h.clock.tick(HOUR + 2 * MINUTE)
+      const probes = (): number => h.socket.subscribes.filter((s) => propertiesOf(s.doc).join() === name).length
+      expect(probes()).toBe(1)
+      expect(h.store.writes.at(-1)!.droppedProperties).toEqual([name])
+
+      // Rejected at about the hour, so due again a day after that.
+      await h.clock.tick(23 * HOUR)
+      expect(probes()).toBe(1)
+      await h.clock.tick(HOUR)
+      expect(probes()).toBe(2)
+    })
+  })
+})
+
 describe('restart', () => {
   const saved = (droppedProperties: string[]) => ({
     state: 'subscribed' as const,

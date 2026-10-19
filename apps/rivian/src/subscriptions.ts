@@ -34,6 +34,18 @@ import {
  *    alone and rejected, at which point it is dropped. 16 settle in at most 5
  *    rejections; healthy halves keep flowing the whole time.
  *
+ *    A SECOND KIND OF FAULT LOOKS LIKE THE FIRST AND MUST NOT BE SEARCHED. If
+ *    every `vehicleState` group of a fresh subscribe is rejected, or a group's
+ *    search ends with every one of its properties rejected, the likelier fault
+ *    is the DOCUMENT (the wrong type, the wrong variable) and not a hundred
+ *    fields retiring at once. Bisecting it would take the whole catalogue down
+ *    to single properties in a couple of minutes (261 subscribes), drop all 135
+ *    and persist that, so a restart would then subscribe no state at all. The
+ *    plan reports such a rejection as a `fault`: nothing is dropped, what was
+ *    dropped on the way is taken back, and the groups are handed back to retry
+ *    on a backoff. A `vehicleState` frame is what shows the documents are fine
+ *    (`documentAccepted`).
+ *
  * 2. `graphql-transport-ws` forbids reusing a subscription id on a socket
  *    (§5.2). Renewing a subscription, which the connector does after every 60 s
  *    of silence, is a `complete` for the old id and a `subscribe` under a NEW
@@ -53,12 +65,101 @@ export interface PlannedSubscription {
 }
 
 /**
+ * What `rejected` found to be the matter when it was not a field.
+ *
+ * - `documents`: every `vehicleState` group of the subscribe wave was rejected
+ *   (or one of them is rejected again after that, with the documents still
+ *   unproven). The document is wrong, not a field.
+ * - `group`: a group was searched down to its single properties and every one
+ *   of them was rejected. Nothing in the group is known to be good.
+ */
+export interface Fault {
+  kind: 'documents' | 'group'
+  /** The groups to subscribe again on a backoff, whole and as they were first subscribed. */
+  retry: PlannedSubscription[]
+  /**
+   * Keys of probes this plan handed out for those groups, earlier, that are no
+   * longer wanted: the connector must cancel any it is still holding.
+   */
+  withdrawn: string[]
+  /**
+   * Properties this search had dropped that are taken back: they were dropped
+   * on the way to finding out that it was not them. The dropped list has
+   * shrunk, and the connector writes it again.
+   */
+  restored: string[]
+}
+
+/** What `rejected` answers. */
+export interface Rejection {
+  probes: PlannedSubscription[]
+  newlyDropped: string[]
+  unavailable: string | null
+  fault: Fault | null
+}
+
+/** A group's search for its bad field: the group first rejected, and the properties found rejected alone since. */
+interface Lineage {
+  group: PlannedSubscription
+  rejected: Set<string>
+  lastAt: number
+}
+
+/** The first subscribe wave's state groups, and what each rejection of them handed out or dropped. */
+interface Wave {
+  groups: Map<string, PlannedSubscription>
+  firstAt: number | null
+  rejected: Map<string, { probes: string[]; dropped: string[] }>
+}
+
+/**
  * How long a rejected property, or a rejected subscription with no properties
  * to bisect, is left alone before it is tried once more (§5.4). A field that
  * Rivian removed can come back for another model, but not by the minute: a day
  * is slow enough not to nag, and fast enough to notice by the next morning.
  */
 const REPROBE_INTERVAL_MS = 24 * 60 * 60 * 1000
+
+const MINUTE_MS = 60 * 1000
+const HOUR_MS = 60 * MINUTE_MS
+
+/**
+ * A property that a previous run found rejected, read back at start, is first
+ * tried again an hour later and not a day: the list was learned by a connector
+ * that may have been wrong (a document fault is not meant to reach it, but one
+ * did once), and a day is a long time to leave 135 fields out on the strength
+ * of a search that nobody can check. The retries are spread over the hour after
+ * that (see the constructor), so a restart does not turn the whole list into
+ * one burst of subscribes.
+ */
+const FIRST_REPROBE_MS = HOUR_MS
+
+/**
+ * The least gap between two reprobes that are handed out for a rejection (and
+ * between the last of those read back at start and the next). Eight properties
+ * that one search found bad at the same moment would otherwise all fall due at
+ * the same moment a day later; this keeps each reprobe a probe of its own.
+ */
+const REPROBE_SPACING_MS = MINUTE_MS
+
+/**
+ * How far apart in time the first and last rejection of a subscribe wave can be
+ * and still be one document fault. A server that rejects the documents
+ * rejects them all within moments of the subscribe; this is under the 30 s a
+ * bisection probe waits, so that when the last rejection completes the wave
+ * the probes already planned for the others have not yet been subscribed and
+ * can still be withdrawn.
+ */
+const WAVE_WINDOW_MS = 20_000
+
+/**
+ * How long a bisection stays one search. Its rejections come one probe (30 s)
+ * after another, so a leaf rejected minutes after the last is not part of the
+ * same search: it is a probe that was accepted at the time and is rejected now
+ * (after a renewal, say), and counting it would "complete" an old search and
+ * take back properties that really were found bad.
+ */
+const LINEAGE_WINDOW_MS = 5 * MINUTE_MS
 
 /**
  * Whether `name` may become part of a `vehicleState` query.
@@ -96,6 +197,28 @@ export class SubscriptionPlan {
   /** Subscriptions with no properties to bisect that Rivian refused, with their retry time. */
   readonly #unavailable = new Map<string, { sub: PlannedSubscription; dueAt: number }>()
 
+  /** When the latest reprobe time that was handed to a dropped property falls (see `#dueAfterDrop`). */
+  #lastDueAt = Number.NEGATIVE_INFINITY
+
+  /** The first subscribe wave, while it can still turn out to be one document fault. Null when it cannot. */
+  #wave: Wave | null = null
+
+  /** Bisection searches in progress or lately finished, by the key of each probe in them. */
+  readonly #lineages = new Map<string, Lineage>()
+
+  /**
+   * Groups to retry, not search, because every group of a wave was rejected.
+   * Emptied by a `vehicleState` frame (`documentAccepted`) and by `initial()`.
+   */
+  readonly #faulted = new Set<string>()
+
+  /**
+   * Groups to retry, not search, because every property of them was rejected.
+   * Emptied only by `initial()`: another group's frame says nothing about
+   * this group's own properties.
+   */
+  readonly #exhausted = new Set<string>()
+
   /** The ids that are subscribed right now, and what each one is. */
   #live = new Map<string, PlannedSubscription>()
 
@@ -109,8 +232,9 @@ export class SubscriptionPlan {
    * `properties` is the list to subscribe (the catalogue, widened by discovery
    * in an earlier run). `dropped` is what a previous run found Rivian rejects,
    * read back from the database: those names are left out of `initial()`, and
-   * first tried again `now` + 24 h, so a restart neither repeats the search nor
-   * retries at once what it already knows fails.
+   * first tried again from `now` + 1 h, spread evenly across the hour after
+   * that, so a restart neither repeats the search nor retries at once what it
+   * already knows fails, and does not retry all of it in one burst either.
    */
   constructor(
     vehicleId: string,
@@ -123,11 +247,12 @@ export class SubscriptionPlan {
   ) {
     this.#vehicleId = vehicleId
     this.#parallaxRvms = opts.parallaxRvms === null ? null : [...opts.parallaxRvms]
-    for (const name of opts.dropped) {
-      if (isQueryable(name) && !this.#dropped.has(name)) {
-        this.#dropped.set(name, opts.now + REPROBE_INTERVAL_MS)
-      }
-    }
+    const saved = [...new Set(opts.dropped)].filter(isQueryable)
+    saved.forEach((name, i) => {
+      const dueAt = opts.now + FIRST_REPROBE_MS + Math.floor((i * HOUR_MS) / saved.length)
+      this.#dropped.set(name, dueAt)
+      this.#lastDueAt = Math.max(this.#lastDueAt, dueAt)
+    })
     // A dropped name is a known name even if the list no longer mentions it,
     // so that it joins a group again if a later probe finds it accepted.
     const seen = new Set<string>()
@@ -169,9 +294,21 @@ export class SubscriptionPlan {
   initial(): { id: string; sub: PlannedSubscription }[] {
     this.#live.clear()
     this.#nextGroup = 0
+    // The keys are numbered afresh, so everything that remembered one is
+    // about subscriptions that no longer exist.
+    this.#lineages.clear()
+    this.#faulted.clear()
+    this.#exhausted.clear()
     const live = this.#properties.filter((name) => !this.#dropped.has(name))
+    const groups = groupProperties(live, MAX_GROUP_SIZE).map((names) => this.#stateGroup(names))
+    // A wave needs at least two groups: with one, "every group was rejected"
+    // says no more than "that group was rejected".
+    this.#wave =
+      groups.length >= 2
+        ? { groups: new Map(groups.map((g) => [g.key, g])), firstAt: null, rejected: new Map() }
+        : null
     const subs = [
-      ...groupProperties(live, MAX_GROUP_SIZE).map((names) => this.#stateGroup(names)),
+      ...groups,
       ...this.#fixedSubscriptions().filter((sub) => !this.#unavailable.has(sub.key)),
     ]
     return subs.map((sub) => ({ id: this.activate(sub), sub }))
@@ -226,38 +363,165 @@ export class SubscriptionPlan {
    *   and reported in `newlyDropped`, for the connector to persist and publish.
    * - Anything else has no properties to bisect. It is marked unavailable, named
    *   in `unavailable`, and tried again once a day by `dueForReprobe`.
+   * - But a rejection that is more likely the DOCUMENT than a field comes back
+   *   as a `fault` instead, with nothing dropped and nothing bisected: the
+   *   rejection that completes a wave (every state group of `initial()`
+   *   rejected), a search in which every property of the group was rejected, and
+   *   a retry of a group that has already been so judged. The connector retries
+   *   the `fault.retry` groups on a backoff, cancels the `fault.withdrawn`
+   *   probes it was holding, and writes the dropped list again if
+   *   `fault.restored` is not empty.
    *
    * An id the plan does not hold (already renewed, ended or rejected) answers
    * nothing and changes nothing: it is a stale error for a subscription that
    * has already been dealt with.
    */
-  rejected(
-    id: string,
-    now: number,
-  ): { probes: PlannedSubscription[]; newlyDropped: string[]; unavailable: string | null } {
+  rejected(id: string, now: number): Rejection {
     const sub = this.#live.get(id)
-    if (sub === undefined) return { probes: [], newlyDropped: [], unavailable: null }
+    if (sub === undefined) return { probes: [], newlyDropped: [], unavailable: null, fault: null }
     this.#live.delete(id)
 
     const properties = sub.properties
     if (properties === undefined) {
       this.#unavailable.set(sub.key, { sub, dueAt: now + REPROBE_INTERVAL_MS })
-      return { probes: [], newlyDropped: [], unavailable: sub.key }
+      return { probes: [], newlyDropped: [], unavailable: sub.key, fault: null }
     }
-    if (properties.length === 1) {
-      const name = properties[0]!
-      this.#dropped.set(name, now + REPROBE_INTERVAL_MS)
-      return { probes: [], newlyDropped: [name], unavailable: null }
+
+    // Already judged: it was a fault when it was last rejected and nothing since
+    // has said otherwise, so it is retried and not searched.
+    if (this.#faulted.has(sub.key)) return this.#retryOnly('documents', sub)
+    if (this.#exhausted.has(sub.key)) return this.#retryOnly('group', sub)
+
+    const wave = this.#waveFor(sub, now)
+    if (wave !== null && wave.rejected.size + (wave.rejected.has(sub.key) ? 0 : 1) === wave.groups.size) {
+      return this.#documentFault(wave)
     }
-    const middle = Math.ceil(properties.length / 2)
+    const result = this.#search(sub, properties, now)
+    if (wave !== null && result.fault === null) {
+      wave.rejected.set(sub.key, {
+        probes: result.probes.map((p) => p.key),
+        dropped: result.newlyDropped,
+      })
+    }
+    return result
+  }
+
+  /**
+   * A `vehicleState` frame arrived: the documents are valid, so a rejection
+   * from now on is about a field. A wave still open cannot be all-rejected, and
+   * groups waiting to be retried as document faults are searched when they are
+   * rejected again.
+   */
+  documentAccepted(): void {
+    this.#wave = null
+    this.#faulted.clear()
+  }
+
+  /** The wave `sub` belongs to, while it is still one wave; null if it belongs to none, or took too long. */
+  #waveFor(sub: PlannedSubscription, now: number): Wave | null {
+    const wave = this.#wave
+    if (wave === null || !wave.groups.has(sub.key)) return null
+    if (wave.firstAt === null) wave.firstAt = now
+    else if (now - wave.firstAt > WAVE_WINDOW_MS) {
+      this.#wave = null
+      return null
+    }
+    return wave
+  }
+
+  /** The last group of a wave was rejected: it was the documents. Take back what the others did. */
+  #documentFault(wave: Wave): Rejection {
+    const withdrawn: string[] = []
+    const restored: string[] = []
+    for (const entry of wave.rejected.values()) {
+      withdrawn.push(...entry.probes)
+      restored.push(...entry.dropped)
+    }
+    for (const key of withdrawn) this.#lineages.delete(key)
+    for (const name of restored) this.#dropped.delete(name)
+    for (const key of wave.groups.keys()) this.#faulted.add(key)
+    this.#wave = null
     return {
-      probes: [
-        this.#stateGroup(properties.slice(0, middle)),
-        this.#stateGroup(properties.slice(middle)),
-      ],
+      probes: [],
       newlyDropped: [],
       unavailable: null,
+      fault: { kind: 'documents', retry: [...wave.groups.values()], withdrawn, restored },
     }
+  }
+
+  #retryOnly(kind: Fault['kind'], sub: PlannedSubscription): Rejection {
+    return {
+      probes: [],
+      newlyDropped: [],
+      unavailable: null,
+      fault: { kind, retry: [sub], withdrawn: [], restored: [] },
+    }
+  }
+
+  /**
+   * The search proper: split a group, or drop a property that is rejected
+   * alone, unless that completes a group whose every property was rejected.
+   */
+  #search(sub: PlannedSubscription, properties: readonly string[], now: number): Rejection {
+    const lineage = this.#lineageOf(sub.key, now)
+
+    if (properties.length === 1) {
+      const name = properties[0]!
+      if (lineage !== undefined) {
+        lineage.rejected.add(name)
+        lineage.lastAt = now
+        if (lineage.rejected.size === lineage.group.properties!.length) {
+          // Every property the group was made of has been rejected alone. That
+          // is not sixteen retired fields, it is something the group's query
+          // gets wrong; the ones already dropped on the way were not at fault.
+          const restored = [...lineage.rejected].filter((n) => n !== name)
+          for (const n of restored) this.#dropped.delete(n)
+          for (const [key, l] of [...this.#lineages]) if (l === lineage) this.#lineages.delete(key)
+          this.#exhausted.add(lineage.group.key)
+          return {
+            probes: [],
+            newlyDropped: [],
+            unavailable: null,
+            fault: { kind: 'group', retry: [lineage.group], withdrawn: [], restored },
+          }
+        }
+      }
+      this.#dropped.set(name, this.#dueAfterDrop(now))
+      return { probes: [], newlyDropped: [name], unavailable: null, fault: null }
+    }
+
+    const middle = Math.ceil(properties.length / 2)
+    const probes = [
+      this.#stateGroup(properties.slice(0, middle)),
+      this.#stateGroup(properties.slice(middle)),
+    ]
+    const search = lineage ?? { group: sub, rejected: new Set<string>(), lastAt: now }
+    search.lastAt = now
+    for (const probe of probes) this.#lineages.set(probe.key, search)
+    return { probes, newlyDropped: [], unavailable: null, fault: null }
+  }
+
+  /** The search this probe belongs to, unless it is old enough to be a different matter (see `LINEAGE_WINDOW_MS`). */
+  #lineageOf(key: string, now: number): Lineage | undefined {
+    const lineage = this.#lineages.get(key)
+    if (lineage === undefined) return undefined
+    if (now - lineage.lastAt > LINEAGE_WINDOW_MS) {
+      this.#lineages.delete(key)
+      return undefined
+    }
+    return lineage
+  }
+
+  /**
+   * When a property just found rejected is next tried: a day on, but never
+   * within a minute of the last one handed a time, so that properties found bad
+   * together are probed one by one over the following minutes and not in one
+   * burst a day later.
+   */
+  #dueAfterDrop(now: number): number {
+    const at = Math.max(now + REPROBE_INTERVAL_MS, this.#lastDueAt + REPROBE_SPACING_MS)
+    this.#lastDueAt = at
+    return at
   }
 
   /**
@@ -273,9 +537,10 @@ export class SubscriptionPlan {
 
   /**
    * The server completed this id, or errored it in a way that is not a
-   * validation failure. Returns the subscription to subscribe again after 30 s
-   * (through `activate`, which gives it a fresh id: the old one is spent), or
-   * null for an id the plan does not hold.
+   * validation failure. Returns the subscription to subscribe again, when the
+   * connector's per-subscription backoff says (through `activate`, which gives
+   * it a fresh id: the old one is spent), or null for an id the plan does not
+   * hold.
    */
   ended(id: string): PlannedSubscription | null {
     const sub = this.#live.get(id)
@@ -307,9 +572,11 @@ export class SubscriptionPlan {
   }
 
   /**
-   * What to try again, once per 24 h: each dropped property ALONE (§5.4, in
-   * case a field has come back, say for the R2) and each unavailable
-   * subscription as it was.
+   * What to try again, once per 24 h (a property read back at start: once, an
+   * hour after it, and then daily): each dropped property ALONE (§5.4, in case
+   * a field has come back, say for the R2) and each unavailable subscription as
+   * it was. The properties' times are spread, so a call returns one or two of
+   * them and not the list.
    *
    * Nothing in this interface says "accepted", only "rejected", so what is
    * handed out here is assumed to be accepted unless `rejected` says

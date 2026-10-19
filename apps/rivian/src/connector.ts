@@ -20,7 +20,7 @@ import type { Publisher } from './publisher.js'
 import { frameFor, type PublishQueue } from './queue.js'
 import { SocketOpenError, type CloseReason, type SocketLike, type openSocket } from './socket.js'
 import type { ConnectorStore } from './store.js'
-import { SubscriptionPlan, type PlannedSubscription } from './subscriptions.js'
+import { SubscriptionPlan, type Fault, type PlannedSubscription } from './subscriptions.js'
 
 /**
  * THE CONNECTOR: ONE RIVIAN SESSION, HELD OPEN, EVERYTHING IT SAYS PUBLISHED
@@ -146,11 +146,13 @@ const VIN_RETRY_MS = 60 * 60 * 1000
 
 /**
  * How often the plan is asked whether a dropped property or an unavailable
- * subscription is due for its daily retry. The plan holds the 24 h; this only
- * bounds how late the retry can be. An hour late on a day is not worth a
- * timer per property.
+ * subscription is due for its retry. The plan holds the times (a day, or an
+ * hour for what a restart read back, spread across the hour after); this only
+ * bounds how late a retry can be, and so how finely the spreading can show.
+ * Once an hour would hand over a whole hour's worth at one tick, which is the
+ * burst the spreading is there to prevent.
  */
-const REPROBE_CHECK_MS = 60 * 60 * 1000
+const REPROBE_CHECK_MS = 60 * 1000
 
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
@@ -310,6 +312,13 @@ export class Connector {
   #lastRenewAt = Number.NEGATIVE_INFINITY
   /** The publisher has reported the queue empty since the last frame was queued. */
   #queueEmpty = true
+
+  /**
+   * The timer of every subscription waiting to be subscribed (a bisection
+   * probe, an ended or refused subscription), by plan key, so that a probe the
+   * plan withdraws can be cancelled before it fires.
+   */
+  readonly #waiting = new Map<string, unknown>()
 
   /**
    * One backoff per subscription (by plan key) that the server has ended or
@@ -779,6 +788,9 @@ export class Connector {
     // and, if it was one of those named in `last_error`, takes it off the list.
     this.#subBackoffs.delete(sub.key)
     if (this.#refused.delete(sub.key)) this.#syncRefusal()
+    // A `vehicleState` frame also shows the documents are valid, which is what
+    // lets a rejection after a document fault be searched as a field again.
+    if (stream === 'state') this.#plan?.documentAccepted()
 
     // The first frame after a connect is what proves the connection works: an
     // ack on its own is not, since a server that acknowledges and closes in the
@@ -931,7 +943,11 @@ export class Connector {
       return
     }
 
-    const { probes, newlyDropped, unavailable } = plan.rejected(id, this.#deps.clock.now())
+    // A group that had been refused and is now being searched is no longer
+    // "refused": what is left to say about it is said about its halves.
+    if (known !== null && this.#refused.delete(known.key)) this.#syncRefusal()
+    const { probes, newlyDropped, unavailable, fault } = plan.rejected(id, this.#deps.clock.now())
+    if (fault !== null) this.#documentFault(fault)
     for (const probe of probes) this.#resubscribeLater(probe, BISECT_DELAY_MS)
     if (unavailable !== null) {
       this.#log(`subscription ${unavailable} is rejected and has nothing to bisect; trying again in a day`)
@@ -940,6 +956,30 @@ export class Connector {
       this.#log(`rivian rejects ${newlyDropped.join(', ')}; no longer subscribed`)
       this.#droppedChanged()
     }
+  }
+
+  /**
+   * The plan judged a rejection to be the document and not a field (design
+   * §5.4): nothing is dropped and nothing is searched. The groups it hands back
+   * are retried on their own backoff, like any refused subscription; probes it
+   * had already handed out for them are cancelled; and `last_error` says what
+   * is wrong, because a connector that is subscribed and silent about 135
+   * missing fields is exactly the failure this exists to make visible.
+   */
+  #documentFault(fault: Fault): void {
+    for (const key of fault.withdrawn) this.#cancelWaiting(key)
+    const line =
+      fault.kind === 'documents'
+        ? 'every vehicleState group refused: GRAPHQL_VALIDATION_FAILED'
+        : 'a vehicleState group refused on every property: GRAPHQL_VALIDATION_FAILED'
+    for (const sub of fault.retry) {
+      this.#refuse(sub, line)
+      const wait = this.#retryLater(sub)
+      this.#log(`subscription ${sub.key} was refused as a whole (${fault.kind}); trying again in ${seconds(wait)}`)
+    }
+    // Properties dropped on the way to this verdict are taken back, so the
+    // saved list shrinks, and the tape and the gauge say so.
+    if (fault.restored.length > 0) this.#droppedChanged()
   }
 
   /**
@@ -962,7 +1002,20 @@ export class Connector {
    * closed socket cancels every retry it was holding.
    */
   #resubscribeLater(sub: PlannedSubscription, wait: number): void {
-    this.#schedule(this.#connTimers, wait, () => this.#activate(sub))
+    const handle = this.#schedule(this.#connTimers, wait, () => {
+      this.#waiting.delete(sub.key)
+      this.#activate(sub)
+    })
+    this.#waiting.set(sub.key, handle)
+  }
+
+  /** Stop a subscription that is waiting to be subscribed, if it is. */
+  #cancelWaiting(key: string): void {
+    const handle = this.#waiting.get(key)
+    if (handle === undefined) return
+    this.#deps.clock.clearTimeout(handle)
+    this.#connTimers.delete(handle)
+    this.#waiting.delete(key)
   }
 
   /**
@@ -1021,7 +1074,7 @@ export class Connector {
   }
 
   /**
-   * Hand out whatever is due for its daily retry (design §5.4), each at once
+   * Hand out whatever is due for its retry (design §5.4), each at once
    * (a probe not subscribed is forgotten for a day, or for ever), and write the
    * list again, because handing a property out takes it off the list.
    */
@@ -1355,6 +1408,7 @@ export class Connector {
     this.#silenceTimer = null
     this.#renewTimer = null
     this.#live.clear()
+    this.#waiting.clear()
     this.#subBackoffs.clear()
     this.#refused.clear()
     this.#flowing = false

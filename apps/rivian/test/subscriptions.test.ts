@@ -9,7 +9,9 @@ import { SubscriptionPlan, type PlannedSubscription } from '../src/subscriptions
 
 const VEHICLE = 'veh-1'
 const NOW = Date.UTC(2026, 9, 19, 12)
-const DAY = 24 * 60 * 60 * 1000
+const MINUTE = 60 * 1000
+const HOUR = 60 * MINUTE
+const DAY = 24 * HOUR
 
 const OTHER_KEYS = ['parallax', 'charging', 'cloud', 'ota-state', 'ota-schedules', 'geofence', 'departure']
 
@@ -29,6 +31,9 @@ function planOf(
     now: over.now ?? NOW,
   })
 }
+
+/** What `rejected` answers when there is nothing to do. */
+const NOTHING = { probes: [], newlyDropped: [], unavailable: null, fault: null }
 
 const stateSubs = (subs: { sub: PlannedSubscription }[]): PlannedSubscription[] =>
   subs.map((s) => s.sub).filter((s) => s.stream === 'state')
@@ -289,7 +294,7 @@ describe('SubscriptionPlan.rejected: bisection (design §5.4)', () => {
     const plan = planOf(names)
     const lone = plan.initial().find((s) => s.sub.key === 'state:1')!
     expect(lone.sub.properties).toEqual([names[16]])
-    expect(plan.rejected(lone.id, NOW)).toEqual({ probes: [], newlyDropped: [names[16]], unavailable: null })
+    expect(plan.rejected(lone.id, NOW)).toEqual({ ...NOTHING, newlyDropped: [names[16]] })
     expect(plan.dropped).toEqual([names[16]])
     expect(plan.streamOf(lone.id)).toBeNull()
   })
@@ -305,18 +310,10 @@ describe('SubscriptionPlan.rejected: bisection (design §5.4)', () => {
     expect([...held].sort()).toEqual(names.filter((n) => !bad.has(n)).sort())
   })
 
-  it('drops all 16 when every one is bad, and then holds no state subscription', () => {
-    const names = props(16)
-    const plan = planOf(names)
-    const { live, newlyDropped } = bisect(plan, plan.initial(), new Set(names))
-    expect([...newlyDropped].sort()).toEqual([...names].sort())
-    expect([...live.values()].filter((s) => s.stream === 'state')).toEqual([])
-  })
-
   it('reports nothing for an id it does not hold, and changes nothing', () => {
     const plan = planOf(props(16))
     const before = plan.initial()
-    expect(plan.rejected('state:0#999', NOW)).toEqual({ probes: [], newlyDropped: [], unavailable: null })
+    expect(plan.rejected('state:0#999', NOW)).toEqual(NOTHING)
     expect(plan.dropped).toEqual([])
     expect(before.every((s) => plan.streamOf(s.id) !== null)).toBe(true)
   })
@@ -325,7 +322,7 @@ describe('SubscriptionPlan.rejected: bisection (design §5.4)', () => {
     const plan = planOf(props(16))
     const id = plan.initial().find((s) => s.sub.stream === 'state')!.id
     expect(plan.rejected(id, NOW).probes).toHaveLength(2)
-    expect(plan.rejected(id, NOW)).toEqual({ probes: [], newlyDropped: [], unavailable: null })
+    expect(plan.rejected(id, NOW)).toEqual(NOTHING)
   })
 
   it('keeps a dropped property out of every later initial() and renewal', () => {
@@ -350,7 +347,7 @@ describe('SubscriptionPlan.rejected: a subscription with no properties to bisect
   it('marks charging unavailable and returns no probes', () => {
     const plan = planOf(props(3))
     const charging = plan.initial().find((s) => s.sub.key === 'charging')!
-    expect(plan.rejected(charging.id, NOW)).toEqual({ probes: [], newlyDropped: [], unavailable: 'charging' })
+    expect(plan.rejected(charging.id, NOW)).toEqual({ ...NOTHING, unavailable: 'charging' })
     expect(plan.streamOf(charging.id)).toBeNull()
     expect(plan.dropped).toEqual([])
   })
@@ -359,7 +356,7 @@ describe('SubscriptionPlan.rejected: a subscription with no properties to bisect
     for (const key of OTHER_KEYS) {
       const plan = planOf(props(3))
       const sub = plan.initial().find((s) => s.sub.key === key)!
-      expect(plan.rejected(sub.id, NOW), key).toEqual({ probes: [], newlyDropped: [], unavailable: key })
+      expect(plan.rejected(sub.id, NOW), key).toEqual({ ...NOTHING, unavailable: key })
     }
   })
 
@@ -485,11 +482,11 @@ describe('SubscriptionPlan.dueForReprobe', () => {
     expect(plan.dueForReprobe(at + DAY)).toHaveLength(2)
   })
 
-  it('counts the first 24 h of a constructor-supplied dropped property from the time given', () => {
+  it('counts a constructor-supplied dropped property\'s first hour from the time given, not its first day', () => {
     const plan = planOf(props(2), { dropped: ['badOne'], now: NOW })
     expect(plan.dueForReprobe(NOW)).toEqual([])
-    expect(plan.dueForReprobe(NOW + DAY - 1)).toEqual([])
-    const due = plan.dueForReprobe(NOW + DAY)
+    expect(plan.dueForReprobe(NOW + HOUR - 1)).toEqual([])
+    const due = plan.dueForReprobe(NOW + HOUR)
     expect(due.map((s) => s.properties)).toEqual([['badOne']])
   })
 
@@ -571,5 +568,344 @@ describe('SubscriptionPlan.addProperties', () => {
     const plan = planOf(props(3))
     plan.addProperties(['newThing'])
     expect(stateSubs(plan.initial()).flatMap((s) => s.properties!)).toContain('newThing')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A fault in the documents is not a fault in a field (design §5.4)
+// ---------------------------------------------------------------------------
+
+/** Reject every id in `ids`, each `gapMs` after the last, and return what each rejection answered. */
+function rejectAll(plan: SubscriptionPlan, ids: string[], at = NOW, gapMs = 100) {
+  return ids.map((id, i) => plan.rejected(id, at + i * gapMs))
+}
+
+describe('SubscriptionPlan.rejected: when every state group of the first wave is rejected', () => {
+  /** 40 properties: groups of 16, 16 and 8. */
+  function threeGroups() {
+    const plan = planOf(props(40))
+    const initial = plan.initial()
+    const groups = initial.filter((s) => s.sub.stream === 'state')
+    return { plan, initial, groups }
+  }
+
+  it('bisects the early rejections as ever, and calls it a document fault on the last', () => {
+    const { plan, groups } = threeGroups()
+    const [first, second, last] = rejectAll(plan, groups.map((g) => g.id))
+
+    expect(first!.probes).toHaveLength(2)
+    expect(first!.fault).toBeNull()
+    expect(second!.probes).toHaveLength(2)
+    expect(second!.fault).toBeNull()
+
+    // The last rejection completes the wave: nothing is bisected for it, and
+    // every probe already handed out for the others is withdrawn.
+    expect(last!.probes).toEqual([])
+    expect(last!.newlyDropped).toEqual([])
+    expect(last!.fault).toMatchObject({ kind: 'documents' })
+    expect(last!.fault!.retry.map((s) => s.key)).toEqual(groups.map((g) => g.sub.key))
+    expect(last!.fault!.retry).toEqual(groups.map((g) => g.sub))
+    expect([...last!.fault!.withdrawn].sort()).toEqual(
+      [...first!.probes, ...second!.probes].map((p) => p.key).sort(),
+    )
+    expect(last!.fault!.restored).toEqual([])
+  })
+
+  it('drops nothing, however long it goes on', () => {
+    const { plan, groups } = threeGroups()
+    rejectAll(plan, groups.map((g) => g.id))
+    expect(plan.dropped).toEqual([])
+  })
+
+  it('does not search the group again when a retry of it is rejected again', () => {
+    const { plan, groups } = threeGroups()
+    const results = rejectAll(plan, groups.map((g) => g.id))
+    const retried = results.at(-1)!.fault!.retry[0]!
+
+    const again = plan.rejected(plan.activate(retried), NOW + HOUR)
+    expect(again.probes).toEqual([])
+    expect(again.newlyDropped).toEqual([])
+    expect(again.fault).toMatchObject({ kind: 'documents', retry: [retried], withdrawn: [], restored: [] })
+    expect(plan.dropped).toEqual([])
+  })
+
+  it('goes back to searching once a state frame shows the documents are fine', () => {
+    const { plan, groups } = threeGroups()
+    const retry = rejectAll(plan, groups.map((g) => g.id)).at(-1)!.fault!.retry
+    // One group's retry is accepted and a frame arrives; another is still refused.
+    plan.activate(retry[0]!)
+    plan.documentAccepted()
+
+    const genuine = plan.rejected(plan.activate(retry[1]!), NOW + HOUR)
+    expect(genuine.fault).toBeNull()
+    expect(genuine.probes).toHaveLength(2)
+  })
+
+  it('is not a document fault when a state frame has arrived in the meantime: some group is accepted', () => {
+    const { plan, groups } = threeGroups()
+    const first = plan.rejected(groups[0]!.id, NOW)
+    expect(first.probes).toHaveLength(2)
+    plan.documentAccepted()
+
+    const second = plan.rejected(groups[1]!.id, NOW + 100)
+    const third = plan.rejected(groups[2]!.id, NOW + 200)
+    expect(second.fault).toBeNull()
+    expect(third.fault).toBeNull()
+    expect(third.probes).toHaveLength(2)
+  })
+
+  it('is not a document fault when one group is not rejected: that one bad field is bisected', () => {
+    const { plan, groups } = threeGroups()
+    const results = rejectAll(plan, groups.slice(0, 2).map((g) => g.id))
+    expect(results.every((r) => r.fault === null)).toBe(true)
+    expect(results.every((r) => r.probes.length === 2)).toBe(true)
+  })
+
+  it('is not one wave if the rejections are more than 20 s apart', () => {
+    const { plan, groups } = threeGroups()
+    const results = rejectAll(plan, groups.map((g) => g.id), NOW, 21_000)
+    expect(results.map((r) => r.fault)).toEqual([null, null, null])
+    expect(results.map((r) => r.probes.length)).toEqual([2, 2, 2])
+  })
+
+  it('needs at least two groups: a lone group that is rejected is bisected', () => {
+    const plan = planOf(props(16))
+    const id = plan.initial().find((s) => s.sub.stream === 'state')!.id
+    const result = plan.rejected(id, NOW)
+    expect(result.fault).toBeNull()
+    expect(result.probes).toHaveLength(2)
+  })
+
+  it('takes a property back that a one-property group lost before the wave was complete', () => {
+    // 17 properties: a group of 16 and a group of one. The lone one is dropped
+    // at once, as a lone rejected property is; the wave then completes, and the
+    // drop is undone because it was a document fault, not that property.
+    const names = props(17)
+    const plan = planOf(names)
+    const [big, lone] = plan.initial().filter((s) => s.sub.stream === 'state')
+
+    const dropped = plan.rejected(lone!.id, NOW)
+    expect(dropped.newlyDropped).toEqual([names[16]])
+    expect(plan.dropped).toEqual([names[16]])
+
+    const last = plan.rejected(big!.id, NOW + 100)
+    expect(last.fault).toMatchObject({ kind: 'documents', restored: [names[16]] })
+    expect(last.fault!.retry.map((s) => s.key)).toEqual(['state:0', 'state:1'])
+    expect(plan.dropped).toEqual([])
+    expect(stateSubs(plan.initial()).flatMap((s) => s.properties!)).toContain(names[16])
+  })
+
+  it('starts again with a new wave when initial() does', () => {
+    const { plan, groups } = threeGroups()
+    rejectAll(plan, groups.map((g) => g.id))
+
+    const again = plan.initial().filter((s) => s.sub.stream === 'state')
+    const first = plan.rejected(again[0]!.id, NOW + DAY)
+    // No leftover verdict: it is a rejection, and it is searched.
+    expect(first.fault).toBeNull()
+    expect(first.probes).toHaveLength(2)
+  })
+})
+
+describe('SubscriptionPlan.rejected: when every property of a group is rejected', () => {
+  /** Reject whatever is live and made only of `bad` properties, and keep going. Returns the faults seen. */
+  function exhaust(plan: SubscriptionPlan, initial: { id: string; sub: PlannedSubscription }[], bad: ReadonlySet<string>) {
+    const live = new Map<string, PlannedSubscription>()
+    for (const { id, sub } of initial) live.set(id, sub)
+    const faults: NonNullable<ReturnType<SubscriptionPlan['rejected']>['fault']>[] = []
+    let rejections = 0
+    let at = NOW
+    for (;;) {
+      const next = [...live].find(
+        ([, sub]) => sub.stream === 'state' && sub.properties!.some((p) => bad.has(p)),
+      )
+      if (next === undefined) break
+      live.delete(next[0])
+      rejections += 1
+      const result = plan.rejected(next[0], at)
+      at += 30_000
+      if (result.fault !== null) faults.push(result.fault)
+      for (const probe of result.probes) live.set(plan.activate(probe), probe)
+    }
+    return { live, faults, rejections }
+  }
+
+  it('restores the original group, drops nothing, and hands it back to retry', () => {
+    const names = props(16)
+    const plan = planOf(names)
+    const initial = plan.initial()
+    const original = stateSubs(initial)[0]!
+
+    const { faults, rejections } = exhaust(plan, initial, new Set(names))
+
+    // 16 bad leaves means 1 + 2 + 4 + 8 + 16 rejections, and then it stops.
+    expect(rejections).toBe(31)
+    expect(faults).toHaveLength(1)
+    expect(faults[0]).toMatchObject({ kind: 'group', withdrawn: [] })
+    expect(faults[0]!.retry).toEqual([original])
+    // The 15 leaves rejected before the last were dropped as they were found;
+    // finding the last takes them back.
+    expect(new Set(faults[0]!.restored).size).toBe(15)
+    for (const name of faults[0]!.restored) expect(names).toContain(name)
+    expect(plan.dropped).toEqual([])
+  })
+
+  it('has the restored group in the next initial(), whole', () => {
+    const names = props(16)
+    const plan = planOf(names)
+    exhaust(plan, plan.initial(), new Set(names))
+    const [group] = stateSubs(plan.initial())
+    expect(group!.properties).toEqual(names)
+  })
+
+  it('does not search the restored group again when a retry of it is rejected', () => {
+    const names = props(16)
+    const plan = planOf(names)
+    const initial = plan.initial()
+    const { faults } = exhaust(plan, initial, new Set(names))
+
+    const retried = faults[0]!.retry[0]!
+    const id = plan.activate(retried)
+    const again = plan.rejected(id, NOW + HOUR)
+    expect(again.probes).toEqual([])
+    expect(again.newlyDropped).toEqual([])
+    expect(again.fault).toMatchObject({ kind: 'group', retry: [retried], withdrawn: [], restored: [] })
+
+    // Not even after a state frame: that is about the documents, and this group
+    // has shown that its own properties are the trouble.
+    plan.documentAccepted()
+    const third = plan.rejected(plan.activate(retried), NOW + 2 * HOUR)
+    expect(third.fault).toMatchObject({ kind: 'group' })
+    expect(third.probes).toEqual([])
+  })
+
+  it('does not apply when even one property of the group is accepted: the rest are dropped', () => {
+    const names = props(16)
+    const plan = planOf(names)
+    const bad = new Set(names.slice(1))
+    const { faults, live } = exhaust(plan, plan.initial(), bad)
+
+    expect(faults).toEqual([])
+    expect([...plan.dropped].sort()).toEqual([...bad].sort())
+    expect([...live.values()].flatMap((s) => s.properties ?? [])).toEqual([names[0]])
+  })
+
+  it('does not apply to a group of one: a lone property that is rejected is the bad field', () => {
+    const plan = planOf(['onlyOne'])
+    const id = plan.initial().find((s) => s.sub.stream === 'state')!.id
+    expect(plan.rejected(id, NOW)).toEqual({ ...NOTHING, newlyDropped: ['onlyOne'] })
+  })
+
+  it('counts only rejections of one search: leaves rejected long apart are not one group', () => {
+    // [a b c d] splits into [a b] and [c d]. a and b are found at once. [c d]
+    // is accepted, and a day later it is rejected: that is a new group, not the
+    // rest of the old search, so a and b are not taken back.
+    const plan = planOf(['a', 'b', 'c', 'd'])
+    const root = plan.initial().find((s) => s.sub.stream === 'state')!
+    const [ab, cd] = plan.rejected(root.id, NOW).probes
+    const abId = plan.activate(ab!)
+    const cdId = plan.activate(cd!)
+    const [a, b] = plan.rejected(abId, NOW).probes
+    expect(plan.rejected(plan.activate(a!), NOW).newlyDropped).toEqual(['a'])
+    expect(plan.rejected(plan.activate(b!), NOW).newlyDropped).toEqual(['b'])
+    expect(plan.dropped).toEqual(['a', 'b'])
+
+    const later = NOW + DAY
+    const [c, d] = plan.rejected(cdId, later).probes
+    expect(plan.rejected(plan.activate(c!), later).newlyDropped).toEqual(['c'])
+    const last = plan.rejected(plan.activate(d!), later)
+
+    // [c d] itself was wholly rejected, and is restored; a and b are not.
+    expect(last.fault).toMatchObject({ kind: 'group', restored: ['c'] })
+    expect(last.fault!.retry[0]!.properties).toEqual(['c', 'd'])
+    expect(plan.dropped).toEqual(['a', 'b'])
+  })
+
+  it('starts again with initial()', () => {
+    const names = props(16)
+    const plan = planOf(names)
+    exhaust(plan, plan.initial(), new Set(names))
+
+    const id = plan.initial().find((s) => s.sub.stream === 'state')!.id
+    const result = plan.rejected(id, NOW + DAY)
+    expect(result.fault).toBeNull()
+    expect(result.probes).toHaveLength(2)
+  })
+})
+
+describe('SubscriptionPlan: reprobing what a restart read back as dropped (design §5.4)', () => {
+  const saved = (n: number) => Array.from({ length: n }, (_, i) => `saved${String(i).padStart(3, '0')}`)
+
+  it('waits an hour, not a day, and is not due at any moment before it', () => {
+    const plan = planOf(props(2), { dropped: saved(60) })
+    for (const at of [0, 1, MINUTE, 30 * MINUTE, HOUR - 1]) {
+      expect(plan.dueForReprobe(NOW + at), String(at)).toEqual([])
+    }
+    expect(plan.dueForReprobe(NOW + HOUR)).toHaveLength(1)
+  })
+
+  it('spreads them across the hour after that, and everything is out by two hours', () => {
+    const names = saved(60)
+    const plan = planOf(props(2), { dropped: names })
+    const probed: string[] = []
+    const perMinute: number[] = []
+    for (let minute = 0; minute <= 120; minute += 1) {
+      const due = plan.dueForReprobe(NOW + minute * MINUTE)
+      if (minute < 60) expect(due, `minute ${minute}`).toEqual([])
+      perMinute.push(due.length)
+      probed.push(...due.flatMap((s) => s.properties!))
+    }
+    expect([...probed].sort()).toEqual([...names].sort())
+    // Not all in one tick: 60 over an hour is one a minute.
+    expect(Math.max(...perMinute)).toBeLessThanOrEqual(1)
+    expect(perMinute.slice(60, 120).filter((n) => n > 0).length).toBeGreaterThanOrEqual(59)
+  })
+
+  it('spreads a long list at least as fine as one every thirty seconds', () => {
+    const names = saved(135)
+    const plan = planOf(props(2), { dropped: names })
+    let total = 0
+    for (let minute = 60; minute <= 120; minute += 1) {
+      const due = plan.dueForReprobe(NOW + minute * MINUTE)
+      expect(due.length, `minute ${minute}`).toBeLessThanOrEqual(3)
+      total += due.length
+    }
+    expect(total).toBe(135)
+  })
+
+  it('keeps a lone name\'s hour, whatever else is in the list', () => {
+    const plan = planOf(props(2), { dropped: ['lone'] })
+    expect(plan.dueForReprobe(NOW + HOUR - 1)).toEqual([])
+    expect(plan.dueForReprobe(NOW + HOUR).map((s) => s.properties)).toEqual([['lone']])
+  })
+
+  it('counts each name once: a repeat and a name that is not a GraphQL name take no slot', () => {
+    const plan = planOf(props(2), { dropped: ['x', 'x', 'not a name', 'y'] })
+    const due = plan.dueForReprobe(NOW + 2 * HOUR)
+    expect(due.map((s) => s.properties)).toEqual([['x'], ['y']])
+  })
+
+  it('goes back to a day for a name that is rejected again', () => {
+    const plan = planOf(props(2), { dropped: ['x'] })
+    const [probe] = plan.dueForReprobe(NOW + HOUR)
+    const at = NOW + HOUR
+    expect(plan.rejected(plan.activate(probe!), at).newlyDropped).toEqual(['x'])
+    expect(plan.dueForReprobe(at + DAY - 1)).toEqual([])
+    expect(plan.dueForReprobe(at + DAY)).toHaveLength(1)
+  })
+
+  it('keeps properties found bad together from all coming due in the same tick', () => {
+    // Eight of sixteen found bad in one search drop at the same moment; a day
+    // later they must not be eight probes at once.
+    const names = props(16)
+    const plan = planOf(names)
+    const bad = new Set(names.filter((_, i) => i % 2 === 0))
+    const initial = plan.initial()
+    bisect(plan, initial, bad)
+    expect(plan.dropped).toHaveLength(8)
+
+    const due = [NOW + DAY - 1, NOW + DAY, NOW + DAY + MINUTE].map((at) => plan.dueForReprobe(at).length)
+    expect(due).toEqual([0, 1, 1])
+    expect(plan.dueForReprobe(NOW + DAY + 8 * MINUTE)).toHaveLength(6)
   })
 })
