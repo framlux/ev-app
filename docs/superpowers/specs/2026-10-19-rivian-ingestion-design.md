@@ -476,7 +476,7 @@ A subscribe re-sends current values, which may be hours old (§2.3). Stamped wit
 **`state`.** For each property in `body.data.vehicleState`:
 - **Absent, or the property object is `null`:** nothing (unchanged, per §2.3).
 - **Present in the catalogue:**
-  - A `value` of `null`, or one of the placeholders `fault`, `signal_not_available` or `undefined`: nothing, so the previous value carries.
+  - A `value` of `null`, or one of the placeholders `fault`, `signal_not_available` or `undefined`: nothing, so the previous value carries. The one exception is `gearStatus`, where a placeholder is an explicit null gear (§7.5), so a carried `D` can't hold a drive open.
   - A value the decoder can't vouch for: nothing.
   - Otherwise, slots plus `observedAt` (§6.4).
   - Numbers accept numeric strings and refuse `''`, NaN and Infinity, as Tesla's decoder does.
