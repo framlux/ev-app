@@ -170,6 +170,35 @@ describe('delivery', () => {
     expect(h.store.writes.at(-1)!.rivianVehicleId).toBe('rv-9')
   })
 
+  it('an hourly retry that is refused as unauthenticated twice means unauthenticated', async () => {
+    h = await makeHarness()
+    h.gateway.script(
+      'userInfo',
+      userInfoWith([{ id: 'other-1', vin: 'SOMEONEELSESVIN123' }]),
+      unauthenticated(),
+    )
+    await h.signIn()
+    h.connector.start()
+    await h.until(() => h.connector.state === 'waiting_for_vehicle', 'waiting_for_vehicle')
+    await settle()
+    expect(h.gateway.calls).toMatchObject({ createCsrf: 1, userInfo: 1 })
+
+    await h.clock.tick(HOUR)
+
+    // The retry, one fresh app session, the retry's retry: then it stops.
+    expect(h.connector.state).toBe('unauthenticated')
+    expect(h.gateway.calls).toMatchObject({ createCsrf: 2, userInfo: 3 })
+    expect(h.store.writes.at(-1)).toMatchObject({
+      state: 'unauthenticated',
+      lastError: 'Rivian rejected the session',
+    })
+    expect(h.fake.opens).toHaveLength(0)
+
+    await h.clock.tick(3 * HOUR)
+    expect(h.gateway.calls).toMatchObject({ createCsrf: 2, userInfo: 3 })
+    expect(h.connector.state).toBe('unauthenticated')
+  })
+
   it('matches the VIN as Rivian spells it, whatever the case of the configured one', async () => {
     h = await makeHarness()
     h.gateway.script('userInfo', userInfoWith([{ id: 'rv-1', vin: VIN.toLowerCase() }]))
@@ -204,6 +233,43 @@ describe('credential', () => {
     await h.until(() => h.connector.state === 'subscribed', 'subscribed')
     expect(h.fake.opens).toHaveLength(1)
     expect(h.store.writes.at(-1)!.lastError).toBeNull()
+  })
+})
+
+describe('signing in again', () => {
+  const SECOND_TOKEN = 'tok-SECOND-userSession-9876543210'
+
+  it('a changed stamp while subscribed closes the live socket, and the new one carries the new token', async () => {
+    h = await makeHarness()
+    await h.connect()
+    const first = h.socket
+    const staleId = first.idFor('cloud')
+    expect(h.fake.opens[0]!.initPayload['u-sess']).toBe(TOKEN)
+
+    await h.signIn(SECOND_TOKEN)
+    await h.clock.tick(POLL)
+    await h.until(
+      () => h.fake.opens.length === 2 && h.connector.state === 'subscribed',
+      'the second connection',
+    )
+    await settle()
+
+    // Exactly one more socket, the old one closed, the new one on the new session.
+    expect(first.closed).toBe(true)
+    expect(h.fake.sockets).toHaveLength(2)
+    expect(h.socket).not.toBe(first)
+    expect(h.socket.closed).toBe(false)
+    expect(h.fake.opens[1]!.initPayload['u-sess']).toBe(SECOND_TOKEN)
+    expect(h.socket.subscribes).toHaveLength(INITIAL_SUBSCRIPTIONS)
+    // Every call made since the restart used the new token, and no call made
+    // before it used the new one.
+    expect(h.gateway.tokens.at(-1)).toBe(SECOND_TOKEN)
+    expect(h.gateway.tokens.indexOf(SECOND_TOKEN)).toBeGreaterThan(h.gateway.tokens.lastIndexOf(TOKEN))
+    // It was a restart, not a failure: no backoff, and the old socket is not heard from again.
+    expect(h.metrics.reconnects).toEqual([])
+    first.handlers.onNext(staleId, { data: {} })
+    await settle()
+    expect(h.frames('cloud')).toHaveLength(0)
   })
 })
 
@@ -251,6 +317,7 @@ describe('postgres blips (review focus 3)', () => {
   it('a poll that never answers counts as a failure after 10 s, and the next poll still runs', async () => {
     h = await makeHarness()
     await h.connect()
+    const socket = h.socket
     const polls = h.store.calls.stamp
 
     h.store.stampHangs = true
@@ -265,6 +332,12 @@ describe('postgres blips (review focus 3)', () => {
     await h.clock.tick(POLL)
     expect(h.store.calls.stamp).toBe(polls + 2)
     expect(h.connector.state).toBe('subscribed')
+
+    // Review focus 3: through all of it the Rivian socket was never touched.
+    expect(h.fake.opens).toHaveLength(1)
+    expect(h.fake.sockets).toEqual([socket])
+    expect(socket.closed).toBe(false)
+    expect(socket.completes).toEqual([])
   })
 
   it('a status write that throws does not change state or close the socket', async () => {
@@ -272,15 +345,25 @@ describe('postgres blips (review focus 3)', () => {
     h.store.writeFails = true
     await h.connect()
 
+    const socket = h.socket
     expect(h.connector.state).toBe('subscribed')
     expect(h.store.calls.write).toBeGreaterThan(0)
-    expect(h.socket.closed).toBe(false)
+    expect(socket.closed).toBe(false)
 
     // Frames are still taken and published.
     await h.next('cloud', { data: { vehicleCloudConnection: { isOnline: true } } })
     expect(h.frames('cloud')).toHaveLength(1)
     expect(h.logs.some((l) => l.includes('status write failed'))).toBe(true)
     expect(h.logs.join('\n')).not.toContain('db-password-xyz')
+
+    // Review focus 3: failing writes, through a minute of silence and a state
+    // change's worth of retries, never cost the socket or a reconnect.
+    await h.clock.tick(30 * SECOND)
+    expect(h.connector.state).toBe('subscribed')
+    expect(h.fake.opens).toHaveLength(1)
+    expect(h.fake.sockets).toEqual([socket])
+    expect(socket.closed).toBe(false)
+    expect(socket.completes).toEqual([])
 
     // The write that failed is made again with the next change.
     h.store.writeFails = false
@@ -750,6 +833,56 @@ describe('restart', () => {
     }
 
     expect(h.store.writes.at(-1)!.droppedProperties).toEqual(['batteryLevel', bad])
+  })
+})
+
+describe('a saved list that is read late, after the connector has learned some of its own', () => {
+  it('is merged with what the connector learned before a sign-out, not substituted for it', async () => {
+    h = await makeHarness()
+    h.store.statusRow = {
+      state: 'subscribed',
+      vin: VIN,
+      rivianVehicleId: 'rv-1',
+      lastFrameAt: null,
+      lastError: null,
+      backoffUntil: null,
+      droppedProperties: ['batteryLevel'],
+      updatedAt: new Date(START),
+    }
+    h.store.statusReadFails = true
+    await h.connect()
+
+    // Rivian rejects one property, which is found while the saved list is unreadable.
+    const bad = RIVIAN_PROPERTIES[0]!.name
+    for (let rejection = 0; rejection < 5; rejection += 1) {
+      h.socket.reject(h.socket.subscribeFor(bad)!.id)
+      await h.clock.tick(30 * SECOND)
+    }
+    expect(liveStateProperties(h.socket)).not.toContain(bad)
+
+    // The user signs out. The plan is gone; what it had learned is the connector's alone.
+    h.store.stamp = null
+    await h.clock.tick(POLL)
+    expect(h.connector.state).toBe('signed_out')
+    expect(h.store.writes).toEqual([])
+
+    // The database comes back, and the user signs in again: the saved list is
+    // read at last, with no plan to carry it, and joins what was learned.
+    h.store.statusReadFails = false
+    await h.signIn()
+    await h.clock.tick(POLL)
+    await h.until(() => h.connector.state === 'subscribed', 'subscribed')
+    await settle()
+
+    expect(h.store.writes.length).toBeGreaterThan(0)
+    for (const row of h.store.writes) {
+      expect(row.droppedProperties).toEqual(['batteryLevel', bad])
+    }
+    // And neither is subscribed again by the new plan.
+    const asked = liveStateProperties(h.socket)
+    expect(asked).not.toContain(bad)
+    expect(asked).not.toContain('batteryLevel')
+    expect(asked).toHaveLength(RIVIAN_PROPERTIES.length - 2)
   })
 })
 

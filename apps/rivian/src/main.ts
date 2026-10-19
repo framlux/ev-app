@@ -13,6 +13,9 @@ import { PublishQueue } from './queue.js'
 import { openSocket } from './socket.js'
 import { pgConnectorStore } from './store.js'
 
+/** The longest shutdown waits for the connection pool to close before it exits anyway. */
+const POOL_CLOSE_WAIT_MS = 3_000
+
 /**
  * The connector's entrypoint: wire the parts together, start them, and see
  * that they stop cleanly.
@@ -71,7 +74,17 @@ async function main(): Promise<void> {
       console.error('shutdown failed', err instanceof Error ? err.name : 'error')
     }
     metricsServer.close()
-    await closePool().catch(() => undefined)
+    // Raced against a short wait, not simply awaited. A database call that the
+    // connector gave up on (`#withinTimeout`) is still running, and still holds
+    // its client; `pool.end()` waits for every client to be released, so against
+    // a Postgres that has stopped answering it can wait for ever. Shutdown has
+    // already spent its drain on the broker, the orchestrator's grace period is
+    // running, and a pool that will not close is no reason to be killed halfway
+    // through it.
+    await Promise.race([
+      closePool().catch(() => undefined),
+      new Promise<void>((resolve) => setTimeout(resolve, POOL_CLOSE_WAIT_MS)),
+    ])
     // exit(), not a return. The MQTT end that `stop()` waits for is graceful,
     // and a graceful end may not destroy the stream: a broker that has gone
     // quiet leaves a socket that holds the event loop open, and the pod would

@@ -1145,7 +1145,12 @@ export class Connector {
     if (this.#loaded) return
     this.#loaded = true
     const saved = row?.droppedProperties ?? []
-    if (this.#plan === null) this.#dropped = unique(saved)
+    // Merged, never replaced, in both branches. With no plan the connector's
+    // own list can already hold names: a plan that ran before a sign-out
+    // handed its dropped list over in `#halt`, and the read that failed was
+    // made while that list was the only copy of what Rivian had rejected. The
+    // saved names go in front, as they do in `#droppedForRow`.
+    if (this.#plan === null) this.#dropped = unique([...saved, ...this.#dropped])
     else this.#carried = unique(saved)
     this.#lastFrameAt ??= row?.lastFrameAt ?? null
     this.#deps.metrics.droppedProperties(this.#droppedForRow().length)
