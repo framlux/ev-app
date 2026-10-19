@@ -1,0 +1,452 @@
+import { describe, expect, it } from 'vitest'
+import type { RawMessage } from '@ev/core'
+import { profileFor } from '../src/deps.js'
+import { Pipeline } from '../src/pipeline.js'
+import { rivianProfile } from '../src/profiles/rivian.js'
+import { STALE_VALUE_MS, VOLATILE_STALE_MS } from '../src/timing.js'
+// The synthetic envelopes Task 5's decoder tests are written from. Reaching into
+// another package's test directory is deliberate: one set of hand-written
+// frames, so a shape corrected there is corrected here (spec §10.1).
+import { stateEnvelope, tv } from '../../../packages/rivian/test/fixtures/state.js'
+import { FakeDb, openSessions } from './support/fake-db.js'
+
+// Every frame here is SYNTHETIC, like the fixtures they build on (spec §8.4):
+// what these tests pin is the wiring from a taped envelope to a sample and a
+// session, not what a real R2 sends.
+
+const OPTS = { usableCapacityKwh: 80 }
+const VEHICLE = 'r2'
+const VIN = 'VIN1'
+const DAY = '2026-10-19'
+const SEC = 1000
+const MIN = 60 * SEC
+const HOUR = 60 * MIN
+
+/** Epoch ms of a UTC time of day on the test day. */
+const ms = (hms: string) => Date.parse(`${DAY}T${hms}.000Z`)
+const iso = (epochMs: number) => new Date(epochMs).toISOString()
+const date = (epochMs: number) => new Date(epochMs)
+
+/** A taped message, as the Rivian worker writes it: the envelope, stamped with its own `receivedAt`. */
+function tape(envelope: { receivedAt: string; [key: string]: unknown }): RawMessage {
+  return {
+    vehicleId: VEHICLE,
+    vendor: 'rivian',
+    receivedAt: new Date(envelope.receivedAt),
+    source: 'graphql_ws',
+    payload: envelope,
+  }
+}
+
+/**
+ * A `vehicleState` frame arriving at `arrival`.
+ *
+ * `values` are stamped with the frame's own arrival, which is what a live push
+ * looks like. `stamped` is for properties that already carry a `timeStamp` of
+ * their own (the shape a resubscribe snapshot has), built with `tv` or by hand.
+ */
+function stateFrame(
+  arrival: number,
+  values: Record<string, unknown> = {},
+  stamped: Record<string, unknown> = {},
+): RawMessage {
+  const props: Record<string, unknown> = {}
+  for (const [name, value] of Object.entries(values)) props[name] = tv(iso(arrival), value)
+  return tape(stateEnvelope(iso(arrival), { ...props, ...stamped }))
+}
+
+/** A `gnssLocation`, which is a struct rather than a `value`. */
+const location = (arrival: number, latitude: number, longitude: number) => ({
+  timeStamp: iso(arrival), latitude, longitude, isAuthorized: true,
+})
+
+/** A `chargingSession` frame: its `liveData` carries no timestamps of its own. */
+function chargingFrame(arrival: number, liveData: Record<string, unknown>): RawMessage {
+  return tape({
+    v: 1,
+    stream: 'charging',
+    vin: VIN,
+    receivedAt: iso(arrival),
+    body: { data: { chargingSession: { liveData } } },
+  })
+}
+
+function otherFrame(stream: string, arrival: number, body: unknown): RawMessage {
+  return tape({ v: 1, stream, vin: VIN, receivedAt: iso(arrival), body })
+}
+
+async function feed(pipeline: Pipeline, frames: readonly RawMessage[]): Promise<void> {
+  for (const frame of frames) await pipeline.handle(frame)
+}
+
+/** Emit whatever is still accumulating, as the worker does at shutdown. */
+const finish = (pipeline: Pipeline, at: string) => pipeline.flush(date(ms(at)), true)
+
+function setup() {
+  const db = new FakeDb()
+  return { db, pipeline: new Pipeline(rivianProfile, db, OPTS) }
+}
+
+const sessionsOf = (db: FakeDb, kind: 'drive' | 'charge') =>
+  db.state.sessions.filter((s) => s.kind === kind)
+
+/** The emitted sample stamped exactly `epochMs`. */
+function sampleAt(db: FakeDb, epochMs: number) {
+  const sample = db.state.samples.find((s) => s.ts.getTime() === epochMs)
+  if (!sample) throw new Error(`no sample at ${iso(epochMs)}`)
+  return sample
+}
+
+describe('the Rivian profile', () => {
+  it('is what profileFor returns for rivian', () => {
+    expect(profileFor('rivian')).toBe(rivianProfile)
+    expect(rivianProfile.vendor).toBe('rivian')
+  })
+
+  it('gives speed, heading and charge power the short window and everything else the long one', () => {
+    for (const slot of ['speedKph', 'gpsHeading', 'chargePowerKw']) {
+      expect(rivianProfile.staleWindowFor(slot)).toBe(VOLATILE_STALE_MS)
+    }
+    // Position and gear are levels here: a parked car is where it parked and in
+    // the gear it left (spec §7.6). The Tesla profile has to carve these out of
+    // its drive tier; Rivian has no such tier to carve them from.
+    for (const slot of ['lat', 'lon', 'gear', 'socPct', 'chargerState', 'odometerKm']) {
+      expect(rivianProfile.staleWindowFor(slot)).toBe(STALE_VALUE_MS)
+    }
+  })
+
+  it('names the charge slots of spec §7.4', () => {
+    expect([...rivianProfile.chargeStateSlots]).toEqual(['chargerState', 'chargerStatus'])
+    expect([...rivianProfile.chargingPowerSlots]).toEqual(['chargePowerKw'])
+    expect([...rivianProfile.chargingEnergySlots]).toEqual(['chargeEnergyAddedKwh'])
+  })
+
+  it('refuses another vendor\'s message', () => {
+    const frame = stateFrame(ms('10:00:00'), { batteryLevel: 80 })
+    expect(rivianProfile.decode({ ...frame, vendor: 'tesla' })).toBeNull()
+  })
+
+  it('decodes a frame to slots with the vehicle\'s own observation times', () => {
+    const decoded = rivianProfile.decode(stateFrame(ms('10:00:00'), { batteryLevel: 80 }))
+    expect(decoded?.slots).toEqual({ socPct: 80 })
+    expect(decoded?.observedAt).toEqual({ socPct: ms('10:00:00') })
+    expect(decoded?.untimed).toBe(0)
+  })
+})
+
+describe('Pipeline with the Rivian profile: a drive', () => {
+  /** The mileage the first frame in drive reports, in metres. */
+  const FIRST_DRIVE_MILEAGE_M = 1_000_100
+  /** The last frame in drive: 119 frames, 100 m apart. */
+  const LAST_DRIVE_MILEAGE_M = 1_011_900
+
+  function driveFrames(): RawMessage[] {
+    const frames = [
+      stateFrame(ms('10:00:00'), {
+        gearStatus: 'park', gnssSpeed: 0, batteryLevel: 80, vehicleMileage: 1_000_000, powerState: 'go',
+      }),
+    ]
+    // 10:00:10 to 10:10:00, every 5 s: 20 m/s covers the 100 m between frames.
+    let i = 0
+    for (let at = ms('10:00:10'); at <= ms('10:10:00'); at += 5 * SEC) {
+      i++
+      frames.push(stateFrame(
+        at,
+        {
+          gearStatus: 'drive',
+          gnssSpeed: 20,
+          vehicleMileage: 1_000_000 + 100 * i,
+          // The pack reports a change a minute: 80 down to 75.5 over the drive.
+          ...(i % 12 === 1 ? { batteryLevel: 80 - ((i - 1) / 12) * 0.5 } : {}),
+        },
+        { gnssLocation: location(at, 47.6 + 0.0005 * i, -122.33) },
+      ))
+    }
+    frames.push(stateFrame(ms('10:10:05'), { gearStatus: 'park', gnssSpeed: 0 }))
+    for (let at = ms('10:10:35'); at <= ms('10:17:00'); at += 30 * SEC) {
+      frames.push(stateFrame(at, { gearStatus: 'park', gnssSpeed: 0 }))
+    }
+    return frames
+  }
+
+  it('writes exactly one drive, measured from the odometer and the pack', async () => {
+    const { db, pipeline } = setup()
+    await feed(pipeline, driveFrames())
+    await finish(pipeline, '10:30:00')
+
+    const drives = sessionsOf(db, 'drive')
+    expect(drives).toHaveLength(1)
+    const drive = drives[0]!
+    expect(drive.isOpen).toBe(false)
+    expect(drive.startedAt).toEqual(date(ms('10:00:10')))
+
+    const summary = drive.summary!
+    // From the first moving sample's odometer to the last: the 100 m a frame
+    // for 118 frames, in kilometres. The parked frame before it is not part of it.
+    expect(summary.distanceKm).toBeCloseTo((LAST_DRIVE_MILEAGE_M - FIRST_DRIVE_MILEAGE_M) / 1000, 3)
+    expect(summary.endSocPct).toBe(75.5)
+    // The SoC delta against the usable capacity the Pipeline was given (80 kWh).
+    expect(summary.energyKwh).toBeCloseTo(((80 - summary.endSocPct!) / 100) * 80, 3)
+    expect(summary.energyKwh).toBeCloseTo(3.6, 3)
+
+    expect(sessionsOf(db, 'charge')).toEqual([])
+    expect(openSessions(db)).toEqual([])
+  })
+
+  it('reads speed in kilometres an hour and the gear as its letter on the way', async () => {
+    const { db, pipeline } = setup()
+    await feed(pipeline, driveFrames())
+    await finish(pipeline, '10:30:00')
+
+    const moving = sampleAt(db, ms('10:05:00'))
+    expect(moving.speedKph).toBeCloseTo(72, 6)
+    expect(moving.gear).toBe('D')
+    expect(moving.powerState).toBe('online')
+    // The 59th frame in drive: 100 m a frame from 1000.0 km.
+    expect(moving.odometerKm).toBeCloseTo(1005.9, 6)
+
+    const parked = sampleAt(db, ms('10:10:35'))
+    expect(parked.speedKph).toBe(0)
+    expect(parked.gear).toBe('P')
+  })
+})
+
+describe('Pipeline with the Rivian profile: a charge', () => {
+  /** 25 charging frames, 5 minutes apart, the counter climbing from 0 to 10 kWh over 2 h. */
+  function chargeFrames(): RawMessage[] {
+    const frames = [
+      stateFrame(ms('11:00:00'), {
+        chargerStatus: 'chrgr_sts_connected_charging', chargerState: 'charging_connecting',
+      }),
+      stateFrame(ms('11:05:00'), { chargerState: 'charging_active' }),
+    ]
+    for (let j = 0; j <= 24; j++) {
+      frames.push(chargingFrame(ms('11:05:00') + j * 5 * MIN, {
+        powerKW: 7.2, totalChargedEnergy: (10 * j) / 24,
+      }))
+    }
+    // The last counter reading is at 13:05:00.
+    frames.push(stateFrame(ms('13:05:30'), { chargerState: 'charging_complete' }))
+    return frames
+  }
+
+  it('writes one charge from the charging stream\'s counter and power', async () => {
+    const { db, pipeline } = setup()
+    await feed(pipeline, chargeFrames())
+    await finish(pipeline, '13:30:00')
+
+    const charges = sessionsOf(db, 'charge')
+    expect(charges).toHaveLength(1)
+    const charge = charges[0]!
+    expect(charge.isOpen).toBe(false)
+    // Opened by `charging_active`, not by the `charging_connecting` before it.
+    expect(charge.startedAt).toEqual(date(ms('11:05:00')))
+    expect(charge.summary!.energyKwh).toBeCloseTo(10, 3)
+    expect(charge.summary!.maxChargePowerKw).toBe(7.2)
+
+    // `charging_connecting` is a handshake, and a cable in is not a charge.
+    expect(sampleAt(db, ms('11:00:00')).chargeState).toBe('connected')
+    expect(sampleAt(db, ms('11:05:00')).chargeState).toBe('charging')
+    expect(sampleAt(db, ms('13:05:30')).chargeState).toBe('complete')
+    expect(sessionsOf(db, 'drive')).toEqual([])
+    expect(openSessions(db)).toEqual([])
+  })
+
+  it('is not split by GPS jitter, which the noise floor and Park read as stationary', async () => {
+    const { db, pipeline } = setup()
+    const jitter = [
+      // Before the charge, while the cable is in but nothing flows: with no
+      // charge open, 0.4 m/s read as 1.44 kph would open a phantom drive.
+      stateFrame(ms('11:02:00'), { gnssSpeed: 0.4 }),
+      // Below the 0.5 m/s floor, mid-charge.
+      stateFrame(ms('12:00:30'), { gnssSpeed: 0.4 }),
+      // Above the floor (2.16 kph), but the car is in Park.
+      stateFrame(ms('12:30:30'), { gearStatus: 'park', gnssSpeed: 0.6 }),
+    ]
+    const frames = [...chargeFrames(), ...jitter]
+      .sort((a, b) => a.receivedAt.getTime() - b.receivedAt.getTime())
+    await feed(pipeline, frames)
+    await finish(pipeline, '13:30:00')
+
+    const charges = sessionsOf(db, 'charge')
+    expect(charges).toHaveLength(1)
+    expect(charges[0]!.isOpen).toBe(false)
+    expect(charges[0]!.summary!.energyKwh).toBeCloseTo(10, 3)
+    expect(sessionsOf(db, 'drive')).toEqual([])
+    // What reached the segmenter was a stationary car, not a slow one.
+    expect(sampleAt(db, ms('11:02:00')).speedKph).toBe(0)
+    expect(sampleAt(db, ms('12:00:30')).speedKph).toBe(0)
+    expect(sampleAt(db, ms('12:30:30')).speedKph).toBe(0)
+  })
+})
+
+describe('Pipeline with the Rivian profile: a resubscribe snapshot re-sending old values', () => {
+  it('never lets an older observation overwrite a newer one, and opens no drive', async () => {
+    const { db, pipeline } = setup()
+    await pipeline.handle(stateFrame(ms('09:00:00'), { gearStatus: 'park', gnssSpeed: 0 }))
+
+    // A frame whose gear is OLDER than the park we already hold: the car said
+    // `drive` at 08:59 and `park` at 09:00, and this is the 08:59 value turning
+    // up late. Arrival order is not observation order.
+    await pipeline.handle(
+      stateFrame(ms('09:01:00'), {}, { gearStatus: tv(iso(ms('08:59:00')), 'drive') }))
+    await pipeline.flush(date(ms('09:01:10')))
+    const afterLateGear = sampleAt(db, ms('09:01:00'))
+    expect(afterLateGear.gear).toBe('P')
+    expect(afterLateGear.speedKph).toBe(0)
+
+    // Three hours on, a resubscribe re-sends what the car last said: the park
+    // from 09:00, and the last speed it read before it parked.
+    await pipeline.handle(stateFrame(ms('12:00:00'), {}, {
+      gearStatus: tv(iso(ms('09:00:00')), 'park'),
+      gnssSpeed: tv(iso(ms('08:58:00')), 15),
+    }))
+    await pipeline.flush(date(ms('12:00:10')))
+
+    expect(db.state.sessions).toEqual([])
+    const resent = sampleAt(db, ms('12:00:00'))
+    expect([null, 0]).toContain(resent.speedKph)
+    expect(resent.gear).toBe('P')
+  })
+
+  it('opens no drive for a car with no gear on record, where the Park rule cannot help', async () => {
+    const { db, pipeline } = setup()
+    // Nothing here says Park, so only the observation time stands between a
+    // three-hour-old 15 m/s (54 kph) and a drive.
+    await pipeline.handle(stateFrame(ms('09:00:00'), { batteryLevel: 80, vehicleMileage: 1_000_000 }))
+    await pipeline.handle(stateFrame(ms('12:00:00'), {}, {
+      gnssSpeed: tv(iso(ms('08:58:00')), 15),
+      // Real news in the same snapshot, so the frame lands and a sample is written.
+      batteryLevel: tv(iso(ms('11:59:00')), 79),
+    }))
+    await finish(pipeline, '12:00:10')
+
+    expect(db.state.sessions).toEqual([])
+    const resent = sampleAt(db, ms('12:00:00'))
+    expect(resent.speedKph).toBeNull()
+    expect(resent.socPct).toBe(79)
+  })
+
+  it('opens no charge for a charging_active older than the level window', async () => {
+    const { db, pipeline } = setup()
+    await pipeline.handle(stateFrame(ms('09:00:00'), { batteryLevel: 80 }))
+    // 7 hours old: past STALE_VALUE_MS, so the car has long since said something
+    // else or gone dark, and a charge opened on it would be a charge that ended
+    // hours ago.
+    await pipeline.handle(stateFrame(ms('12:00:00'), {}, {
+      chargerState: tv(iso(ms('05:00:00')), 'charging_active'),
+      chargerStatus: tv(iso(ms('05:00:00')), 'chrgr_sts_connected_charging'),
+      batteryLevel: tv(iso(ms('11:59:00')), 79),
+    }))
+    await finish(pipeline, '12:00:10')
+
+    expect(db.state.sessions).toEqual([])
+    const resent = sampleAt(db, ms('12:00:00'))
+    expect(resent.chargeState).toBeNull()
+    expect(resent.socPct).toBe(79)
+  })
+
+  it('cannot hold a charge open by re-sending the charging_active that opened it', async () => {
+    const { db, pipeline } = setup()
+    await feed(pipeline, [
+      stateFrame(ms('08:00:00'), {
+        chargerStatus: 'chrgr_sts_connected_charging', chargerState: 'charging_active',
+      }),
+      ...[0, 1, 2, 3, 4, 5, 6].map((j) =>
+        chargingFrame(ms('08:00:00') + j * 5 * MIN, { powerKW: 7.2, totalChargedEnergy: j })),
+    ])
+
+    // The car goes dark at 08:30 and never says another word about its charge.
+    // A snapshot every half hour re-sends the same two values with the stamp
+    // they were given at 08:00. Stamped with arrival instead, each would restart
+    // the six hours and the charge would be carried for ever.
+    for (let at = ms('09:00:00'); at <= ms('15:30:00'); at += 30 * MIN) {
+      await pipeline.handle(stateFrame(at, {}, {
+        chargerState: tv(iso(ms('08:00:00')), 'charging_active'),
+        chargerStatus: tv(iso(ms('08:00:00')), 'chrgr_sts_connected_charging'),
+      }))
+    }
+    // Then the car says something real and unrelated. It carries no charger
+    // state, so what the sample shows of the charge is only what was carried.
+    await pipeline.handle(stateFrame(ms('15:40:00'), { batteryLevel: 70 }))
+    await finish(pipeline, '15:41:00')
+
+    const charges = sessionsOf(db, 'charge')
+    expect(charges).toHaveLength(1)
+    expect(charges[0]!.isOpen).toBe(false)
+    // The six hours run from the last sign of charging (08:30), so nothing the
+    // snapshots re-sent can have carried it past 14:30.
+    expect(charges[0]!.summary!.endedAt!.getTime()).toBeLessThanOrEqual(ms('08:30:00') + 6 * HOUR)
+    expect(sampleAt(db, ms('15:40:00')).chargeState).toBeNull()
+  })
+})
+
+describe('Pipeline with the Rivian profile: what is not a frame of state', () => {
+  it('tapes parallax, meta and ota, counts each as unmapped, and opens nothing', async () => {
+    const { db, pipeline } = setup()
+    const frames = [
+      otherFrame('parallax', ms('10:00:00'), {
+        data: { parallaxMessages: { rvm: 'charging.session.notification', payload: 'CJYB', timestamp: iso(ms('10:00:00')) } },
+      }),
+      otherFrame('meta', ms('10:00:01'), { kind: 'vehicle_images', data: { count: 3 } }),
+      otherFrame('ota', ms('10:00:02'), { data: { vehicleOtaStatus: { currentVersion: '2026.40.0' } } }),
+    ]
+    for (const [n, frame] of frames.entries()) {
+      const result = await pipeline.handle(frame)
+      expect(result.unmapped).toBe(1)
+      expect(result.fieldsApplied).toBe(0)
+      expect(db.state.raw).toHaveLength(n + 1)
+    }
+    await finish(pipeline, '10:30:00')
+
+    expect(db.state.raw.map((m) => m.payload)).toEqual(frames.map((f) => f.payload))
+    expect(db.state.samples).toEqual([])
+    expect(db.state.sessions).toEqual([])
+  })
+
+  it('counts a frame of only null and unknown properties as unmapped, not applied', async () => {
+    const { db, pipeline } = setup()
+    const result = await pipeline.handle(stateFrame(ms('10:00:00'), {}, {
+      batteryLevel: null,
+      gearStatus: null,
+      gnssSpeed: { timeStamp: iso(ms('10:00:00')), value: null },
+      aPropertyNobodyDecodes: tv(iso(ms('10:00:00')), 7),
+    }))
+    expect(result.unmapped).toBe(1)
+    expect(result.fieldsApplied).toBe(0)
+    expect(result.untimed).toBe(0)
+    expect(db.state.raw).toHaveLength(1)
+
+    // Nothing was accumulated, so nothing is emitted for it: counting it as
+    // applied would schedule a sample of carried-only state on every resubscribe.
+    await finish(pipeline, '10:30:00')
+    expect(db.state.samples).toEqual([])
+  })
+
+  it('counts a frame whose only property is too old to apply as unmapped', async () => {
+    const { pipeline } = setup()
+    const result = await pipeline.handle(stateFrame(ms('10:00:00'), {}, {
+      gnssSpeed: tv(iso(ms('09:00:00')), 15),
+    }))
+    expect(result.unmapped).toBe(1)
+    expect(result.fieldsApplied).toBe(0)
+  })
+
+  it('counts a property with no usable timestamp as untimed, and still applies it', async () => {
+    const { db, pipeline } = setup()
+    const result = await pipeline.handle(stateFrame(ms('10:00:00'), {}, {
+      batteryLevel: tv('garbage', 50),
+    }))
+    expect(result.untimed).toBe(1)
+    expect(result.fieldsApplied).toBe(1)
+    expect(result.unmapped).toBe(0)
+
+    // Stamped with the frame's arrival, so it is as current as the frame.
+    await finish(pipeline, '10:30:00')
+    expect(sampleAt(db, ms('10:00:00')).socPct).toBe(50)
+
+    // A timed frame beside it is not counted.
+    const timed = await pipeline.handle(stateFrame(ms('10:01:00'), { batteryLevel: 49 }))
+    expect(timed.untimed).toBe(0)
+  })
+})

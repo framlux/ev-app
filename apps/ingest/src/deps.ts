@@ -21,6 +21,7 @@ import {
   readRivianEnvelope,
 } from '@ev/rivian'
 import type { VendorProfile } from './profile.js'
+import { rivianProfile } from './profiles/rivian.js'
 import { teslaProfile } from './profiles/tesla.js'
 
 /**
@@ -31,7 +32,7 @@ import { teslaProfile } from './profiles/tesla.js'
 export function profileFor(vendor: Vendor): VendorProfile {
   switch (vendor) {
     case 'tesla': return teslaProfile
-    case 'rivian': throw new Error('no profile for vendor rivian yet')
+    case 'rivian': return rivianProfile
   }
 }
 

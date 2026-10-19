@@ -8,6 +8,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/main.js",
     "reprocess": "node dist/reprocess.js",
+    "parallax-dump": "node dist/parallax-dump.js",
     "backfill-costs": "node dist/backfill-costs.js"
   },
   "dependencies": {
