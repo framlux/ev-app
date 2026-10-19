@@ -132,16 +132,51 @@ function cleanString(s: string): string {
  * `JSON.parse` can produce, and all the connector sends.
  */
 export function cleanStrings<T>(value: T): T {
-  return clean(value) as T
-}
+  if (typeof value === 'string') return cleanString(value) as T
+  if (typeof value !== 'object' || value === null) return value
 
-function clean(value: unknown): unknown {
-  if (typeof value === 'string') return cleanString(value)
-  if (Array.isArray(value)) return value.map(clean)
-  if (typeof value === 'object' && value !== null) {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, inner]) => [cleanString(key), clean(inner)]),
-    )
+  // An explicit stack, not recursion. `JSON.parse` accepts nesting far deeper
+  // than the call stack can follow, so a recursive clean would turn one
+  // pathological frame into a `RangeError` thrown out of the connector's reader
+  // or ingest's tape, and a frame that throws on every delivery is the same
+  // wedge this function exists to prevent. Each pending pair is a container to
+  // read and the empty copy to fill from it.
+  const pending: Array<[source: object, copy: object]> = []
+  // Maps each source container to its copy, so a container reached twice is
+  // copied once. JSON cannot produce that, but a cycle would otherwise grow the
+  // stack until the process ran out of memory: a hang, which is worse than the
+  // throw the old recursion gave.
+  const copies = new WeakMap<object, object>()
+
+  const copyOf = (inner: unknown): unknown => {
+    if (typeof inner === 'string') return cleanString(inner)
+    if (typeof inner !== 'object' || inner === null) return inner
+    let copy = copies.get(inner)
+    if (copy === undefined) {
+      copy = Array.isArray(inner) ? [] : {}
+      copies.set(inner, copy)
+      pending.push([inner, copy])
+    }
+    return copy
   }
-  return value
+
+  const root = copyOf(value)
+  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+    const [source, copy] = next
+    if (Array.isArray(source)) {
+      for (const item of source) (copy as unknown[]).push(copyOf(item))
+    } else {
+      for (const [key, inner] of Object.entries(source)) {
+        // defineProperty, not assignment: assigning to `__proto__` re-points
+        // the prototype, and this keeps it the own data key it arrived as.
+        Object.defineProperty(copy, cleanString(key), {
+          value: copyOf(inner),
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        })
+      }
+    }
+  }
+  return root as T
 }

@@ -34,12 +34,23 @@ describe('RIVIAN_PROPERTIES', () => {
     expect(RIVIAN_PROPERTIES).toHaveLength(135)
   })
 
+  it('lists them in alphabetical order, by UTF-16 code unit', () => {
+    // The comment on the list says so, and groups are cut from this order, so a
+    // hand-edit that drops a name in the wrong place moves its neighbours.
+    const names = RIVIAN_PROPERTIES.map((p) => p.name)
+    expect(names).toEqual([...names].sort())
+    // Code-unit order, not locale order: an upper-case letter sorts first.
+    expect(names.indexOf('chargingDisabledACFaultState')).toBeLessThan(
+      names.indexOf('chargingDisabledAll'),
+    )
+  })
+
   it('gives exactly three properties a structured shape', () => {
     const structured = RIVIAN_PROPERTIES.filter((p) => p.shape !== 'value')
     expect(structured.map((p) => [p.name, p.shape])).toEqual([
       ['cloudConnection', 'cloudConnection'],
-      ['gnssLocation', 'location'],
       ['gnssError', 'locationError'],
+      ['gnssLocation', 'location'],
     ])
   })
 
@@ -87,13 +98,34 @@ describe('shapeOf', () => {
 })
 
 describe('SHAPE_SELECTIONS', () => {
-  it('holds the selection each shape is asked for with', () => {
-    expect(SHAPE_SELECTIONS).toEqual({
-      value: '{ timeStamp value }',
-      location: '{ latitude longitude timeStamp isAuthorized }',
-      cloudConnection: '{ lastSync isOnline }',
-      locationError: '{ timeStamp positionVertical positionHorizontal speed bearing }',
-    })
+  it('holds the selection each shape is asked for with, one field per line', () => {
+    expect(SHAPE_SELECTIONS.value).toBe(`{
+  timeStamp
+  value
+}`)
+    expect(SHAPE_SELECTIONS.location).toBe(`{
+  timeStamp
+  latitude
+  longitude
+  isAuthorized
+}`)
+    expect(SHAPE_SELECTIONS.cloudConnection).toBe(`{
+  isOnline
+  lastSync
+}`)
+    expect(SHAPE_SELECTIONS.locationError).toBe(`{
+  timeStamp
+  bearing
+  positionHorizontal
+  positionVertical
+  speed
+}`)
+  })
+
+  it('has a selection for every shape and no other', () => {
+    expect(Object.keys(SHAPE_SELECTIONS).sort()).toEqual(
+      ['cloudConnection', 'location', 'locationError', 'value'],
+    )
   })
 })
 
@@ -143,36 +175,117 @@ describe('vehicleStateDocument', () => {
   it('asks for each property in the shape it has', () => {
     const doc = vehicleStateDocument('veh', ['batteryLevel', 'gnssLocation'])
     expect(doc.operationName).toBe('VehicleState')
-    expect(doc.variables).toEqual({ vehicleID: 'veh' })
-    expect(doc.query).toBe(
-      'subscription VehicleState($vehicleID: String!) { vehicleState(id: $vehicleID) { batteryLevel { timeStamp value } gnssLocation { latitude longitude timeStamp isAuthorized } } }',
-    )
+    expect(doc.variables).toEqual({ vehicleId: 'veh' })
+    expect(doc.query).toBe(`subscription VehicleState($vehicleId: String!) {
+  vehicleState(id: $vehicleId) {
+    batteryLevel {
+      timeStamp
+      value
+    }
+    gnssLocation {
+      timeStamp
+      latitude
+      longitude
+      isAuthorized
+    }
+  }
+}`)
   })
 
   it('selects the structured shapes with their own fields', () => {
     const { query } = vehicleStateDocument('veh', ['cloudConnection', 'gnssError'])
-    expect(query).toContain('cloudConnection { lastSync isOnline }')
-    expect(query).toContain(
-      'gnssError { timeStamp positionVertical positionHorizontal speed bearing }',
-    )
+    expect(query).toContain(`    cloudConnection {
+      isOnline
+      lastSync
+    }`)
+    expect(query).toContain(`    gnssError {
+      timeStamp
+      bearing
+      positionHorizontal
+      positionVertical
+      speed
+    }`)
   })
 
   it('selects a property it does not know as a plain value', () => {
     expect(vehicleStateDocument('veh', ['someFutureR2Property']).query).toContain(
-      'someFutureR2Property { timeStamp value }',
+      `    someFutureR2Property {
+      timeStamp
+      value
+    }`,
     )
   })
 
   it('carries the vehicle id as a variable, never inside the query text', () => {
     const doc = vehicleStateDocument('veh" } } injected', ['batteryLevel'])
     expect(doc.query).not.toContain('injected')
-    expect(doc.variables).toEqual({ vehicleID: 'veh" } } injected' })
+    expect(doc.variables).toEqual({ vehicleId: 'veh" } } injected' })
   })
 
   it('builds a document for a full group of sixteen from the catalogue', () => {
     const [group] = groupProperties(RIVIAN_PROPERTIES.map((p) => p.name))
     const doc = vehicleStateDocument('veh', group!)
-    for (const name of group!) expect(doc.query).toContain(` ${name} {`)
+    expect(group).toHaveLength(16)
+    for (const name of group!) expect(doc.query).toContain(`\n    ${name} {\n`)
+  })
+
+  it('keeps the properties in the order it was given', () => {
+    const { query } = vehicleStateDocument('veh', ['speedLike', 'aaa', 'mmm'])
+    expect(query.indexOf('speedLike')).toBeLessThan(query.indexOf('aaa'))
+    expect(query.indexOf('aaa')).toBeLessThan(query.indexOf('mmm'))
+  })
+
+  describe('refuses text that is not a property name', () => {
+    it('an empty list, which would be an empty selection set', () => {
+      expect(() => vehicleStateDocument('veh', [])).toThrow(RangeError)
+    })
+
+    it.each([
+      ['an empty name', ''],
+      ['a name with a space', 'battery level'],
+      ['a name that starts with a digit', '1battery'],
+      ['a name with a hyphen', 'battery-level'],
+      ['a name with a dot', 'battery.level'],
+      ['a name that closes the selection', 'x } } subscription Y { z'],
+      ['a name with a newline', 'a\nb'],
+      ['a name with a trailing newline', 'batteryLevel\n'],
+      ['a name with a non-ASCII letter', 'batteryLevél'],
+      ['a name with a NUL', 'battery\u0000Level'],
+      ['a name with a comment marker', 'a # b'],
+      ['a name with a directive', 'a @skip(if: true)'],
+    ])('%s', (_label, name) => {
+      expect(() => vehicleStateDocument('veh', ['batteryLevel', name])).toThrow(RangeError)
+    })
+
+    it('and says where, not what: the offending text is not in the message', () => {
+      const bad = 'sneaky } { text'
+      let message = ''
+      try {
+        vehicleStateDocument('veh', ['batteryLevel', 'powerState', bad])
+      } catch (err) {
+        message = (err as Error).message
+      }
+      expect(message).toContain('position 2')
+      expect(message).not.toContain('sneaky')
+      expect(message).not.toContain(bad)
+    })
+
+    it('whichever position it is in', () => {
+      expect(() => vehicleStateDocument('veh', ['a b', 'powerState'])).toThrow(RangeError)
+      expect(() => vehicleStateDocument('veh', ['powerState', 'a b'])).toThrow(RangeError)
+    })
+  })
+
+  it('accepts what GraphQL calls a name, including a leading underscore and digits after', () => {
+    for (const name of ['_x', 'x1', 'X_9', '_', 'batteryLevel']) {
+      expect(() => vehicleStateDocument('veh', [name]), name).not.toThrow()
+    }
+  })
+
+  it('accepts every name in the catalogue', () => {
+    expect(() =>
+      vehicleStateDocument('veh', RIVIAN_PROPERTIES.map((p) => p.name)),
+    ).not.toThrow()
   })
 })
 
@@ -180,23 +293,25 @@ describe('parallaxDocument', () => {
   it('asks for every topic when rvms is null', () => {
     const doc = parallaxDocument('veh', null)
     expect(doc.operationName).toBe('ParallaxMessages')
-    expect(doc.variables).toEqual({ vehicleId: 'veh', rvms: null })
-    expect(doc.query).toContain(
-      'parallaxMessages(vehicleId: $vehicleId, rvms: $rvms) { payload timestamp rvm }',
-    )
+    expect(doc.variables).toEqual({ vehicleId: 'veh', topics: null })
+    expect(doc.query).toBe(`subscription ParallaxMessages($vehicleId: String!, $topics: [String!]) {
+  parallaxMessages(vehicleId: $vehicleId, rvms: $topics) {
+    payload
+    timestamp
+    rvm
+  }
+}`)
   })
 
   it('passes a list of topics through as a variable', () => {
     const rvms = ['energy_management.charging_status', 'vehicle.speed']
     const doc = parallaxDocument('veh', rvms)
-    expect(doc.variables).toEqual({ vehicleId: 'veh', rvms })
-    expect(doc.variables.rvms).not.toBe(rvms)
+    expect(doc.variables).toEqual({ vehicleId: 'veh', topics: rvms })
+    expect(doc.variables.topics).not.toBe(rvms)
   })
 
   it('declares the topic filter as an optional list, so null is legal', () => {
-    expect(parallaxDocument('veh', null).query).toContain(
-      'subscription ParallaxMessages($vehicleId: String!, $rvms: [String!])',
-    )
+    expect(parallaxDocument('veh', null).query).toContain('$topics: [String!])')
   })
 })
 
@@ -225,53 +340,128 @@ describe('chargingSessionDocument', () => {
     expect(selected(doc.query, 'chartData')).toEqual(CHART_DATA)
   })
 
-  it('is exactly the document the design gives', () => {
-    expect(chargingSessionDocument('veh').query).toBe(
-      'subscription ChargingSession($vehicleId: String!) { chargingSession(vehicleId: $vehicleId) { liveData { powerKW kilometersChargedPerHour rangeAddedThisSession totalChargedEnergy timeElapsed timeRemaining price currency isFreeSession vehicleChargerState startTime } chartData { soc powerKW startTime endTime timeEstimationValidityStatus vehicleChargerState } } }',
-    )
+  it('is exactly this document, chartData first as the schema declares it', () => {
+    expect(chargingSessionDocument('veh').query).toBe(`subscription ChargingSession($vehicleId: String!) {
+  chargingSession(vehicleId: $vehicleId) {
+    chartData {
+      soc
+      powerKW
+      startTime
+      endTime
+      timeEstimationValidityStatus
+      vehicleChargerState
+    }
+    liveData {
+      powerKW
+      kilometersChargedPerHour
+      rangeAddedThisSession
+      totalChargedEnergy
+      timeElapsed
+      timeRemaining
+      price
+      currency
+      isFreeSession
+      vehicleChargerState
+      startTime
+    }
+  }
+}`)
   })
 })
 
 describe('cloudConnectionDocument', () => {
-  it('asks by $id, which is what this subscription calls its argument', () => {
+  it('feeds its vehicle variable to the argument this subscription calls id', () => {
     expect(cloudConnectionDocument('veh')).toEqual({
       operationName: 'VehicleCloudConnection',
-      query:
-        'subscription VehicleCloudConnection($id: String!) { vehicleCloudConnection(id: $id) { lastSync isOnline } }',
-      variables: { id: 'veh' },
+      query: `subscription VehicleCloudConnection($vehicleId: String!) {
+  vehicleCloudConnection(id: $vehicleId) {
+    isOnline
+    lastSync
+  }
+}`,
+      variables: { vehicleId: 'veh' },
     })
   })
 })
 
-describe('the Parallax-shaped subscriptions', () => {
-  it('select { payload timestamp rvm } from their own field', () => {
+describe('the bare-payload subscriptions', () => {
+  it('select payload and sequenceNumber from their own field', () => {
     expect(otaInstallStateDocument('veh')).toEqual({
       operationName: 'OtaInstallState',
-      query:
-        'subscription OtaInstallState($vehicleId: String!) { otaInstallState(vehicleId: $vehicleId) { payload timestamp rvm } }',
+      query: `subscription OtaInstallState($vehicleId: String!) {
+  otaInstallState(vehicleId: $vehicleId) {
+    payload
+    sequenceNumber
+  }
+}`,
       variables: { vehicleId: 'veh' },
     })
     expect(otaInstallSchedulesDocument('veh')).toEqual({
       operationName: 'OtaInstallSchedules',
-      query:
-        'subscription OtaInstallSchedules($vehicleId: String!) { otaInstallSchedules(vehicleId: $vehicleId) { payload timestamp rvm } }',
+      query: `subscription OtaInstallSchedules($vehicleId: String!) {
+  otaInstallSchedules(vehicleId: $vehicleId) {
+    payload
+    sequenceNumber
+  }
+}`,
       variables: { vehicleId: 'veh' },
     })
     expect(geofencesDocument('veh')).toEqual({
       operationName: 'VehicleGeofences',
-      query:
-        'subscription VehicleGeofences($vehicleId: String!) { vehicleGeofences(vehicleId: $vehicleId) { payload timestamp rvm } }',
+      query: `subscription VehicleGeofences($vehicleId: String!) {
+  vehicleGeofences(vehicleId: $vehicleId) {
+    payload
+    sequenceNumber
+  }
+}`,
       variables: { vehicleId: 'veh' },
     })
+  })
+
+  it('do not ask for the topic fields only parallaxMessages has', () => {
+    for (const doc of [
+      otaInstallStateDocument('veh'),
+      otaInstallSchedulesDocument('veh'),
+      geofencesDocument('veh'),
+    ]) {
+      expect(doc.query, doc.operationName).not.toMatch(/\btimestamp\b|\brvm\b/)
+    }
   })
 })
 
 describe('departureSchedulesDocument', () => {
-  it('selects the full schedule, including the weekly occurrence fragment', () => {
+  it('selects the full schedule, with the weekly occurrence behind a fragment', () => {
     expect(departureSchedulesDocument('veh')).toEqual({
       operationName: 'VehicleDepartureSchedules',
-      query:
-        'subscription VehicleDepartureSchedules($vehicleId: String!) { vehicleDepartureSchedules(vehicleId: $vehicleId) { id name isEnabled occurrence { __typename ... on RepeatsWeekly { days startsAtMin skippedOn } } departureSettings { shouldOverrideChargeSchedule comfortSettings { cabinTempCelsius frontDefogDefrost surfaceHeatVentLevels { frontLeftSeat frontRightSeat rearLeftSeat rearRightSeat steeringWheel } } } } }',
+      query: `subscription VehicleDepartureSchedules($vehicleId: String!) {
+  vehicleDepartureSchedules(vehicleId: $vehicleId) {
+    id
+    name
+    isEnabled
+    occurrence {
+      ... on RepeatsWeekly {
+        days
+        startsAtMin
+        skippedOn
+      }
+      __typename
+    }
+    departureSettings {
+      shouldOverrideChargeSchedule
+      comfortSettings {
+        surfaceHeatVentLevels {
+          frontLeftSeat
+          frontRightSeat
+          rearLeftSeat
+          rearRightSeat
+          steeringWheel
+        }
+        cabinTempCelsius
+        frontDefogDefrost
+      }
+    }
+  }
+}`,
       variables: { vehicleId: 'veh' },
     })
   })
@@ -313,6 +503,25 @@ describe('every document', () => {
       const body = doc.query.slice(doc.query.indexOf(')') + 1)
       for (const name of declared) {
         expect(body, `${doc.operationName} $${name}`).toContain(`$${name}`)
+      }
+    }
+  })
+
+  it('spells the vehicle variable one way, whatever the argument is called', () => {
+    for (const doc of documents) {
+      expect(doc.variables, doc.operationName).toHaveProperty('vehicleId', 'veh')
+      expect(doc.query, doc.operationName).not.toMatch(/\$(id|vehicleID)\b/)
+    }
+  })
+
+  it('puts one field on each line, and never two selections on one', () => {
+    for (const doc of documents) {
+      for (const line of doc.query.split('\n').slice(1)) {
+        // After the header, a line is a field (maybe opening a block), a fragment
+        // opener, or a closing brace: never `a { b c }`.
+        expect(line, `${doc.operationName}: ${line}`).toMatch(
+          /^ *(?:\}|(?:\.\.\. on \w+|\w+(?:\([^)]*\))?)(?: \{)?)$/,
+        )
       }
     }
   })

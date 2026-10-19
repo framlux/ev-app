@@ -143,6 +143,70 @@ describe('cleanStrings', () => {
     expect(({} as Record<string, unknown>).polluted).toBeUndefined()
   })
 
+  it('does not run out of stack on nesting far deeper than a call stack can follow', () => {
+    // JSON.parse takes this depth happily; a recursive clean would throw a
+    // RangeError, on every delivery of the frame. Built and checked in loops,
+    // because toEqual would recurse too.
+    const DEPTH = 100_000
+    let deep: unknown = 'leaf\u0000'
+    for (let i = 0; i < DEPTH; i++) deep = i % 2 === 0 ? { 'k\u0000': deep } : [deep]
+
+    const out = cleanStrings(deep)
+
+    // One assertion, not a hundred thousand: count the levels that have the
+    // expected shape and then check the leaf.
+    let node: unknown = out
+    let wellFormed = 0
+    for (let i = DEPTH - 1; i >= 0; i--) {
+      if (i % 2 === 0) {
+        const keys = Object.keys(node as object)
+        if (keys.length !== 1 || keys[0] !== 'k') break
+        node = (node as Record<string, unknown>).k
+      } else {
+        if (!Array.isArray(node) || node.length !== 1) break
+        node = node[0]
+      }
+      wellFormed++
+    }
+    expect(wellFormed).toBe(DEPTH)
+    expect(node).toBe('leaf')
+  })
+
+  it('cleans every branch of a wide structure, not only the one it descends first', () => {
+    const wide = { a: ['x\u0000', { b: 'y\u0000' }], c: { d: ['z\u0000'], 'e\u0000': 1 }, f: '\uD800' }
+    expect(cleanStrings(wide)).toEqual({
+      a: ['x', { b: 'y' }],
+      c: { d: ['z'], e: 1 },
+      f: '\uFFFD',
+    })
+  })
+
+  it('keeps the order of array elements and of object keys', () => {
+    const out = cleanStrings({ z: [3, 'a\u0000', 1], a: 2, m: { y: 1, b: 2 } })
+    expect(Object.keys(out)).toEqual(['z', 'a', 'm'])
+    expect(out.z).toEqual([3, 'a', 1])
+    expect(Object.keys(out.m)).toEqual(['y', 'b'])
+  })
+
+  it('terminates on a cyclic structure instead of growing until memory runs out', () => {
+    const cyclic: Record<string, unknown> = { name: 'a\u0000b' }
+    cyclic.self = cyclic
+    cyclic.list = [cyclic]
+    const out = cleanStrings(cyclic) as Record<string, unknown>
+    expect(out.name).toBe('ab')
+    expect(out.self).toBe(out)
+    expect((out.list as unknown[])[0]).toBe(out)
+    expect(cyclic.name).toBe('a\u0000b')
+  })
+
+  it('returns a scalar at the top level, cleaned if it is a string', () => {
+    expect(cleanStrings('a\u0000b')).toBe('ab')
+    expect(cleanStrings(7)).toBe(7)
+    expect(cleanStrings(null)).toBeNull()
+    expect(cleanStrings(true)).toBe(true)
+    expect(cleanStrings(undefined)).toBeUndefined()
+  })
+
   it('produces a value Postgres JSONB would accept', () => {
     const dirty = { name: 'Driver\u0000One', note: '\uD83D broken' }
     expect(JSON.stringify(cleanStrings(dirty))).not.toMatch(/\\u0000|\\ud8/i)
