@@ -618,6 +618,67 @@ describe('Pipeline with the Rivian profile: arrival-stamped values re-sent uncha
     expect(sampleAt(replayed.db, ms('15:40:00')).chargeState).toBeNull()
   })
 
+  it('does not bring an expired charging word back when the stream goes on repeating it', async () => {
+    // The word expires at 14:00, six hours after its last real change. A level
+    // that changes at 14:30 emits a sample, and `take()` drops the word from the
+    // accumulator while the minute snapshots go on re-sending it. With nothing
+    // held to compare against, the next re-send used to land as new, put the
+    // word back at a fresh stamp, and open a charge seven hours after the last
+    // charging data. The accumulator remembers the last value the stream said,
+    // whether or not it is still held, so the re-send is still not news.
+    const live = { powerKW: 7.2, totalChargedEnergy: 6, vehicleChargerState: 'charging_active' }
+    const { db, pipeline } = setup()
+    await pipeline.handle(stateFrame(ms('08:00:00'), {
+      chargerStatus: 'chrgr_sts_connected_charging', chargerState: 'charging_active',
+    }))
+    for (let j = 0; j <= 6; j++) {
+      await pipeline.handle(chargingFrame(ms('08:00:00') + j * 5 * MIN, { ...live, totalChargedEnergy: j }))
+    }
+    const results = []
+    for (let at = ms('08:31:00'); at <= ms('15:30:00'); at += MIN) {
+      if (at === ms('14:30:00')) await pipeline.handle(stateFrame(at, { batteryLevel: 70 }))
+      else results.push(await pipeline.handle(chargingFrame(at, live)))
+    }
+    await finish(pipeline, '15:40:00')
+
+    const charges = sessionsOf(db, 'charge')
+    expect(charges).toHaveLength(1)
+    expect(charges[0]!.isOpen).toBe(false)
+    expect(charges[0]!.summary!.endedAt).toEqual(date(ms('08:30:00')))
+    // The level change at 14:30 is what emitted a sample (the word already run
+    // out of its window), and nothing after it says charging.
+    expect(sampleAt(db, ms('14:30:00')).chargeState).toBeNull()
+    const after = db.state.samples.filter((x) => x.ts.getTime() > ms('14:30:00'))
+    expect(after.every((x) => x.chargeState === null)).toBe(true)
+    // Not one of the re-sends landed.
+    expect(results.every((r) => r.unmapped === 1 && r.fieldsApplied === 0)).toBe(true)
+  })
+
+  it('still lands a charge power equal to the last session\'s, once the stream has been silent for longer than its window', async () => {
+    // The memory of what the stream last said must not outlive the stream: a
+    // wall charger's power is the same constant every session, and a value
+    // dropped as "already said" yesterday would leave every later session with
+    // no power at all.
+    const { db, pipeline } = setup()
+    await pipeline.handle(stateFrame(ms('08:00:00'), {
+      chargerStatus: 'chrgr_sts_connected_charging', chargerState: 'charging_active',
+    }))
+    for (let j = 0; j <= 6; j++) {
+      await pipeline.handle(chargingFrame(ms('08:00:00') + j * 5 * MIN, { powerKW: 11.5, totalChargedEnergy: j }))
+    }
+    await pipeline.handle(stateFrame(ms('08:35:00'), { chargerState: 'charging_complete' }))
+    // The second session, hours later, at the same constant power.
+    await pipeline.handle(stateFrame(ms('16:00:00'), { chargerState: 'charging_active' }))
+    for (let j = 0; j <= 6; j++) {
+      await pipeline.handle(chargingFrame(ms('16:00:10') + j * 5 * MIN, { powerKW: 11.5, totalChargedEnergy: j }))
+    }
+    await finish(pipeline, '17:00:00')
+
+    expect(sessionsOf(db, 'charge')).toHaveLength(2)
+    expect(sampleAt(db, ms('16:00:10')).chargePowerKw).toBe(11.5)
+    expect(sampleAt(db, ms('16:30:10')).chargePowerKw).toBe(11.5)
+  })
+
   it('a real charge stays one charge past six hours, its charging word re-sent unchanged', async () => {
     // The other half: what keeps a long charge's word alive is the car's power
     // and counter moving, through the charge refresh, with no help from the

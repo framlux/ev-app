@@ -339,6 +339,59 @@ describe('FieldAccumulator: slots stamped with their arrival', () => {
       expect(acc.take()?.state.state).toBe('complete')
     })
 
+    it('is still not news once the held word has expired and been dropped', () => {
+      // `take()` deletes what has run out of its window, and with it the thing a
+      // re-send is compared against. The accumulator remembers what the stream
+      // last said apart from what it holds, so the word does not come back for
+      // as long as the stream keeps repeating it.
+      const acc = fresh()
+      acc.apply(stamped({ state: 'charging' }, 0), at(0))
+      acc.take()
+      acc.apply(stamped({ state: 'charging' }, 3 * HOUR), at(3 * HOUR))
+      acc.apply(stamped({ state: 'charging' }, 5 * HOUR), at(5 * HOUR))
+      // 6 h 1 min: another value lands and emits, and the word is dropped.
+      acc.apply({ slots: { odometer: 1 } }, at(STALE_VALUE_MS + MINUTE))
+      expect(acc.take()?.state.state).toBeUndefined()
+
+      expect(acc.apply(stamped({ state: 'charging' }, STALE_VALUE_MS + 2 * MINUTE), at(STALE_VALUE_MS + 2 * MINUTE)))
+        .toBe(false)
+      expect(acc.pending).toBe(false)
+      expect(carried(acc, STALE_VALUE_MS + 3 * MINUTE).state).toBeUndefined()
+    })
+
+    it('lands a different word after that, and a flip back to the old one is news again', () => {
+      const acc = fresh()
+      acc.apply(stamped({ state: 'charging' }, 0), at(0))
+      acc.apply({ slots: { odometer: 1 } }, at(STALE_VALUE_MS + MINUTE))
+      acc.take()
+
+      expect(acc.apply(stamped({ state: 'complete' }, STALE_VALUE_MS + 2 * MINUTE), at(STALE_VALUE_MS + 2 * MINUTE)))
+        .toBe(true)
+      expect(acc.apply(stamped({ state: 'charging' }, STALE_VALUE_MS + 3 * MINUTE), at(STALE_VALUE_MS + 3 * MINUTE)))
+        .toBe(true)
+    })
+
+    it('is remembered from a word the car timed itself, once the stream has said the same', () => {
+      const acc = fresh()
+      acc.apply({ slots: { state: 'charging' }, observedAt: { state: 0 } }, at(0))
+      // The stream repeats it from then on, often enough to still be heard.
+      for (const t of [MINUTE, 3 * HOUR, 5 * HOUR]) acc.apply(stamped({ state: 'charging' }, t), at(t))
+      acc.apply({ slots: { odometer: 1 } }, at(STALE_VALUE_MS + MINUTE))
+      expect(acc.take()?.state.state).toBeUndefined()
+      expect(acc.apply(stamped({ state: 'charging' }, STALE_VALUE_MS + 2 * MINUTE), at(STALE_VALUE_MS + 2 * MINUTE)))
+        .toBe(false)
+    })
+
+    it('forgets what the stream said once it has been silent for longer than the word\'s window', () => {
+      // A genuinely new session, a day later, whose first word is the same one.
+      const acc = fresh()
+      acc.apply(stamped({ state: 'charging' }, 0), at(0))
+      acc.apply({ slots: { odometer: 1 } }, at(STALE_VALUE_MS + MINUTE))
+      acc.take()
+      const later = 24 * HOUR
+      expect(acc.apply(stamped({ state: 'charging' }, later), at(later))).toBe(true)
+    })
+
     it('is kept alive by the charge refresh, as before, when the power really moves', () => {
       const acc = fresh()
       acc.apply(stamped({ state: 'charging' }, 0), at(0))
@@ -361,6 +414,18 @@ describe('FieldAccumulator: slots stamped with their arrival', () => {
     // `state` was last refreshed at 1 s, when the power landed, and a re-say at
     // 5 h did not move it: at 6 h + 1 s it is a full window old.
     expect(carried(acc, STALE_VALUE_MS + 1_000).state).toBeUndefined()
+  })
+
+  it('treats the same value after a silence longer than its window as news again', () => {
+    // `power` is volatile (five minutes). What the stream last said is only
+    // evidence that it is repeating itself while it keeps being heard: a value
+    // that comes back after a gap is a new report, even if it equals the old.
+    const acc = fresh()
+    acc.apply(stamped({ power: 7 }, 0), at(0))
+    acc.take()
+    acc.apply({ slots: { odometer: 1 } }, at(VOLATILE_STALE_MS + MINUTE))
+    expect(acc.take()?.state.power).toBeUndefined()
+    expect(acc.apply(stamped({ power: 7 }, 10 * MINUTE), at(10 * MINUTE))).toBe(true)
   })
 
   it('never moves a value backwards for an older arrival stamp', () => {

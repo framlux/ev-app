@@ -189,6 +189,22 @@ export class FieldAccumulator {
   private newestAt: number | null = null
   /** Arrival of the oldest field in the pending sample, for the hard-ceiling rule. */
   private pendingSince: number | null = null
+  /**
+   * What an arrival-stamped slot was last SAID to be, and when it was last said
+   * (`Decoded.arrivalStamped`), kept apart from `slots` on purpose. `take()`
+   * deletes a value that has run out of its window, and with it the thing a
+   * re-send is compared against: held alone, an expired charging word that the
+   * stream goes on repeating would find nothing to equal and land as new, put
+   * itself back at a fresh stamp, and open a charge hours after the last real
+   * charging data. Snapshotted with the rest of the accumulator (see `clone`).
+   *
+   * It lasts only as long as the stream is heard: an entry older than the slot's
+   * window no longer says the stream is repeating itself, so the same value
+   * after that silence is news again. Without that bound a wall charger's
+   * constant power, said at the end of one session, would be "already said" at
+   * the start of the next and never recorded.
+   */
+  private arrivals = new Map<string, { value: unknown; seenAt: number }>()
 
   constructor(private readonly profile: VendorProfile) {}
 
@@ -224,6 +240,13 @@ export class FieldAccumulator {
    * state slots are the exception: an unchanged re-send there does not even
    * refresh, so the word's window runs from its last real change (see the
    * comment at the refresh).
+   *
+   * "UNCHANGED" IS JUDGED AGAINST WHAT THE STREAM LAST SAID (`arrivals`) as well
+   * as against what is held, because the held entry can be gone: `take()` drops a
+   * value past its window, and a charging word that expired at 14:00 and is
+   * still being repeated would otherwise land as news at the next re-send, and
+   * come back as a charge. A value equal to the stream's last, heard within the
+   * slot's window, is not news whether or not anything is held.
    */
   apply(decoded: Decoded, at: Date): boolean {
     const ms = at.getTime()
@@ -234,6 +257,8 @@ export class FieldAccumulator {
     // Held values an arrival-stamped re-send re-asserted unchanged. Applied with
     // what lands, so that a frame that lands nothing still keeps them alive.
     const refreshed = new Map<string, Entry>()
+    // What the arrival-stamped slots in this frame said, landed or not.
+    const heard = new Map<string, { value: unknown; seenAt: number }>()
     for (const [key, value] of Object.entries(decoded.slots)) {
       if (value === undefined) continue
       // The vehicle's own observation time where the vendor gives one (spec
@@ -256,26 +281,41 @@ export class FieldAccumulator {
         if (stamp < held.observed) continue
         if (stamp === held.observed && isDeepStrictEqual(value, held.value)) continue
       }
-      if (held !== undefined && decoded.arrivalStamped?.has(key) && isDeepStrictEqual(value, held.value)) {
-        // The charge state is exempt from the refresh (and, like the rest, is
-        // not a landing): its window runs from its last REAL change. A re-sent
-        // `charging_active` is the stream repeating itself, not the car saying
-        // again that energy is flowing, and renewed by it the word would be
-        // carried for as long as the snapshots kept coming, so the next real
-        // frame hours after the last charging data opened a second charge. What
-        // keeps a genuine charge's word alive is the refresh below, which fires
-        // when power or the counter actually moves.
-        if (this.profile.chargeStateSlots.includes(key)) continue
-        // Past the guard above, so `stamp` is not older than what is held. `at`
-        // never goes backwards: the charge refresh may already have moved it
-        // past this frame's stamp.
-        refreshed.set(key, { value: held.value, at: Math.max(held.at, stamp), observed: stamp })
-        continue
+      if (decoded.arrivalStamped?.has(key)) {
+        const memory = this.arrivals.get(key)
+        const remembered = memory !== undefined &&
+          ms - memory.seenAt < this.profile.staleWindowFor(key) &&
+          isDeepStrictEqual(value, memory.value)
+        const equalsHeld = held !== undefined && isDeepStrictEqual(value, held.value)
+        // Said, whether or not it counts as news: the silence that ends the
+        // memory is measured from the last time the stream was heard.
+        heard.set(key, { value, seenAt: ms })
+        if (remembered || equalsHeld) {
+          // The charge state is exempt from the refresh (and, like the rest, is
+          // not a landing): its window runs from its last REAL change. A
+          // re-sent `charging_active` is the stream repeating itself, not the
+          // car saying again that energy is flowing, and renewed by it the word
+          // would be carried for as long as the snapshots kept coming, so the
+          // next real frame hours after the last charging data opened a second
+          // charge. What keeps a genuine charge's word alive is the refresh
+          // below, which fires when power or the counter actually moves.
+          if (this.profile.chargeStateSlots.includes(key)) continue
+          // Only a held entry that says this very value is renewed: one the car
+          // has since changed (the memory is of an older word) is not. Past
+          // the guard above, so `stamp` is not older than what is held, and
+          // `at` never goes backwards: the charge refresh may already have
+          // moved it past this frame's stamp.
+          if (equalsHeld) {
+            refreshed.set(key, { value: held.value, at: Math.max(held.at, stamp), observed: stamp })
+          }
+          continue
+        }
       }
       landing.set(key, { value, at: stamp, observed: observed === undefined ? undefined : stamp })
     }
     // A new entry, not a mutation: `clone` shares entries with its copy.
     for (const [key, entry] of refreshed) this.slots.set(key, entry)
+    for (const [key, said] of heard) this.arrivals.set(key, said)
     if (landing.size === 0) return false
     // Over what landed, not over what arrived: an older power or energy value
     // that was skipped above is a replay, and must not refresh the charge state
@@ -357,6 +397,7 @@ export class FieldAccumulator {
   clone(): FieldAccumulator {
     const copy = new FieldAccumulator(this.profile)
     copy.slots = new Map(this.slots)
+    copy.arrivals = new Map(this.arrivals)
     copy.newestAt = this.newestAt
     copy.pendingSince = this.pendingSince
     return copy
