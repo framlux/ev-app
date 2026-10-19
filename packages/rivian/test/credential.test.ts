@@ -107,7 +107,19 @@ describe('sealCredential and unsealCredential', () => {
 
   it('throws CredentialUnreadable for a JWE that decrypts to something that is not a credential', async () => {
     const key = await importJWK(keys.publicJwk, 'ECDH-ES+A256KW')
-    for (const plaintext of ['not json', '[]', 'null', '{}', '{"userSessionToken":5}', '{"userSessionToken":""}']) {
+    const notCredentials = [
+      'not json',
+      '[]',
+      '["userSessionToken"]',
+      'null',
+      '{}',
+      '{"userSessionToken":5}',
+      '{"userSessionToken":null}',
+      '{"userSessionToken":["S"]}',
+      '{"userSessionToken":""}',
+      '{"accessToken":"S"}',
+    ]
+    for (const plaintext of notCredentials) {
       const sealed = await new CompactEncrypt(new TextEncoder().encode(plaintext))
         .setProtectedHeader({ alg: 'ECDH-ES+A256KW', enc: 'A256GCM' })
         .encrypt(key)
@@ -115,6 +127,50 @@ describe('sealCredential and unsealCredential', () => {
         CredentialUnreadable,
       )
     }
+  })
+
+  it('is strict: a payload with any field beside userSessionToken is unreadable, not trimmed', async () => {
+    // Only `sealCredential` makes these, and it writes one field. A sealed
+    // string carrying more was made by something else, and is refused whole
+    // instead of having the token read out of it.
+    const key = await importJWK(keys.publicJwk, 'ECDH-ES+A256KW')
+    const withExtras = [
+      '{"userSessionToken":"S","accessToken":"AT"}',
+      '{"userSessionToken":"S","refreshToken":"RT","accessToken":"AT"}',
+      '{"userSessionToken":"S","extra":null}',
+      '{"userSessionToken":"S","__proto__":{"x":1}}',
+      '{"extra":1,"userSessionToken":"S"}',
+    ]
+    for (const plaintext of withExtras) {
+      const sealed = await new CompactEncrypt(new TextEncoder().encode(plaintext))
+        .setProtectedHeader({ alg: 'ECDH-ES+A256KW', enc: 'A256GCM' })
+        .encrypt(key)
+      await expect(unsealCredential(keys.privateJwk, sealed), plaintext).rejects.toBeInstanceOf(
+        CredentialUnreadable,
+      )
+    }
+    // And the exact payload `sealCredential` writes is still read.
+    const exact = await new CompactEncrypt(new TextEncoder().encode('{"userSessionToken":"S"}'))
+      .setProtectedHeader({ alg: 'ECDH-ES+A256KW', enc: 'A256GCM' })
+      .encrypt(key)
+    await expect(unsealCredential(keys.privateJwk, exact)).resolves.toEqual({ userSessionToken: 'S' })
+  })
+
+  it('refuses to seal to a key that carries a private part', async () => {
+    // Sealing needs the public half only; a web pod holding the private key
+    // could read back every credential it writes.
+    const err = await sealCredential(keys.privateJwk, { userSessionToken: 'S' }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(TypeError)
+    expect((err as Error).message).not.toContain(String(keys.privateJwk.d))
+    expect((err as Error).message).toMatch(/private part/)
+    // Whatever the value of `d`, its presence is the refusal.
+    await expect(
+      sealCredential({ ...keys.publicJwk, d: '' }, { userSessionToken: 'S' }),
+    ).rejects.toBeInstanceOf(TypeError)
+    // The public half still seals.
+    await expect(sealCredential(keys.publicJwk, { userSessionToken: 'S' })).resolves.toEqual(
+      expect.any(String),
+    )
   })
 
   it('refuses a JWE sealed with an algorithm other than the two it fixes', async () => {

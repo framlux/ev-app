@@ -1,3 +1,4 @@
+import { inspect } from 'node:util'
 import { describe, expect, it } from 'vitest'
 import { RivianApiError, toRivianApiError } from '../src/errors.js'
 
@@ -39,9 +40,21 @@ function hostileBody(): unknown {
   }
 }
 
-/** Every string form an error can take, as one list. */
+/**
+ * Every string form an error can take, as one list. The last is what
+ * `console.log(err)` and a test runner's diff print: `showHidden` adds the
+ * non-enumerable own properties (`stack`, `message`) and any `[cause]`, so it
+ * is the form that would show a wrapped exception, or a property added later.
+ */
 function surfaces(err: RivianApiError): string[] {
-  return [String(err), err.message, err.redacted(), JSON.stringify(err), err.stack ?? '']
+  return [
+    String(err),
+    err.message,
+    err.redacted(),
+    JSON.stringify(err),
+    err.stack ?? '',
+    inspect(err, { showHidden: true, depth: 5 }),
+  ]
 }
 
 function expectNoSecrets(err: RivianApiError): void {
@@ -79,38 +92,119 @@ describe('toRivianApiError redaction', () => {
     expect(err.cause).toBeUndefined()
   })
 
-  it('drops a code or reason that is shaped like a secret rather than like a code', () => {
-    // The same filter, aimed at the two fields that ARE read. A real token is
-    // long, and an echoed password has a character no code has.
-    const body = {
-      errors: [
-        { extensions: { code: SECRETS.accessToken + SECRETS.refreshToken } },
-        { extensions: { code: PASSWORD_ECHO } },
-        { extensions: { code: 'UNAUTHENTICATED', reason: SECRETS.userSessionToken + SECRETS.otpToken } },
-        { extensions: { code: 'BAD_USER_INPUT', reason: PASSWORD_ECHO } },
-        { extensions: { code: 'RATE_LIMIT', reason: 'two words' } },
-      ],
-    }
-    const err = toRivianApiError(400, body, 'Login')
-    expect(err.codes).toEqual([
-      { code: 'UNAUTHENTICATED' },
-      { code: 'BAD_USER_INPUT' },
-      { code: 'RATE_LIMIT' },
-    ])
-    expectNoSecrets(err)
-  })
-
   it('applies the same filter when the constructor is called directly', () => {
     // The guarantee belongs to the type, not to one way of building it.
     const rich = { code: 'UNAUTHENTICATED', reason: 'expired', accessToken: SECRETS.accessToken }
     const err = new RivianApiError(
       401,
-      [rich, { code: PASSWORD_ECHO }, { code: SECRETS.csrfToken + SECRETS.appSessionToken }],
+      [rich, { code: PASSWORD_ECHO }, { code: SECRETS.csrfToken }, { code: SECRETS.appSessionToken }],
       'getUserInfo',
     )
     expect(err.codes).toEqual([{ code: 'UNAUTHENTICATED', reason: 'expired' }])
     expect(Object.keys(err.codes[0] ?? {}).sort()).toEqual(['code', 'reason'])
     expectNoSecrets(err)
+  })
+
+  describe('the shape filter', () => {
+    /** A code or reason in the second position beside a genuine code, as Rivian sends them. */
+    const asReason = (reason: string) =>
+      toRivianApiError(400, { errors: [{ extensions: { code: 'BAD_USER_INPUT', reason } }] }, 'Login')
+    const asCode = (code: string) => toRivianApiError(400, { errors: [{ extensions: { code } }] }, 'Login')
+
+    it.each(Object.entries(SECRETS))(
+      'refuses the %s sentinel, on its own, as a reason and as a code',
+      (_name, sentinel) => {
+        // Each sentinel is 23 or more characters, so it is UNDER the length caps
+        // (40 for a reason, 48 for a code): it is the secret SHAPE that stops it,
+        // not its length. Tried alone, not concatenated with another to make
+        // it long enough to trip a cap.
+        expect(sentinel.length).toBeLessThanOrEqual(40)
+        expect(asReason(sentinel).codes).toEqual([{ code: 'BAD_USER_INPUT' }])
+        expectNoSecrets(asReason(sentinel))
+        // As a code it is dropped whole, with and without the dash that the
+        // code shape alone would already refuse.
+        for (const form of [sentinel, sentinel.replace(/-/g, '')]) {
+          expect(asCode(form).codes, form).toEqual([])
+          expect(asCode(form).redacted(), form).toBe('Rivian HTTP 400')
+        }
+      },
+    )
+
+    it('refuses a one-time code, however short, as a reason and inside a code', () => {
+      for (const otp of ['123456', '000000', '48291', '7', '1234567890']) {
+        expect(asReason(otp).codes, otp).toEqual([{ code: 'BAD_USER_INPUT' }])
+      }
+      // Six digits inside a longer string; five do not make one.
+      expect(asReason('otp-123456').codes).toEqual([{ code: 'BAD_USER_INPUT' }])
+      expect(asReason('otp-12345').codes).toEqual([{ code: 'BAD_USER_INPUT', reason: 'otp-12345' }])
+      expect(asCode('A123456').codes).toEqual([])
+    })
+
+    it('refuses a UUID, with its dashes or without', () => {
+      const uuid = '3f2504e0-4f89-41d3-a716-446655440000'
+      expect(asReason(uuid).codes).toEqual([{ code: 'BAD_USER_INPUT' }])
+      expect(asReason(uuid.toUpperCase()).codes).toEqual([{ code: 'BAD_USER_INPUT' }])
+      expect(asCode(uuid.replace(/-/g, '')).codes).toEqual([])
+      expect(asCode('x' + uuid.replace(/-/g, '')).codes).toEqual([])
+    })
+
+    it('refuses a long hex run and a long opaque run', () => {
+      expect(asReason('deadbeef').codes).toEqual([{ code: 'BAD_USER_INPUT' }])
+      expect(asReason('session-0123abcd').codes).toEqual([{ code: 'BAD_USER_INPUT' }])
+      // Seven hex digits are not eight.
+      expect(asReason('abcdef0').codes).toEqual([{ code: 'BAD_USER_INPUT', reason: 'abcdef0' }])
+      // Twenty letters and digits in a row: a JWT segment, base64.
+      const jwtHeader = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9'
+      expect(asReason(jwtHeader).codes).toEqual([{ code: 'BAD_USER_INPUT' }])
+      expect(asReason(`${jwtHeader}.eyJzdWIiOiJ4In0.sig`).codes).toEqual([{ code: 'BAD_USER_INPUT' }])
+      expect(asCode('QWxhZGRpbjpvcGVuIHNlc2FtZQ').codes).toEqual([])
+    })
+
+    it('refuses what is not shaped like a code or a reason at all', () => {
+      // An echoed password has a character no identifier has; two words have a space.
+      expect(asCode(PASSWORD_ECHO).codes).toEqual([])
+      expect(asReason(PASSWORD_ECHO).codes).toEqual([{ code: 'BAD_USER_INPUT' }])
+      expect(asReason('two words').codes).toEqual([{ code: 'BAD_USER_INPUT' }])
+      expect(asReason('x'.repeat(41)).codes).toEqual([{ code: 'BAD_USER_INPUT' }])
+      expect(asCode('A' + 'B'.repeat(48)).codes).toEqual([])
+    })
+
+    it('still passes the codes and reasons Rivian actually sends', () => {
+      const codes = [
+        'BAD_USER_INPUT',
+        'UNAUTHENTICATED',
+        'GRAPHQL_VALIDATION_FAILED',
+        'SESSION_MANAGER_ERROR',
+        'RATE_LIMIT',
+        'BAD_CURRENT_PASSWORD',
+        'INTERNAL_SERVER_ERROR',
+      ]
+      for (const code of codes) expect(asCode(code).codes, code).toEqual([{ code }])
+      // Reasons are identifiers or single words, in either case, and not only
+      // the two the classification reads. A reason with a space in it is not
+      // one of these: it is dropped, and the code beside it kept.
+      const reasons = [
+        'INVALID_OTP',
+        'OTP_TOKEN_EXPIRED',
+        'expired',
+        'Expired',
+        'rate_limited',
+        'RateLimited',
+        'session-expired',
+        'v2.expired',
+      ]
+      for (const reason of reasons) {
+        expect(asReason(reason).codes, reason).toEqual([{ code: 'BAD_USER_INPUT', reason }])
+      }
+    })
+
+    it('cannot tell a short secret that looks like a word from a word', () => {
+      // The honest limit of the filter, pinned so nobody mistakes it for a
+      // guarantee: `hunter` has the shape of a reason and none of a secret.
+      // This is why the response body, where such a value would actually be,
+      // is never read, and why the filter is only the second line of defence.
+      expect(asReason('hunter').codes).toEqual([{ code: 'BAD_USER_INPUT', reason: 'hunter' }])
+    })
   })
 
   it('reads nothing from a body that is not an errors array', () => {

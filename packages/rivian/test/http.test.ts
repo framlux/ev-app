@@ -1,3 +1,4 @@
+import { inspect } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RivianApiError } from '../src/errors.js'
 import {
@@ -49,6 +50,21 @@ function stub(reply: (req: Recorded, n: number) => Reply) {
 
 const APP: AppSession = { csrfToken: 'CSRF-1', appSessionToken: 'APP-1' }
 const NORMALISE = (text: string): string => text.replace(/\s+/g, ' ').trim()
+
+/**
+ * Every string form a thrown error can take, including what `console.log(err)`
+ * prints: `showHidden` adds the non-enumerable own properties (`stack`,
+ * `message`) and any `[cause]`, which is where a wrapped exception would show.
+ */
+function allForms(err: unknown): string {
+  return [
+    String(err),
+    (err as Error).message,
+    JSON.stringify(err),
+    (err as Error).stack ?? '',
+    inspect(err, { showHidden: true, depth: 5 }),
+  ].join('\n')
+}
 
 /** The one request a single call made. */
 function only(requests: Recorded[]): Recorded {
@@ -379,8 +395,8 @@ describe('errors', () => {
     expect(err).toBeInstanceOf(RivianApiError)
     expect((err as RivianApiError).httpStatus).toBe(502)
     expect((err as RivianApiError).redacted()).toBe('Rivian HTTP 502')
-    expect(JSON.stringify(err) + String(err) + (err as Error).stack).not.toContain('SECRET')
-    expect(JSON.stringify(err) + String(err)).not.toContain('hunter2')
+    expect(allForms(err)).not.toContain('SECRET')
+    expect(allForms(err)).not.toContain('hunter2')
   })
 
   it('throws for a 2xx that is not JSON as a bad response', async () => {
@@ -453,9 +469,10 @@ describe('errors', () => {
     expect(err).toBeInstanceOf(RivianApiError)
     expect((err as RivianApiError).httpStatus).toBeNull()
     expect((err as RivianApiError).redacted()).toBe('Rivian request failed: NETWORK')
-    const everything = [String(err), (err as Error).message, JSON.stringify(err), (err as Error).stack].join('\n')
+    const everything = allForms(err)
     expect(everything).not.toContain('SECRET')
     expect(everything).not.toContain('hunter2')
+    expect(everything).not.toContain('ECONNREFUSED')
     expect((err as Error).cause).toBeUndefined()
   })
 
@@ -480,7 +497,7 @@ describe('errors', () => {
       .catch((e: unknown) => e)
     expect(err).toBeInstanceOf(RivianApiError)
     expect((err as RivianApiError).badCredentials).toBe(true)
-    const everything = [String(err), (err as Error).message, (err as RivianApiError).redacted(), JSON.stringify(err), (err as Error).stack].join('\n')
+    const everything = [allForms(err), (err as RivianApiError).redacted()].join('\n')
     expect(everything).not.toContain('SECRET')
     expect(everything).not.toContain('someone@example.com')
   })

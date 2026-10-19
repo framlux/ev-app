@@ -15,12 +15,15 @@
  * That is enforced by construction rather than by scrubbing. A scrubber has to
  * recognise every secret in every shape Rivian might put one in; this file only
  * has to refuse to look. Even the two fields it does read are filtered to the
- * SHAPE of a code (a short identifier) and of a reason (a short token), because
- * both are remote text and a response that put a token in either would
- * otherwise carry it straight into `message`, `stack` and the
- * `rivian_status.last_error` column. The filter is a second line of defence, not
- * the first: it cannot tell a short secret from a short word, which is why the
- * response body is never read for anything else.
+ * SHAPE of a code (a short identifier) and of a reason (a short token), and a
+ * value shaped like a secret (a run of digits, a hex run, a long opaque run) is
+ * refused whatever its length, because both fields are remote text and a
+ * response that put a token or a one-time code in either would otherwise carry
+ * it straight into `message`, `stack` and the `rivian_status.last_error`
+ * column. The filter is a second line of defence, not the first: it recognises
+ * the SHAPES secrets usually have, and it cannot tell a short secret that looks
+ * like a word from the word, which is why the response body is never read for
+ * anything else.
  *
  * Every string an error exposes (`message`, `stack`, `redacted()`, the JSON
  * form) is therefore built from those filtered codes, a status number and the
@@ -53,6 +56,32 @@ const CODE_SHAPE = /^[A-Za-z][A-Za-z0-9_]{0,47}$/
 const REASON_SHAPE = /^[A-Za-z0-9_.-]{1,40}$/
 
 /**
+ * The shapes of a secret, which a code or a reason must not have however short
+ * it is. A length cap alone lets an OTP (`123456`), a UUID or a 20-character
+ * token through, because all of those are shorter than any cap that would still
+ * admit `OTP_TOKEN_EXPIRED`. Each rule is something no genuine code or reason
+ * has: they are identifiers made of words, and the longest run of letters or
+ * digits in `GRAPHQL_VALIDATION_FAILED` is ten characters, none of them digits.
+ * - all digits, any length: a one-time code, a numeric id;
+ * - six or more digits in a row: the same, inside a longer string;
+ * - eight or more hex digits in a row: a hex token, or any group of a UUID;
+ * - twenty or more letters and digits in a row: an opaque token, base64 or the
+ *   segment of a JWT.
+ * A run is broken by `_`, `-` and `.`, which is how real identifiers are written
+ * and how the words of one are told apart.
+ */
+const SECRET_SHAPES: readonly RegExp[] = [
+  /^[0-9]+$/,
+  /[0-9]{6,}/,
+  /[0-9a-fA-F]{8,}/,
+  /[A-Za-z0-9]{20,}/,
+]
+
+function looksLikeSecret(value: string): boolean {
+  return SECRET_SHAPES.some((shape) => shape.test(value))
+}
+
+/**
  * More distinct codes than this are cut. Rivian reports a rejected selection as
  * one `GRAPHQL_VALIDATION_FAILED` per bad field, and a group of sixteen can
  * produce sixteen; the cap keeps the redacted line a line. Equal entries are
@@ -79,9 +108,10 @@ const OTP_REASONS: ReadonlySet<string> = new Set(['INVALID_OTP', 'OTP_TOKEN_EXPI
 
 /**
  * The codes an error may hold: each entry reduced to `code` and `reason`, an
- * entry whose code has not the shape of one dropped whole (a reason with no
- * code beside it means nothing), a reason that has not the shape of one
- * dropped alone, equal entries collapsed, and the list cut at `MAX_CODES`.
+ * entry whose code has not the shape of one, or has the shape of a secret,
+ * dropped whole (a reason with no code beside it means nothing), a reason that
+ * has not the shape of one, or has the shape of a secret, dropped alone, equal
+ * entries collapsed, and the list cut at `MAX_CODES`.
  *
  * It runs in the CONSTRUCTOR, not only in `toRivianApiError`, so that the
  * guarantee belongs to the type: no caller, however it builds the list, can
@@ -94,9 +124,11 @@ function keepCodes(input: readonly RivianErrorCode[]): RivianErrorCode[] {
   for (const entry of input) {
     if (kept.length >= MAX_CODES) break
     const { code, reason } = entry
-    if (typeof code !== 'string' || !CODE_SHAPE.test(code)) continue
+    if (typeof code !== 'string' || !CODE_SHAPE.test(code) || looksLikeSecret(code)) continue
     const next: RivianErrorCode =
-      typeof reason === 'string' && REASON_SHAPE.test(reason) ? { code, reason } : { code }
+      typeof reason === 'string' && REASON_SHAPE.test(reason) && !looksLikeSecret(reason)
+        ? { code, reason }
+        : { code }
     if (kept.some((c) => c.code === next.code && c.reason === next.reason)) continue
     kept.push(next)
   }

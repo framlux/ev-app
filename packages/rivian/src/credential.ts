@@ -21,8 +21,17 @@
  * construction: `sealCredential` copies that one field into the plaintext, so a
  * caller that hands it the whole sign-in result (with the access and refresh
  * tokens beside it, which nothing uses and which would only widen the exposure)
- * seals one field of it. The unsealer returns the same single field, so a sealed
- * string that does carry more yields no more.
+ * seals one field of it. The unsealer is STRICT about the same thing: a payload
+ * with any other field beside `userSessionToken`, or with a token that is not a
+ * non-empty string, is `CredentialUnreadable`, not a credential with the extras
+ * ignored. Only this code ever seals one, so a payload with more in it was not
+ * made by it, and the right response to a sealed string we did not make is to
+ * refuse it rather than to read what we like out of it.
+ *
+ * ONLY THE PUBLIC KEY IS EVER NEEDED TO SEAL, and `sealCredential` enforces it:
+ * a JWK that carries a private part is refused, so that a web pod misconfigured
+ * with the private key fails the first sign-in loudly instead of quietly holding
+ * the key that reads back every credential it writes.
  */
 
 import { CompactEncrypt, compactDecrypt, exportJWK, generateKeyPair, importJWK } from 'jose'
@@ -62,6 +71,13 @@ export async function sealCredential(publicJwk: JWK, c: RivianCredential): Promi
   if (typeof c.userSessionToken !== 'string' || c.userSessionToken === '') {
     throw new TypeError('a Rivian credential needs a non-empty userSessionToken')
   }
+  // Sealing needs the public half only. A key with `d` is the private key, and
+  // the caller holding one is the mistake `parseJwk(text, 'public')` exists to
+  // catch at startup; this is the same refusal for a caller that skipped it.
+  // The message names no key material.
+  if (publicJwk.d !== undefined) {
+    throw new TypeError('sealing takes a public key; this key carries a private part')
+  }
   const key = await importJWK(publicJwk, ALG)
   // Only this field, whatever else the argument carries (see the file comment).
   const plaintext = new TextEncoder().encode(
@@ -87,9 +103,18 @@ export async function unsealCredential(privateJwk: JWK, sealed: string): Promise
       contentEncryptionAlgorithms: [ENC],
     })
     const payload: unknown = JSON.parse(new TextDecoder().decode(plaintext))
-    if (typeof payload !== 'object' || payload === null) throw new CredentialUnreadable()
+    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+      throw new CredentialUnreadable()
+    }
+    // Exactly one field, and it a non-empty string (see the file comment).
+    const fields = Object.keys(payload)
     const { userSessionToken } = payload as { userSessionToken?: unknown }
-    if (typeof userSessionToken !== 'string' || userSessionToken === '') {
+    if (
+      fields.length !== 1 ||
+      fields[0] !== 'userSessionToken' ||
+      typeof userSessionToken !== 'string' ||
+      userSessionToken === ''
+    ) {
       throw new CredentialUnreadable()
     }
     return { userSessionToken }
