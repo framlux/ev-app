@@ -1,5 +1,8 @@
 {
   "extends": "./tsconfig.json",
-  "compilerOptions": { "noEmit": true, "rootDir": "." },
+  // rootDir is the repo, not this app: a test imports the shared database guard
+  // from packages/db/test/support, as vitest.config.ts imports isolatedDatabase
+  // from there. Nothing is emitted (noEmit), so this only widens what tsc may read.
+  "compilerOptions": { "noEmit": true, "rootDir": "../.." },
   "include": ["src", "test"]
 }

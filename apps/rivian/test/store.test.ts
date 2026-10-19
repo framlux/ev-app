@@ -8,6 +8,7 @@ import {
 } from '@ev/db'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { pgConnectorStore } from '../src/store.js'
+import { assertTestDatabase } from '../../../packages/db/test/support/test-database.js'
 
 /**
  * `pgConnectorStore` against a real Postgres.
@@ -40,7 +41,11 @@ const empty = () => getPool().query('DELETE FROM rivian_credential; DELETE FROM 
 describe.skipIf(!hasDb)('pgConnectorStore', () => {
   // Generous timeout: this hook may spend most of it waiting on the migration
   // gate while a sibling file migrates.
+  //
+  // The database check comes first: this file empties both tables wholesale,
+  // and it is the per-project database, not anything here, that makes that safe.
   beforeAll(async () => {
+    assertTestDatabase()
     await runMigrationsUnderGate()
   }, 60_000)
 
@@ -49,10 +54,16 @@ describe.skipIf(!hasDb)('pgConnectorStore', () => {
   })
 
   afterAll(async () => {
-    // A sealed credential left in a database is the one fixture here that
-    // something else could mistake for a sign-in.
-    await empty()
-    await closePool()
+    try {
+      // A failed beforeAll does not stop this hook, and a database that failed
+      // the check must not be emptied here either.
+      assertTestDatabase()
+      // A sealed credential left in a database is the one fixture here that
+      // something else could mistake for a sign-in.
+      await empty()
+    } finally {
+      await closePool()
+    }
   })
 
   it('answers null for an empty database, which is how a sign-out looks', async () => {

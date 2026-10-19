@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { closePool, getPool } from '../src/pool.js'
+import { assertTestDatabase } from './support/test-database.js'
 import { runMigrationsUnderGate } from '../src/migrate.js'
 import { withTransaction, type DbClient } from '../src/repo/types.js'
 import {
@@ -49,17 +50,29 @@ const STATES: RivianConnectorState[] = [
 describe.skipIf(!hasDb)('009_rivian', () => {
   // Generous timeout: this hook may spend most of it waiting on the migration
   // gate while a sibling file migrates.
-  beforeAll(async () => { await runMigrationsUnderGate() }, 60_000)
+  //
+  // The database check comes first: this file empties both tables wholesale,
+  // and it is the per-project database, not anything here, that makes that safe.
+  beforeAll(async () => {
+    assertTestDatabase()
+    await runMigrationsUnderGate()
+  }, 60_000)
 
   beforeEach(async () => {
     await getPool().query('DELETE FROM rivian_credential; DELETE FROM rivian_status')
   })
 
   afterAll(async () => {
-    // Leave nothing behind: a sealed credential row left in a database is the
-    // one fixture here that something else could mistake for a sign-in.
-    await getPool().query('DELETE FROM rivian_credential; DELETE FROM rivian_status')
-    await closePool()
+    try {
+      // A failed beforeAll does not stop this hook, and a database that failed
+      // the check must not be emptied here either.
+      assertTestDatabase()
+      // Leave nothing behind: a sealed credential row left in a database is the
+      // one fixture here that something else could mistake for a sign-in.
+      await getPool().query('DELETE FROM rivian_credential; DELETE FROM rivian_status')
+    } finally {
+      await closePool()
+    }
   })
 
   describe('rivian_credential', () => {
