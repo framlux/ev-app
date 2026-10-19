@@ -44,6 +44,16 @@ describe('SAMPLE_COLUMNS', () => {
     }
   })
 
+  // §7.5: the segmenter reasons about `gear`, so the column is typed as the four
+  // canonical letters rather than `string`. Typed as `string`, a vendor's own
+  // word would compile, bind and be stored, and the engine would read it as "not
+  // in Park" for as long as nobody noticed.
+  it('types gear as the canonical Gear, which binds as text', () => {
+    const gear = SAMPLE_COLUMNS.find((c) => c.column === 'gear')
+    expect(gear).toEqual({ column: 'gear', key: 'gear', sql: 'TEXT', ts: 'Gear' })
+    expect(TS_TYPES_FOR_SQL['TEXT']).toContain('Gear')
+  })
+
   // A truncated regeneration would still satisfy every rule above; the point of
   // the catalogue is that it covers the whole applicable signal set (§3.2).
   it('covers the full signal set, not a subset', () => {

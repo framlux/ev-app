@@ -102,21 +102,38 @@ describe('decodeTeslaField: unknown fields', () => {
     // THE CHANGE THIS WORK EXISTS FOR. Both have been streamed since day one
     // and thrown away because there was nowhere to put them; they have columns
     // now, and the tape can be reprocessed to backfill them.
-    expect(decoded('Gear', 'ShiftStateD')).toEqual({ gear: 'ShiftStateD' })
+    expect(decoded('Gear', 'ShiftStateD')).toEqual({ gear: 'D' })
     expect(decoded('ChargeAmps', 32)).toEqual({ chargeAmps: 32 })
     expect(isKnownTeslaField('Gear')).toBe(true)
   })
 })
 
 describe('decodeTeslaField: Gear', () => {
+  it('decodes the four positions to the canonical letter the engine reads', () => {
+    expect(decodeTeslaField('Gear', 'ShiftStateP')).toEqual({ gear: 'P' })
+    expect(decodeTeslaField('Gear', 'ShiftStateR')).toEqual({ gear: 'R' })
+    expect(decodeTeslaField('Gear', 'ShiftStateN')).toEqual({ gear: 'N' })
+    expect(decodeTeslaField('Gear', 'ShiftStateD')).toEqual({ gear: 'D' })
+  })
+
   it('reads a null gear as Park, since that is what a switched-off car is in', () => {
-    // The car sends Gear null when its drive system powers down, and not
-    // always a P first: on the tape it went straight from D or R to null ten
-    // times, stopped every time (2026-09-15 19:40:04, then locked and the
-    // driver's seat empty by 19:42). Ignored, the last D was carried for 51
-    // minutes as if the car sat waiting in gear.
-    expect(decodeTeslaField('Gear', null)).toEqual({ gear: 'ShiftStateP' })
-    expect(decodeTeslaField('Gear', 'ShiftStateR')).toEqual({ gear: 'ShiftStateR' })
+    // 2026-09-15 19:40:04: D or R straight to null, ten times, stopped every time.
+    expect(decodeTeslaField('Gear', null)).toEqual({ gear: 'P' })
+  })
+
+  it('writes an explicit null for a position it cannot name, so an earlier D is not carried', () => {
+    // Today ShiftStateSNA OVERWRITES a carried D (it is not in the driving set).
+    // Returning nothing instead would carry the D and hold the drive open - the
+    // bug 71aa244 fixed - so an unnamed position is an explicit null.
+    expect(decodeTeslaField('Gear', 'ShiftStateSNA')).toEqual({ gear: null })
+    expect(decodeTeslaField('Gear', 'ShiftStateInvalid')).toEqual({ gear: null })
+    // The key is whatever string the car sent, and `'constructor'` is a
+    // property of every object: it must miss the lookup like any other word.
+    expect(decodeTeslaField('Gear', 'constructor')).toEqual({ gear: null })
+  })
+
+  it('still decodes a wrong-typed payload to nothing', () => {
+    expect(decodeTeslaField('Gear', 42)).toBeNull()
   })
 })
 

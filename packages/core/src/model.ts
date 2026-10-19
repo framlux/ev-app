@@ -12,6 +12,14 @@ export type ChargeState =
   | 'complete'
   | 'stopped'
 
+/**
+ * The selector position, canonical across vendors. The segmenter reasons about
+ * it - only Park ends a drive - so, like PowerState and ChargeState, each
+ * normaliser maps its vendor's own vocabulary onto these four letters and the
+ * raw tape keeps the original word.
+ */
+export type Gear = 'P' | 'R' | 'N' | 'D'
+
 export type RawSource = 'telemetry' | 'fleet_api' | 'graphql_ws'
 
 export interface RawMessage {
@@ -36,6 +44,7 @@ interface TsTypeMap {
   Date: Date
   PowerState: PowerState
   ChargeState: ChargeState
+  Gear: Gear
   TpmsMap: Record<string, number>
 }
 

@@ -53,6 +53,7 @@ function sampleValue(c: SampleColumn): unknown {
     case 'boolean': return true
     case 'PowerState': return 'online'
     case 'ChargeState': return 'charging'
+    case 'Gear': return 'D'
     case 'TpmsMap': return { fl: 2.5, fr: 2.5, rl: 2.5, rr: 2.5 }
     case 'Date': return new Date('2026-09-04T09:00:00.000Z')
   }

@@ -78,9 +78,9 @@ export type SqlType =
   | 'JSONB'
 
 /**
- * The TypeScript side of a column. `PowerState`, `ChargeState` and `TpmsMap` are
- * named rather than widened to `string`/`object` because the engine reasons
- * about them and `model.ts` binds each to its real type.
+ * The TypeScript side of a column. `PowerState`, `ChargeState`, `Gear` and
+ * `TpmsMap` are named rather than widened to `string`/`object` because the
+ * engine reasons about them and `model.ts` binds each to its real type.
  */
 export type TsType =
   | 'number'
@@ -89,6 +89,7 @@ export type TsType =
   | 'Date'
   | 'PowerState'
   | 'ChargeState'
+  | 'Gear'
   | 'TpmsMap'
 
 /**
@@ -106,7 +107,7 @@ export const TS_TYPES_FOR_SQL: Record<SqlType, readonly TsType[]> = {
   'DOUBLE PRECISION': ['number'],
   'INT': ['number'],
   'BOOLEAN': ['boolean'],
-  'TEXT': ['string', 'PowerState', 'ChargeState'],
+  'TEXT': ['string', 'PowerState', 'ChargeState', 'Gear'],
   'TIME': ['string'],
   'TIMESTAMPTZ': ['Date'],
   'JSONB': ['TpmsMap'],
@@ -157,8 +158,10 @@ export const SAMPLE_COLUMNS = [
   { column: 'pack_voltage', key: 'packVoltage', sql: 'REAL', ts: 'number' },
   { column: 'pack_current', key: 'packCurrent', sql: 'REAL', ts: 'number' },
   { column: 'dcdc_enable', key: 'dcdcEnable', sql: 'BOOLEAN', ts: 'boolean' },
-  // ShiftState, as the vendor names it
-  { column: 'gear', key: 'gear', sql: 'TEXT', ts: 'string' },
+  // Canonical P/R/N/D, not the vendor's word: the segmenter reasons about it, so
+  // each normaliser maps its own vocabulary onto these four (the tape keeps the
+  // original).
+  { column: 'gear', key: 'gear', sql: 'TEXT', ts: 'Gear' },
   { column: 'isolation_resistance',
     key: 'isolationResistance', sql: 'REAL', ts: 'number' },
   { column: 'pedal_position', key: 'pedalPosition', sql: 'REAL', ts: 'number' },

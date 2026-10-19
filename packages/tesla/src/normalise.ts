@@ -70,6 +70,7 @@ import {
   SAMPLE_COLUMNS,
   makeSample,
   type ChargeState,
+  type Gear,
   type PowerState,
   type RawMessage,
   type SampleColumn,
@@ -201,6 +202,20 @@ const COLUMNS_BY_NAME: ReadonlyMap<string, SampleColumn> = new Map(
 )
 
 /**
+ * Tesla's `ShiftState` enum names, as the canonical letters. Only the four
+ * positions a driver selects: `ShiftStateSNA` ("signal not available") and
+ * `ShiftStateInvalid` are not positions at all and are deliberately absent, so
+ * the lookup misses and the decoder writes a null for them.
+ *
+ * A Map rather than an object literal, because the key is whatever string the
+ * car sent: `{}['constructor']` is a function, and a plain record would hand it
+ * to the decoder as a gear, to be bound as a query parameter.
+ */
+const TESLA_GEARS: ReadonlyMap<string, Gear> = new Map([
+  ['ShiftStateP', 'P'], ['ShiftStateR', 'R'], ['ShiftStateN', 'N'], ['ShiftStateD', 'D'],
+])
+
+/**
  * The fields whose decoding is a judgement rather than a function of the column
  * type. Every one of them collapses several messages into one column, or reads
  * a struct: nine of the ten fields that share a column are here, plus the door
@@ -220,12 +235,23 @@ const FIELD_OVERRIDES: Record<string, (value: unknown) => TeslaFieldUpdate | nul
 
   DoorState: (v) => one('doorsOpen', anyDoorOpen(v)),
 
-  // A null gear is the drive system powering down, and a Tesla that is off is
-  // in Park. It does not always send P first: on the tape it went straight
-  // from D or R to null ten times, stopped every time. Dropped like any other
-  // null, the last D was carried for as long as the car sat, and a parked car
-  // read as one waiting in gear. The raw tape keeps the null.
-  Gear: (v) => one('gear', v === null ? 'ShiftStateP' : str(v)),
+  // Canonical letters, because the segmenter reasons about gear and must not
+  // know any vendor's words (spec §7.5). A null gear is the drive system
+  // powering down, and a Tesla that is off is in Park (71aa244). It does not
+  // always send P first: on the tape it went straight from D or R to null ten
+  // times, stopped every time. Dropped like any other null, the last D was
+  // carried for as long as the car sat, and a parked car read as one waiting in
+  // gear. The raw tape keeps the null.
+  //
+  // A position we cannot name - ShiftStateSNA, ShiftStateInvalid - is an
+  // EXPLICIT null: it used to overwrite a carried D, and `one()` returning
+  // nothing would carry it instead, holding the drive open. A non-string is
+  // still nothing.
+  Gear: (v) => {
+    if (v === null) return { gear: 'P' }
+    if (typeof v !== 'string') return null
+    return { gear: TESLA_GEARS.get(v) ?? null }
+  },
 
   // Power is reported per rail and coalesced at build time. The rail that is
   // actually delivering is recorded here, while we can still see it, because

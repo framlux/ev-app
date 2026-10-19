@@ -196,8 +196,10 @@ function motionOf(
   // whatever the odometer does. The odometer is reported late and on its own
   // delta, so a parked car can wake with it a hundredth of a kilometre on; read
   // as movement, that reset the parked clock and held the drive open all night.
-  // The raw enum string, as Tesla sends it (`catalogue.ts`).
-  if (sample.gear === 'ShiftStateP') return 'stationary'
+  // The canonical letter: every normaliser maps its vendor's own word onto
+  // P/R/N/D before it reaches a sample, so this compares against no vendor's
+  // vocabulary (`Gear` in `model.ts`).
+  if (sample.gear === 'P') return 'stationary'
   // A rising odometer still proves movement; a flat one
   // proves nothing, because odometer resolution is coarse enough to sit still
   // through slow traffic.
@@ -208,8 +210,12 @@ function motionOf(
   return 'unknown'
 }
 
-/** In a driving gear: D, R or N, as Tesla's raw `ShiftState` strings. */
-const DRIVING_GEARS: ReadonlySet<string> = new Set(['ShiftStateD', 'ShiftStateR', 'ShiftStateN'])
+/**
+ * In a driving gear: D, R or N, as the canonical letters every normaliser maps
+ * its vendor's own word onto. Not Park, and not an unnamed position (null), so
+ * a car whose gear we cannot read does not hold a drive open on that alone.
+ */
+const DRIVING_GEARS: ReadonlySet<string> = new Set<string>(['D', 'R', 'N'])
 
 function inGear(sample: VehicleSample): boolean {
   return sample.gear !== null && DRIVING_GEARS.has(sample.gear)

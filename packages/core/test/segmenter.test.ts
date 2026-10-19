@@ -220,7 +220,7 @@ describe('segmenter', () => {
     // parked clock, and every later speedless sample left the drive open for as
     // long as the car sat there.
     const inPark = (sec: number, odo: number) =>
-      makeSample({ vehicleId: 'v1', ts: at(sec), odometerKm: odo, gear: 'ShiftStateP',
+      makeSample({ vehicleId: 'v1', ts: at(sec), odometerKm: odo, gear: 'P',
                    powerState: 'online', chargeState: 'stopped' })
     const { state, events } = run([
       moving(0, 50, 1000, 80),
@@ -239,7 +239,7 @@ describe('segmenter', () => {
                    powerState: 'online', chargeState: 'disconnected' })
     const { events } = run([
       moving(0, 50, 100, 80),
-      noSpeed(400, 105, 'ShiftStateD'),
+      noSpeed(400, 105, 'D'),
       noSpeed(800, 110, null),
     ])
     expect(events.filter((e) => e.type === 'session-end')).toHaveLength(0)
@@ -275,7 +275,7 @@ describe('segmenter', () => {
     // 2026-09-11 22:23: stopped for 5 min 14 s in D, a queue or a light, then
     // on again. Only Park ends a drive; waiting in gear is still the trip.
     const waiting = (sec: number) =>
-      makeSample({ vehicleId: 'v1', ts: at(sec), speedKph: 0, odometerKm: 1001, gear: 'ShiftStateD',
+      makeSample({ vehicleId: 'v1', ts: at(sec), speedKph: 0, odometerKm: 1001, gear: 'D',
                    socPct: 80, powerState: 'online', chargeState: 'disconnected' })
     const { events } = run([
       moving(0, 50, 1000, 80),
@@ -293,12 +293,12 @@ describe('segmenter', () => {
                    socPct: 80, powerState: 'online', chargeState: 'disconnected' })
     const { events } = run([
       moving(0, 50, 1000, 80),
-      inGear(60, 'ShiftStateD'),
-      inGear(240, 'ShiftStateP'),
-      inGear(500, 'ShiftStateP'),
+      inGear(60, 'D'),
+      inGear(240, 'P'),
+      inGear(500, 'P'),
       // Five minutes after Park, not after the stop: 240 + 300.
-      inGear(539, 'ShiftStateP'),
-      inGear(540, 'ShiftStateP'),
+      inGear(539, 'P'),
+      inGear(540, 'P'),
     ])
     expect(ends(events, 'drive').map((e) => e.at)).toEqual([at(539)])
   })
@@ -312,8 +312,8 @@ describe('segmenter', () => {
                    socPct: 80, powerState: 'online', chargeState: 'disconnected' })
     const { events } = run([
       moving(0, 50, 1000, 80),
-      inGear(60, 'ShiftStateP'),
-      inGear(438, 'ShiftStateR'),
+      inGear(60, 'P'),
+      inGear(438, 'R'),
       moving(450, 5, 1001, 80),
     ])
     expect(ends(events, 'drive').map((e) => e.at)).toEqual([at(60)])
