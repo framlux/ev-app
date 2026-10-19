@@ -1,9 +1,10 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { closePool, getPool } from '../src/pool.js'
 import { runMigrationsUnderGate } from '../src/migrate.js'
-import { withTransaction } from '../src/repo/types.js'
+import { withTransaction, type DbClient } from '../src/repo/types.js'
 import {
   deleteRivianCredential, readRivianCredential, readRivianCredentialStamp,
+  readRivianCredentialSummary,
   readRivianStatus, upsertRivianCredential, writeRivianStatus,
   type RivianConnectorState,
 } from '../src/repo/rivian.js'
@@ -65,6 +66,7 @@ describe.skipIf(!hasDb)('009_rivian', () => {
     it('is null while nobody has signed in', async () => {
       expect(await withTransaction(getPool(), (c) => readRivianCredential(c))).toBeNull()
       expect(await withTransaction(getPool(), (c) => readRivianCredentialStamp(c))).toBeNull()
+      expect(await withTransaction(getPool(), (c) => readRivianCredentialSummary(c))).toBeNull()
     })
 
     it('stores a credential and reads it back', async () => {
@@ -116,6 +118,51 @@ describe.skipIf(!hasDb)('009_rivian', () => {
       expect(stamp?.getTime()).toBe(row?.updatedAt.getTime())
     })
 
+    it('reads the account and both stamps without ever selecting the sealed value', async () => {
+      await withTransaction(getPool(), (c) =>
+        upsertRivianCredential(c, { sealed: 'jwe-one', account: 'owner@example.com' }))
+      const full = await withTransaction(getPool(), (c) => readRivianCredential(c))
+
+      // The statement is recorded, not just the result: a result without
+      // `sealed` would also come from a reader that selected it and dropped it
+      // in JavaScript, and the web pod would still have held the string.
+      const statements: string[] = []
+      const summary = await withTransaction(getPool(), (c) => {
+        const recording = {
+          query: (...args: unknown[]) => {
+            statements.push(String(typeof args[0] === 'string' ? args[0] : ''))
+            return (c.query as (...a: unknown[]) => unknown)(...args)
+          },
+        } as unknown as DbClient
+        return readRivianCredentialSummary(recording)
+      })
+
+      expect(statements).toHaveLength(1)
+      expect(statements[0]).not.toMatch(/sealed/i)
+      expect(statements[0]).not.toContain('*')
+      expect(summary).toEqual({
+        account: 'owner@example.com',
+        createdAt: full?.createdAt,
+        updatedAt: full?.updatedAt,
+      })
+      expect(Object.keys(summary!).sort()).toEqual(['account', 'createdAt', 'updatedAt'])
+    })
+
+    it('moves the summary with a second sign-in, as the full read does', async () => {
+      await withTransaction(getPool(), (c) =>
+        upsertRivianCredential(c, { sealed: 'jwe-one', account: 'owner@example.com' }))
+      const first = await withTransaction(getPool(), (c) => readRivianCredentialSummary(c))
+
+      await sleep(10)
+      await withTransaction(getPool(), (c) =>
+        upsertRivianCredential(c, { sealed: 'jwe-two', account: 'second@example.com' }))
+      const second = await withTransaction(getPool(), (c) => readRivianCredentialSummary(c))
+
+      expect(second?.account).toBe('second@example.com')
+      expect(second!.updatedAt.getTime()).toBeGreaterThan(first!.updatedAt.getTime())
+      expect(second?.createdAt.getTime()).toBe(first?.createdAt.getTime())
+    })
+
     it('deletes the credential, which is what signing out is', async () => {
       await withTransaction(getPool(), (c) =>
         upsertRivianCredential(c, { sealed: 'jwe-one', account: 'owner@example.com' }))
@@ -123,6 +170,7 @@ describe.skipIf(!hasDb)('009_rivian', () => {
 
       expect(await withTransaction(getPool(), (c) => readRivianCredential(c))).toBeNull()
       expect(await withTransaction(getPool(), (c) => readRivianCredentialStamp(c))).toBeNull()
+      expect(await withTransaction(getPool(), (c) => readRivianCredentialSummary(c))).toBeNull()
     })
 
     it('treats deleting an absent credential as done', async () => {

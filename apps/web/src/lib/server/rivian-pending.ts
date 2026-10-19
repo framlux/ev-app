@@ -23,6 +23,7 @@
  * a successful code or a sign-out clears it, and a restart empties the process.
  * A wrong code is deliberately NOT one of them: the entry survives, so a typo in
  * the code costs a retype rather than a second password entry and a second code.
+ * An EXPIRED token is the opposite case and does clear it (see `submitOtp`).
  *
  * Keyed by the app session's SUBJECT, for the reason `tesla-session.ts` spells
  * out at length: the app's session is a stateless sealed cookie with no
@@ -47,8 +48,9 @@ export interface PendingOtp {
  * Ten minutes. Rivian's own `otpToken` has a lifetime we have not been told, and
  * a code arrives within seconds, so this is a bound on how long a half-made
  * sign-in may sit in memory rather than a promise about Rivian's side. When
- * Rivian expires the token sooner, the answer is `OTP_TOKEN_EXPIRED`, which the
- * user sees as "Wrong or expired code" and fixes by signing in again.
+ * Rivian expires the token sooner, the answer is `OTP_TOKEN_EXPIRED`: the user sees
+ * "Wrong or expired code", `submitOtp` clears the entry (a dead token cannot
+ * succeed), and signing in again is the fix.
  */
 export const PENDING_TTL_MS = 10 * 60_000
 

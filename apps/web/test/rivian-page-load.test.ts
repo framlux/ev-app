@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 /**
@@ -5,19 +7,25 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
  * what it refuses to pass on.
  *
  * `components.test.ts` renders the `.svelte` against hand-written `data`, so
- * whether the load really drops the sealed credential on its way to the browser
- * is decided here or nowhere. The database is mocked at the module this app
+ * what the load actually reads and forwards (which reader, which fields, which
+ * dates as strings) is decided here or nowhere. The sealed credential is kept
+ * out by never SELECTing it: the load reads `readRivianCredentialSummary`, and
+ * the last block of this file fails if any web source names the full reader.
+ * The database is mocked at the module this app
  * already owns (`$lib/server/db.js`); the pending-code map is real, because
  * "is there an attempt in progress" is a fact about that map and a fake of it
  * would only restate the test.
  */
-const readRivianCredential = vi.fn()
+const readRivianCredentialSummary = vi.fn()
 const readRivianStatus = vi.fn()
 
 vi.mock('../src/lib/server/db.js', () => ({
 	getPool: () => ({}) as never,
 	withTransaction: (_pool: unknown, fn: (c: unknown) => unknown) => fn({}),
-	readRivianCredential: (...args: unknown[]) => readRivianCredential(...args),
+	readRivianCredentialSummary: (...args: unknown[]) => readRivianCredentialSummary(...args),
+	// `readRivianCredential` is deliberately NOT provided. The web must never
+	// SELECT the sealed column, and a mocked module that lacks the full reader
+	// makes any call to it throw here rather than quietly succeed.
 	readRivianStatus: (...args: unknown[]) => readRivianStatus(...args)
 }))
 
@@ -25,8 +33,6 @@ const { load } = await import('../src/routes/settings/rivian/+page.server.js')
 const { clearPendingOtp, setPendingOtp } = await import('../src/lib/server/rivian-pending.js')
 
 const SUBJECT = 'operator'
-const SEALED = 'eyJhbGciOiJFQ0RILUVTK0EyNTZLVyIsImVuYyI6IkEyNTZHQ00ifQ.SEALED-VALUE.iv.ct.tag'
-
 const event = (sub: string | null = SUBJECT) =>
 	({ locals: { user: sub ? { sub } : null } }) as never
 
@@ -55,8 +61,13 @@ const loaded = async (sub: string | null = SUBJECT) => {
 	return data as unknown as Loaded
 }
 
+/**
+ * What `readRivianCredentialSummary` returns: the account and both stamps. There
+ * is no `sealed` here because the reader's query does not select it
+ * (packages/db/test/rivian-repo.test.ts pins that), so a load that tried to
+ * pass it on would have nothing to pass.
+ */
 const CREDENTIAL_ROW = {
-	sealed: SEALED,
 	account: 'owner@example.com',
 	createdAt: new Date('2026-10-01T08:00:00.000Z'),
 	updatedAt: new Date('2026-10-18T09:30:00.000Z')
@@ -94,7 +105,7 @@ afterEach(() => {
 
 describe('the Rivian page load', () => {
 	it('with no rows, says so: no credential and no status, both null', async () => {
-		readRivianCredential.mockResolvedValue(null)
+		readRivianCredentialSummary.mockResolvedValue(null)
 		readRivianStatus.mockResolvedValue(null)
 
 		const data = await loaded()
@@ -105,7 +116,7 @@ describe('the Rivian page load', () => {
 	})
 
 	it('with rows, passes on the account and its stamp, and the status as the connector wrote it', async () => {
-		readRivianCredential.mockResolvedValue(CREDENTIAL_ROW)
+		readRivianCredentialSummary.mockResolvedValue(CREDENTIAL_ROW)
 		readRivianStatus.mockResolvedValue(STATUS_ROW)
 
 		const data = await loaded()
@@ -124,24 +135,30 @@ describe('the Rivian page load', () => {
 		})
 	})
 
-	it('never passes the sealed credential on, under any name, anywhere in the object', async () => {
-		readRivianCredential.mockResolvedValue(CREDENTIAL_ROW)
+	it('passes on nothing but the account and the stamp, and nothing about a sealed value', async () => {
+		readRivianCredentialSummary.mockResolvedValue(CREDENTIAL_ROW)
 		readRivianStatus.mockResolvedValue(STATUS_ROW)
 
 		const data = await loaded()
 		const seen = everything(data)
-		expect(seen).not.toContain('sealed')
-		for (const text of seen) {
-			expect(text).not.toContain('SEALED-VALUE')
-			expect(text.toLowerCase()).not.toContain('sealed')
-		}
+		for (const text of seen) expect(text.toLowerCase()).not.toContain('sealed')
+		expect(Object.keys(data.credential!).sort()).toEqual(['account', 'updatedAt'])
 		// Nor the connector's internal vehicle id, which nothing on the page shows.
 		expect(seen).not.toContain('rivianVehicleId')
 		expect(JSON.stringify(data)).not.toContain('01-internal-vehicle-id')
 	})
 
+	it('reads the credential only through the summary reader, which the module mock enforces', async () => {
+		readRivianCredentialSummary.mockResolvedValue(null)
+		readRivianStatus.mockResolvedValue(null)
+		await loaded()
+		// The mocked db module has no `readRivianCredential` at all, so reaching
+		// the full reader would have thrown above; this pins the positive side.
+		expect(readRivianCredentialSummary).toHaveBeenCalledTimes(1)
+	})
+
 	it('keeps an empty dropped list empty and a missing field null, never turning either into a claim', async () => {
-		readRivianCredential.mockResolvedValue(null)
+		readRivianCredentialSummary.mockResolvedValue(null)
 		readRivianStatus.mockResolvedValue({
 			...STATUS_ROW,
 			state: 'signed_out',
@@ -164,10 +181,10 @@ describe('the Rivian page load', () => {
 	})
 
 	it('reads both rows, and only those', async () => {
-		readRivianCredential.mockResolvedValue(null)
+		readRivianCredentialSummary.mockResolvedValue(null)
 		readRivianStatus.mockResolvedValue(null)
 		await loaded()
-		expect(readRivianCredential).toHaveBeenCalledTimes(1)
+		expect(readRivianCredentialSummary).toHaveBeenCalledTimes(1)
 		expect(readRivianStatus).toHaveBeenCalledTimes(1)
 	})
 
@@ -180,7 +197,7 @@ describe('the Rivian page load', () => {
 		})
 
 		it('reflects an attempt in progress for THIS subject', async () => {
-			readRivianCredential.mockResolvedValue(null)
+			readRivianCredentialSummary.mockResolvedValue(null)
 			readRivianStatus.mockResolvedValue(null)
 
 			setPendingOtp(SUBJECT, attempt(new Date(Date.now() + 5 * 60_000)))
@@ -190,7 +207,7 @@ describe('the Rivian page load', () => {
 		})
 
 		it('is false once the attempt has expired, and the read evicts it', async () => {
-			readRivianCredential.mockResolvedValue(null)
+			readRivianCredentialSummary.mockResolvedValue(null)
 			readRivianStatus.mockResolvedValue(null)
 
 			setPendingOtp(SUBJECT, attempt(new Date(Date.now() - 1)), new Date(0))
@@ -198,12 +215,57 @@ describe('the Rivian page load', () => {
 		})
 
 		it('does not put the attempt itself in the data, only whether there is one', async () => {
-			readRivianCredential.mockResolvedValue(null)
+			readRivianCredentialSummary.mockResolvedValue(null)
 			readRivianStatus.mockResolvedValue(null)
 			setPendingOtp(SUBJECT, attempt(new Date(Date.now() + 60_000)))
 
 			const seen = everything(await loaded())
 			for (const secret of ['csrf', 'app', 'otp']) expect(seen).not.toContain(secret)
 		})
+	})
+})
+
+/**
+ * The web must never SELECT the sealed column (§4.2): it writes the JWE and
+ * does not read it back. `readRivianCredential` is the reader that selects it,
+ * so nothing under `src` may name it, and `$lib/server/db.ts` must not
+ * re-export it. A name that cannot be imported cannot be called by a later
+ * edit that did not know why it was left out.
+ *
+ * Comments are stripped first, because db.ts and the page load explain the
+ * rule by naming the function it forbids.
+ */
+describe('the web never names the reader that selects the sealed credential', () => {
+	function sourceFiles(dir: string): string[] {
+		const out: string[] = []
+		for (const entry of readdirSync(dir)) {
+			const full = join(dir, entry)
+			if (statSync(full).isDirectory()) out.push(...sourceFiles(full))
+			else if (/\.(ts|svelte|js)$/.test(entry)) out.push(full)
+		}
+		return out
+	}
+	const stripComments = (src: string) =>
+		src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+
+	const files = sourceFiles(new URL('../src', import.meta.url).pathname)
+
+	it('finds source files, so a pass means something', () => {
+		expect(files.length).toBeGreaterThan(0)
+	})
+
+	it('has no reference to readRivianCredential in any source file', () => {
+		// `\b` after the name: `readRivianCredentialSummary` is a different word.
+		const offenders = files.filter((f) =>
+			/\breadRivianCredential\b/.test(stripComments(readFileSync(f, 'utf8'))))
+		expect(offenders).toEqual([])
+	})
+
+	it('still catches a re-export of it, which is the shape this forbids', () => {
+		const reexport = `export { readRivianCredential, readRivianStatus } from '@ev/db'`
+		expect(/\breadRivianCredential\b/.test(stripComments(reexport))).toBe(true)
+		// And does not mistake the summary reader, or a comment, for it.
+		expect(/\breadRivianCredential\b/.test(stripComments(`import { readRivianCredentialSummary } from 'x'`))).toBe(false)
+		expect(/\breadRivianCredential\b/.test(stripComments(`// readRivianCredential\n/* readRivianCredential */`))).toBe(false)
 	})
 })

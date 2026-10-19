@@ -31,6 +31,8 @@
 	interface Outcome {
 		status: 'signed_in' | 'otp_required' | 'error'
 		message?: string
+		/** The half-made sign-in is gone on the server: no code can finish it. */
+		restart?: boolean
 	}
 
 	let email = $state('')
@@ -40,6 +42,13 @@
 	let failure = $state<string | null>(null)
 	/** Set by an `otp_required` answer, so the code box appears without a reload. */
 	let sentCode = $state(false)
+	/**
+	 * Set when the server says the attempt is gone (its token expired, or ten
+	 * minutes passed). It overrides `data.pendingOtp`, which is only as fresh as
+	 * the last load and would otherwise keep a code box on screen that no code
+	 * can work in.
+	 */
+	let codeEnded = $state(false)
 
 	let clock = $derived(new Date(Date.parse(data.now)))
 	let credential = $derived(data.credential)
@@ -51,11 +60,15 @@
 	 * the box survive a reload, and a second tab: the attempt lives in the pod's
 	 * memory, not in this component.
 	 */
-	let showCode = $derived(sentCode || data.pendingOtp)
+	let showCode = $derived(!codeEnded && (sentCode || data.pendingOtp))
 
 	/**
 	 * The connector's states (§5.2) in words, each with the one sentence that
-	 * says what to DO about it, or that nothing needs doing. A state this page
+	 * says what to DO about it, or that nothing needs doing. The two that need a
+	 * new sign-in say "sign out, then sign in again" and not just "sign in":
+	 * while a credential row exists this page shows the account and a Sign out
+	 * button, and the sign-in form is hidden, so the first half of that is the
+	 * step that actually has to be taken. A state this page
 	 * has not heard of is shown as it came, so a state added later reads as
 	 * itself instead of as a blank.
 	 */
@@ -64,7 +77,7 @@
 		starting: { label: 'Starting', hint: 'reading the credential and opening an app session' },
 		credential_invalid: {
 			label: 'Credential unreadable',
-			hint: "the stored credential does not open with the connector's key — sign in again"
+			hint: "the stored credential does not open with the connector's key — sign out, then sign in again"
 		},
 		finding_vehicle: { label: 'Finding the vehicle', hint: 'looking for the VIN on the account' },
 		waiting_for_vehicle: {
@@ -76,7 +89,7 @@
 		backing_off: { label: 'Backing off', hint: 'the stream dropped — retrying with a growing delay' },
 		unauthenticated: {
 			label: 'Session refused',
-			hint: 'Rivian no longer accepts the saved session — sign in again'
+			hint: 'Rivian no longer accepts the saved session — sign out, then sign in again'
 		}
 	}
 
@@ -144,6 +157,7 @@
 			password = ''
 			if (outcome.status === 'otp_required') {
 				sentCode = true
+				codeEnded = false
 				return
 			}
 			// A reload rather than splicing the account in: who is signed in, the
@@ -166,6 +180,10 @@
 				// The attempt survives a wrong code on the server, so the box stays
 				// and the user can type it again.
 				failure = outcome.message ?? 'Rivian did not accept the code'
+				if (outcome.restart) {
+					code = ''
+					codeEnded = true
+				}
 				return
 			}
 			code = ''
@@ -287,6 +305,11 @@
 
 			{#if failure}
 				<p class="failure" role="alert">{failure}</p>
+			{/if}
+			{#if codeEnded}
+				<p class="faint note">
+					That sign-in attempt has ended. Enter your email and password again to get a new code.
+				</p>
 			{/if}
 
 			<p class="faint note">

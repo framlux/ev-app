@@ -1,7 +1,7 @@
 import type { PageServerLoad } from './$types.js'
 import {
 	getPool,
-	readRivianCredential,
+	readRivianCredentialSummary,
 	readRivianStatus,
 	withTransaction
 } from '$lib/server/db.js'
@@ -19,21 +19,21 @@ import { getPendingOtp } from '$lib/server/rivian-pending.js'
  * and never merged: "signed in as X" with a status of `credential_invalid` is
  * exactly the situation the page exists to make visible.
  *
- * WHAT IS NOT PASSED ON. `readRivianCredential` returns the sealed credential
- * with the account, and this load takes the account and the stamp from it and
- * nothing else. The sealed string is no use without the connector's private
- * key, which this pod never holds, but there is no reason for the browser to
- * have it, and a page `data` object is serialised into the HTML of every
- * render. The status's internal vehicle id is left out too: nothing shows it.
- * `lastError` is passed as the connector stored it, which is the §4.4 redacted
- * form and nothing richer; this load adds no text of its own to it.
+ * WHAT THIS PAGE NEVER HAS. It reads the credential through
+ * `readRivianCredentialSummary`, whose query does not select the sealed
+ * column, so the sealed string is never in this pod's memory to be passed on,
+ * and a page `data` object (which is serialised into the HTML of every render)
+ * cannot carry it however the load is edited. The status's internal vehicle id
+ * is left out of the data: nothing shows it. `lastError` is passed as the
+ * connector stored it, which is the §4.4 redacted form and nothing richer; this
+ * load adds no text of its own to it.
  *
  * Dates become ISO strings here, as the telemetry page's DTO does, so what the
  * page receives is plain data whatever the transport does to a `Date`.
  */
 export const load: PageServerLoad = async ({ locals }) => {
 	const { credential, status } = await withTransaction(getPool(), async (c) => ({
-		credential: await readRivianCredential(c),
+		credential: await readRivianCredentialSummary(c),
 		status: await readRivianStatus(c)
 	}))
 

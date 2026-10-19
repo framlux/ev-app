@@ -88,6 +88,28 @@ afterEach(() => {
 	vi.clearAllMocks()
 })
 
+/**
+ * Each route answers a POST and nothing else.
+ *
+ * SvelteKit answers a method the module does not export with a 405 of its own,
+ * which is exactly what is wanted: a GET of /api/v1/rivian/login must not be a
+ * way to sign in (the password would be in the URL, which everything between
+ * here and the browser logs), and a GET of /logout must not be a link that signs
+ * the car out when something prefetches it. An exported `GET` added later, for
+ * convenience, would quietly be both.
+ */
+describe('the route modules export a POST handler and nothing else', () => {
+	it.each([
+		['login', '../src/routes/api/v1/rivian/login/+server.js'],
+		['otp', '../src/routes/api/v1/rivian/otp/+server.js'],
+		['logout', '../src/routes/api/v1/rivian/logout/+server.js']
+	])('%s', async (_name, path) => {
+		const module = await import(/* @vite-ignore */ path)
+		expect(Object.keys(module)).toEqual(['POST'])
+		expect(typeof module.POST).toBe('function')
+	})
+})
+
 describe('every route refuses without a session, before it reads anything', () => {
 	it.each([
 		['login', login],
@@ -207,7 +229,9 @@ describe('login then otp', () => {
 		const res = await otp(post({ code: OTP_CODE }))
 		expect(JSON.parse(await res.text())).toEqual({
 			status: 'error',
-			message: 'Wrong or expired code'
+			message: 'Wrong or expired code',
+			// The attempt is gone, so the page is told to take the code box away.
+			restart: true
 		})
 		expect(calls).toEqual([])
 	})

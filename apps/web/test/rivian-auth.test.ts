@@ -1,3 +1,4 @@
+import { formatWithOptions } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { JWK } from 'jose'
 import {
@@ -59,12 +60,23 @@ const WRONG_CODE = 'Wrong or expired code'
 const logged: string[] = []
 const spies: ReturnType<typeof vi.spyOn>[] = []
 
+/**
+ * A console call as the terminal would show it. NOT `JSON.stringify`: that
+ * gives `{}` for an Error (its message and stack are not enumerable), so a
+ * `console.error(err)` with a secret in `err.message`, the most likely way a
+ * secret ever reaches a log, would have passed this file's check unseen.
+ * `formatWithOptions` is what `console` itself uses, with the depth limit lifted
+ * so a secret nested four levels down in an object is not hidden as `[Object]`.
+ * An Error comes out as its stack, which begins with its message.
+ */
+const asLogged = (args: unknown[]) => formatWithOptions({ depth: null }, ...args)
+
 beforeEach(() => {
 	logged.length = 0
 	for (const level of ['log', 'info', 'warn', 'error', 'debug'] as const) {
 		spies.push(
 			vi.spyOn(console, level).mockImplementation((...args: unknown[]) => {
-				logged.push(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '))
+				logged.push(asLogged(args))
 			})
 		)
 	}
@@ -158,6 +170,27 @@ const noSecrets = (text: string) => {
 	for (const secret of SECRETS) expect(text).not.toContain(secret)
 }
 
+describe('the file-wide console check', () => {
+	// The check in `afterEach` is only worth having if it can fail. These write
+	// a secret to the console the ways a careless line would, confirm the
+	// recorder sees it, and then empty the record so that the check itself does
+	// not fail the test that proves it works.
+	it.each([
+		['an Error whose message carries the password', () => console.error(new Error(`failed for ${PASSWORD}`))],
+		[
+			'an Error whose cause carries a token',
+			() => console.warn(new Error('sign-in failed', { cause: new Error(USER_SESSION_TOKEN) }))
+		],
+		['an object with the code four levels down', () => console.log({ a: { b: { c: { code: OTP_CODE } } } })],
+		['a string argument', () => console.info('token', OTP_TOKEN)]
+	])('records %s', (_name, write) => {
+		write()
+		expect(logged.length).toBeGreaterThan(0)
+		expect(SECRETS.some((secret) => logged.join('\n').includes(secret))).toBe(true)
+		logged.length = 0
+	})
+})
+
 describe('signing in without a second factor', () => {
 	it('seals the user session token alone, saves it once, and names the account', async () => {
 		const h = await harness()
@@ -247,25 +280,60 @@ describe('signing in with a second factor', () => {
 		expect(h.saved).toHaveLength(1)
 	})
 
-	it.each([
-		['a wrong code', 'BAD_USER_INPUT', 'INVALID_OTP'],
-		['a code whose token has expired', 'UNAUTHENTICATED', 'OTP_TOKEN_EXPIRED']
-	])('%s gives the one message the design names', async (_name, code, reason) => {
+	it('a wrong code gives the one message the design names, and no restart', async () => {
 		const h = await harness(fakeHttp({ login: { kind: 'otp', otpToken: OTP_TOKEN } }))
 		await signIn(h.deps, SUBJECT, EMAIL, PASSWORD)
-		h.http.loginWithOtp.mockRejectedValueOnce(apiError(code, reason, 200))
+		h.http.loginWithOtp.mockRejectedValueOnce(apiError('BAD_USER_INPUT', 'INVALID_OTP', 200))
+		const outcome = await submitOtp(h.deps, SUBJECT, OTP_CODE)
+		// `toEqual` ignores an absent key but not a present one, so this proves
+		// the page is not told to take the code box away.
+		expect(outcome).toEqual({ status: 'error', message: WRONG_CODE })
+		expect(outcome).not.toHaveProperty('restart')
+		expect(getPendingOtp(SUBJECT, NOW)).not.toBeNull()
+	})
+
+	it('an expired token ends the attempt: same message, entry cleared, page told to restart', async () => {
+		const h = await harness(fakeHttp({ login: { kind: 'otp', otpToken: OTP_TOKEN } }))
+		await signIn(h.deps, SUBJECT, EMAIL, PASSWORD)
+		h.http.loginWithOtp.mockRejectedValueOnce(apiError('UNAUTHENTICATED', 'OTP_TOKEN_EXPIRED', 200))
+
 		expect(await submitOtp(h.deps, SUBJECT, OTP_CODE)).toEqual({
 			status: 'error',
-			message: WRONG_CODE
+			message: WRONG_CODE,
+			restart: true
 		})
-		expect(getPendingOtp(SUBJECT, NOW)).not.toBeNull()
+		expect(h.saved).toEqual([])
+		// A dead token cannot succeed, so keeping it would only invite retries.
+		expect(getPendingOtp(SUBJECT, NOW)).toBeNull()
+
+		// And the next code is refused WITHOUT another call to Rivian: the user
+		// has to sign in again, which is the whole point of clearing it.
+		expect(await submitOtp(h.deps, SUBJECT, OTP_CODE)).toEqual({
+			status: 'error',
+			message: WRONG_CODE,
+			restart: true
+		})
+		expect(h.http.loginWithOtp).toHaveBeenCalledTimes(1)
+	})
+
+	it('signing in again after an expired token starts a fresh attempt that can finish', async () => {
+		const http = fakeHttp({ login: { kind: 'otp', otpToken: OTP_TOKEN } })
+		const h = await harness(http)
+		await signIn(h.deps, SUBJECT, EMAIL, PASSWORD)
+		http.loginWithOtp.mockRejectedValueOnce(apiError('UNAUTHENTICATED', 'OTP_TOKEN_EXPIRED', 200))
+		await submitOtp(h.deps, SUBJECT, OTP_CODE)
+
+		await signIn(h.deps, SUBJECT, EMAIL, PASSWORD)
+		expect(await submitOtp(h.deps, SUBJECT, OTP_CODE)).toEqual({ status: 'signed_in' })
+		expect(h.saved).toHaveLength(1)
 	})
 
 	it('with no attempt in progress, a code is refused without calling Rivian', async () => {
 		const h = await harness()
 		expect(await submitOtp(h.deps, SUBJECT, OTP_CODE)).toEqual({
 			status: 'error',
-			message: WRONG_CODE
+			message: WRONG_CODE,
+			restart: true
 		})
 		expect(h.http.loginWithOtp).not.toHaveBeenCalled()
 		expect(h.http.createCsrf).not.toHaveBeenCalled()
@@ -276,7 +344,8 @@ describe('signing in with a second factor', () => {
 		await signIn(h.deps, SUBJECT, EMAIL, PASSWORD)
 		expect(await submitOtp(h.deps, 'someone-else', OTP_CODE)).toEqual({
 			status: 'error',
-			message: WRONG_CODE
+			message: WRONG_CODE,
+			restart: true
 		})
 		expect(h.http.loginWithOtp).not.toHaveBeenCalled()
 		expect(getPendingOtp(SUBJECT, NOW)).not.toBeNull()
@@ -298,7 +367,8 @@ describe('the ten-minute window', () => {
 		h.clock.now = new Date(NOW.getTime() + PENDING_TTL_MS)
 		expect(await submitOtp(h.deps, SUBJECT, OTP_CODE)).toEqual({
 			status: 'error',
-			message: WRONG_CODE
+			message: WRONG_CODE,
+			restart: true
 		})
 		expect(h.http.loginWithOtp).not.toHaveBeenCalled()
 		expect(h.saved).toEqual([])
@@ -417,27 +487,98 @@ describe('a server that cannot seal', () => {
 		expect(getPendingOtp(SUBJECT, NOW)).toBeNull()
 	})
 
-	it('a key with a private part is refused loudly, and the token goes nowhere', async () => {
+	/**
+	 * Keys that `parseJwk` would let through or that a caller could hand the deps
+	 * directly, and that cannot seal. Each must fail BEFORE Rivian is asked for
+	 * anything: found at the end of a sign-in, it would have spent a password
+	 * login (or a single-use code) on a session nobody can store.
+	 */
+	const unusableKeys = async (): Promise<[string, JWK, string][]> => {
 		const keys = await generateCredentialKeys()
-		const h = await harness(fakeHttp(), { publicJwk: keys.privateJwk })
+		return [
+			['one with a private part', keys.privateJwk, keys.privateJwk.d!],
+			// A well-formed public key whose point is not on the curve: it parses,
+			// and only importing it finds out.
+			['one that is not a point on the curve', { ...keys.publicJwk, y: keys.publicJwk.x! }, '']
+		]
+	}
+
+	it.each([0, 1])('sign-in refuses an unusable key (%#) before any call to Rivian', async (i) => {
+		const [, key, privatePart] = (await unusableKeys())[i]!
+		const h = await harness(fakeHttp(), { publicJwk: key })
 		const failure = await signIn(h.deps, SUBJECT, EMAIL, PASSWORD).then(
 			() => null,
 			(e: unknown) => e
 		)
 		expect(failure).toBeInstanceOf(Error)
-		// Neither the token nor the key's private part is in what was thrown.
+		// Not one Rivian call, so no login was spent and no token ever existed.
+		expect(h.http.createCsrf).not.toHaveBeenCalled()
+		expect(h.http.login).not.toHaveBeenCalled()
+		expect(h.saved).toEqual([])
+		expect(getPendingOtp(SUBJECT, NOW)).toBeNull()
+		// Neither a secret nor the key's private part is in what was thrown.
 		noSecrets(String((failure as Error).message) + String((failure as Error).stack))
-		expect((failure as Error).message).not.toContain(keys.privateJwk.d!)
+		if (privatePart) expect((failure as Error).message).not.toContain(privatePart)
+	})
+
+	it.each([0, 1])(
+		'code step refuses an unusable key (%#) before Rivian sees the code, and keeps the attempt',
+		async (i) => {
+			const [, key] = (await unusableKeys())[i]!
+			const http = fakeHttp({ login: { kind: 'otp', otpToken: OTP_TOKEN } })
+			const good = await harness(http)
+			await signIn(good.deps, SUBJECT, EMAIL, PASSWORD)
+			expect(getPendingOtp(SUBJECT, NOW)).not.toBeNull()
+
+			// The same attempt, now meeting a server whose key has gone wrong.
+			const failure = await submitOtp({ ...good.deps, publicJwk: key }, SUBJECT, OTP_CODE).then(
+				() => null,
+				(e: unknown) => e
+			)
+			expect(failure).toBeInstanceOf(Error)
+			// A code is single-use: Rivian must not have been given it.
+			expect(http.loginWithOtp).not.toHaveBeenCalled()
+			expect(good.saved).toEqual([])
+			noSecrets(String((failure as Error).message) + String((failure as Error).stack))
+
+			// And the attempt is untouched, so once the key is fixed the SAME
+			// attempt finishes without another password entry.
+			expect(getPendingOtp(SUBJECT, NOW)).not.toBeNull()
+			expect(await submitOtp(good.deps, SUBJECT, OTP_CODE)).toEqual({ status: 'signed_in' })
+			expect(good.saved).toHaveLength(1)
+		}
+	)
+
+	it('a failed save after sign-in is rethrown as the save\'s own error, never reported as a sign-in', async () => {
+		const failureFromSave = new Error('connection terminated')
+		const h = await harness(fakeHttp(), {
+			save: async () => {
+				throw failureFromSave
+			}
+		})
+		// Rejected with that very error: no outcome object was returned, so the
+		// page cannot be told `signed_in` about a credential that was not stored.
+		await expect(signIn(h.deps, SUBJECT, EMAIL, PASSWORD)).rejects.toBe(failureFromSave)
+		// What was thrown is the save's own text and carries none of what was in
+		// flight; the token was sealed, and the sealed value is not in it either.
+		noSecrets(failureFromSave.message + failureFromSave.stack)
 		expect(h.saved).toEqual([])
 	})
 
-	it('a failed save is thrown, not reported as a sign-in, and says nothing secret', async () => {
-		const h = await harness(fakeHttp(), {
+	it('a failed save after the code is rethrown too, and the spent attempt is already gone', async () => {
+		const failureFromSave = new Error('connection terminated')
+		const http = fakeHttp({ login: { kind: 'otp', otpToken: OTP_TOKEN } })
+		const h = await harness(http, {
 			save: async () => {
-				throw new Error('connection terminated')
+				throw failureFromSave
 			}
 		})
-		await expect(signIn(h.deps, SUBJECT, EMAIL, PASSWORD)).rejects.toThrow('connection terminated')
+		await signIn(h.deps, SUBJECT, EMAIL, PASSWORD)
+
+		await expect(submitOtp(h.deps, SUBJECT, OTP_CODE)).rejects.toBe(failureFromSave)
+		// Rivian accepted the code, so its token is spent; keeping the entry
+		// would only invite a retry that cannot work.
+		expect(getPendingOtp(SUBJECT, NOW)).toBeNull()
 	})
 })
 

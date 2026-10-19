@@ -1238,6 +1238,21 @@ describe('the Rivian settings page renders in every state that occurs', () => {
 		assertNoBrokenValues(body)
 	})
 
+	it.each(['credential_invalid', 'unauthenticated'])(
+		'state %s says "sign out, then sign in again", because the form is hidden while an account is shown',
+		(state) => {
+			// These are the two states whose fix is a new sign-in, and they only occur
+			// WITH a credential row. The page then shows the account and a Sign out
+			// button and no sign-in form, so a hint that said only "sign in again"
+			// would point at a form that is not on the page.
+			const body = text(rivianPage({ credential: ACCOUNT, status: status({ state }) }))
+			expect(body).toContain('sign out, then sign in again')
+			expect(body).toMatch(/<button[^>]*>\s*Sign out/)
+			expect(body).not.toContain('name="password"')
+			assertNoBrokenValues(body)
+		}
+	)
+
 	it('shows a state it has not heard of as it came, rather than as a blank', () => {
 		const body = rivianPage({ status: status({ state: 'rate_limited_for_a_while' }) })
 		expect(body).toContain('rate_limited_for_a_while')

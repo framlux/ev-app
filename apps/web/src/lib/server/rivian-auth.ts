@@ -71,7 +71,14 @@ export interface RivianAuthDeps {
 export type SignInOutcome =
 	| { status: 'signed_in' }
 	| { status: 'otp_required' }
-	| { status: 'error'; message: string }
+	/**
+	 * `restart` is set when the half-made sign-in is GONE (expired, never
+	 * started, or its token ended), so the page knows to take the code box away
+	 * and ask for the password again instead of inviting another try that cannot
+	 * work. It is absent on every other error, including a wrong code, where the
+	 * attempt survives and retyping is the right move.
+	 */
+	| { status: 'error'; message: string; restart?: true }
 
 /**
  * The messages, and the only sentences a user is ever shown about a Rivian
@@ -85,7 +92,8 @@ const LOCKED = 'Account temporarily locked'
 const RATE_LIMITED = 'Rivian is rate-limiting, try later'
 const NOT_CONFIGURED = 'Rivian sign-in is not configured on this server'
 
-const failure = (message: string): SignInOutcome => ({ status: 'error', message })
+const failure = (message: string, restart = false): SignInOutcome =>
+	restart ? { status: 'error', message, restart: true } : { status: 'error', message }
 
 /**
  * Turn a Rivian refusal into one of the messages.
@@ -137,6 +145,33 @@ async function sealAndSave(
 	await deps.save({ sealed, account })
 }
 
+/**
+ * The text sealed by the probe in `assertCanSeal`. It is not a token and stands
+ * for none; it is sealed, discarded and never stored or sent anywhere.
+ */
+const PROBE = 'probe'
+
+/**
+ * Prove the public key can seal, BEFORE anything is asked of Rivian.
+ *
+ * `publicJwk` being non-null only says the variable parsed. A key can parse and
+ * still be unusable: one that is off the curve, or one that carries a private
+ * part (which `sealCredential` refuses, so that a pod holding the connector's
+ * key fails loudly instead of being able to read back what it writes). Found
+ * at the END of a sign-in, either costs something that cannot be given back: a
+ * password login spent on a session that is then thrown away, or a single-use
+ * one-time code consumed by Rivian for a session nobody can store. So the key is
+ * exercised first, by sealing a throwaway string through the very function the
+ * real seal goes through, which makes the check exactly as strict as the thing
+ * it guards and leaves no second list of what makes a key usable to drift.
+ *
+ * Throws, like the real seal would have, with a message that names no key
+ * material (`sealCredential`'s are fixed text; jose's do not quote the key).
+ */
+async function assertCanSeal(publicJwk: JWK): Promise<void> {
+	await sealCredential(publicJwk, { userSessionToken: PROBE })
+}
+
 /** Step one: email and password. */
 export async function signIn(
 	deps: RivianAuthDeps,
@@ -148,6 +183,7 @@ export async function signIn(
 	// password, still less spend a login on a session it could not keep.
 	const publicJwk = deps.publicJwk
 	if (!publicJwk) return failure(NOT_CONFIGURED)
+	await assertCanSeal(publicJwk)
 
 	let app: AppSession
 	let result: LoginResult
@@ -190,13 +226,19 @@ export async function submitOtp(
 ): Promise<SignInOutcome> {
 	const publicJwk = deps.publicJwk
 	if (!publicJwk) return failure(NOT_CONFIGURED)
+	// Before the pending entry is read, let alone before Rivian is asked: a code
+	// is single-use, and a key that cannot seal would have Rivian consume it for
+	// a session we then cannot keep. The entry is left exactly as it was, so that
+	// once the key is fixed the same attempt can still be finished.
+	await assertCanSeal(publicJwk)
 
 	// "Nothing in progress" and "it ran out" are one answer, and it is the one
 	// for a wrong code, because to the user they are the same: this code cannot
 	// be used. Rivian is not asked: a call spent on an attempt we have already
 	// decided is dead is a call that counts toward its rate limit for nothing.
+	// `restart` tells the page the attempt is gone, so it takes the code box away.
 	const pending = getPendingOtp(subject, deps.now())
-	if (!pending) return failure(WRONG_CODE)
+	if (!pending) return failure(WRONG_CODE, true)
 
 	let userSessionToken: string
 	try {
@@ -208,8 +250,17 @@ export async function submitOtp(
 		)
 		userSessionToken = session.userSessionToken
 	} catch (e) {
-		// The entry stays: a mistyped code is retried against the same token.
-		if (e instanceof RivianApiError) return failure(messageFor(e, 'code'))
+		if (e instanceof RivianApiError) {
+			// A token that has EXPIRED is dead for good: no code, right or wrong,
+			// can succeed against it, so keeping the entry would only invite
+			// retries that all fail until the ten minutes run out. It is cleared
+			// and the page is told to start again. Every other refusal, a wrong
+			// code above all, keeps the entry: a mistyped code is retried against
+			// the same token.
+			const ended = e.codes.some((c) => c.reason === 'OTP_TOKEN_EXPIRED')
+			if (ended) clearPendingOtp(subject)
+			return failure(messageFor(e, 'code'), ended)
+		}
 		throw e
 	}
 

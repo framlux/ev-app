@@ -8,7 +8,9 @@ import type { DbClient } from './types.js'
  * neither knows nor checks what is inside, which is the point of keeping the
  * crypto out of the database layer. The web pod never calls
  * `readRivianCredential`: it writes the row and cannot read it back, so a
- * compromise of that pod yields the NEXT sign-in and not this one.
+ * compromise of that pod yields the NEXT sign-in and not this one. What it
+ * reads for its settings page is `readRivianCredentialSummary`, whose query
+ * does not name the `sealed` column.
  */
 export interface RivianCredentialRow {
   sealed: string
@@ -44,6 +46,33 @@ export async function readRivianCredential(
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   }
+}
+
+/**
+ * Who is signed in and since when, WITHOUT the sealed credential.
+ *
+ * This is the web pod's reader. The settings page needs the account and the
+ * stamps to say "signed in as X since Y", and nothing else, so the query does
+ * not name the `sealed` column: the web pod's process never holds the sealed
+ * string at all, whatever a later change to the page might otherwise pass on.
+ * The sealed JWE is useless without the connector's private key, which is why
+ * this is not about a secret leaking today; it is about keeping the rule in
+ * the one place a reader cannot forget it, the SELECT list. A web-side reader
+ * that could select it would need a reviewer to notice, on every future edit,
+ * that the value was not being forwarded.
+ *
+ * Null for "no row" and nothing else, with the same meaning as in
+ * `readRivianCredential`: a failed query throws.
+ */
+export async function readRivianCredentialSummary(
+  c: DbClient,
+): Promise<{ account: string; createdAt: Date; updatedAt: Date } | null> {
+  const { rows } = await c.query(
+    `SELECT account, created_at, updated_at
+       FROM rivian_credential WHERE id=1`)
+  const r = rows[0]
+  if (!r) return null
+  return { account: r.account, createdAt: r.created_at, updatedAt: r.updated_at }
 }
 
 /**

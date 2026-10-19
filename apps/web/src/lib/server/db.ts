@@ -43,21 +43,20 @@ export type { DbClient, TelemetryCheck, TelemetryStatus } from '@ev/db'
  * page load and `rivian-auth.ts` all reach it through this one module and a
  * test can `vi.mock` it and be sure it never touches a real row.
  *
- * What is deliberately NOT here: `writeRivianStatus` and
- * `readRivianCredentialStamp`. The connector is the only writer of the status
- * row (§5.7) and the only reader of the credential stamp (§5.2), so the web has
- * no reason to be able to do either, and a name that cannot be imported cannot
- * be called by mistake.
- *
- * `readRivianCredential` returns the sealed value along with the account. The
- * page load calls it for the account and the stamp and passes on nothing else;
- * the sealed string is useless without the connector's private key, which this
- * pod never holds.
+ * What is deliberately NOT here, and so cannot be imported by mistake:
+ * - `readRivianCredential`. It selects the sealed credential, and the web pod
+ *   must never SELECT that column: it writes the JWE and does not read it back
+ *   (§4.2). The page reads `readRivianCredentialSummary` instead, whose query
+ *   has no `sealed` in it. test/rivian-page-load.test.ts fails if any web
+ *   source names the full reader.
+ * - `writeRivianStatus` and `readRivianCredentialStamp`. The connector is the
+ *   only writer of the status row (§5.7) and the only reader of the credential
+ *   stamp (§5.2), so the web has no reason to be able to do either.
  */
 export {
 	deleteRivianCredential,
-	readRivianCredential,
+	readRivianCredentialSummary,
 	readRivianStatus,
 	upsertRivianCredential
 } from '@ev/db'
-export type { RivianCredentialRow, RivianStatusRow } from '@ev/db'
+export type { RivianStatusRow } from '@ev/db'
