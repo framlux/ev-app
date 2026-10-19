@@ -946,8 +946,15 @@ export class Connector {
     // A group that had been refused and is now being searched is no longer
     // "refused": what is left to say about it is said about its halves.
     if (known !== null && this.#refused.delete(known.key)) this.#syncRefusal()
-    const { probes, newlyDropped, unavailable, fault } = plan.rejected(id, this.#deps.clock.now())
+    const { probes, newlyDropped, unavailable, fault, canary } = plan.rejected(id, this.#deps.clock.now())
     if (fault !== null) this.#documentFault(fault)
+    // The canary is asked for AT ONCE, unlike a probe: its answer is what
+    // decides whether the probes below are wanted, and it has to be in before
+    // the first of them is due.
+    if (canary !== null) {
+      this.#log('every vehicleState group was refused; subscribing the canary to tell the documents from the fields')
+      this.#activate(canary)
+    }
     for (const probe of probes) this.#resubscribeLater(probe, BISECT_DELAY_MS)
     if (unavailable !== null) {
       this.#log(`subscription ${unavailable} is rejected and has nothing to bisect; trying again in a day`)
@@ -961,17 +968,20 @@ export class Connector {
   /**
    * The plan judged a rejection to be the document and not a field (design
    * §5.4): nothing is dropped and nothing is searched. The groups it hands back
-   * are retried on their own backoff, like any refused subscription; probes it
-   * had already handed out for them are cancelled; and `last_error` says what
-   * is wrong, because a connector that is subscribed and silent about 135
-   * missing fields is exactly the failure this exists to make visible.
+   * (with the canary, when the canary is what showed it) are retried on their
+   * own backoff, like any refused subscription; probes it had already handed
+   * out for them are cancelled; and `last_error` says what is wrong, because a
+   * connector that is subscribed and silent about 135 missing fields is exactly
+   * the failure this exists to make visible.
    */
   #documentFault(fault: Fault): void {
     for (const key of fault.withdrawn) this.#cancelWaiting(key)
     const line =
       fault.kind === 'documents'
         ? 'every vehicleState group refused: GRAPHQL_VALIDATION_FAILED'
-        : 'a vehicleState group refused on every property: GRAPHQL_VALIDATION_FAILED'
+        : fault.kind === 'canary'
+          ? 'the vehicleState canary refused: GRAPHQL_VALIDATION_FAILED'
+          : 'a vehicleState group refused on every property: GRAPHQL_VALIDATION_FAILED'
     for (const sub of fault.retry) {
       this.#refuse(sub, line)
       const wait = this.#retryLater(sub)

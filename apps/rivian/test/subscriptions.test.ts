@@ -5,7 +5,7 @@ import {
   vehicleStateDocument,
 } from '@ev/rivian'
 import { describe, expect, it } from 'vitest'
-import { SubscriptionPlan, type PlannedSubscription } from '../src/subscriptions.js'
+import { CANARY_PROPERTY, SubscriptionPlan, type PlannedSubscription } from '../src/subscriptions.js'
 
 const VEHICLE = 'veh-1'
 const NOW = Date.UTC(2026, 9, 19, 12)
@@ -33,7 +33,7 @@ function planOf(
 }
 
 /** What `rejected` answers when there is nothing to do. */
-const NOTHING = { probes: [], newlyDropped: [], unavailable: null, fault: null }
+const NOTHING = { probes: [], newlyDropped: [], unavailable: null, fault: null, canary: null }
 
 const stateSubs = (subs: { sub: PlannedSubscription }[]): PlannedSubscription[] =>
   subs.map((s) => s.sub).filter((s) => s.stream === 'state')
@@ -589,54 +589,130 @@ describe('SubscriptionPlan.rejected: when every state group of the first wave is
     return { plan, initial, groups }
   }
 
-  it('bisects the early rejections as ever, and calls it a document fault on the last', () => {
+  /** Reject every group of the wave, and subscribe the canary the last rejection asks for. */
+  function waveWithCanary() {
+    const { plan, groups } = threeGroups()
+    const results = rejectAll(plan, groups.map((g) => g.id))
+    const canary = results.at(-1)!.canary!
+    return { plan, groups, results, canary, canaryId: plan.activate(canary) }
+  }
+
+  it('bisects every rejection as ever, and the last one also asks for a canary: a single batteryLevel group', () => {
     const { plan, groups } = threeGroups()
     const [first, second, last] = rejectAll(plan, groups.map((g) => g.id))
 
-    expect(first!.probes).toHaveLength(2)
-    expect(first!.fault).toBeNull()
-    expect(second!.probes).toHaveLength(2)
-    expect(second!.fault).toBeNull()
+    for (const r of [first, second, last]) {
+      expect(r!.probes, 'bisected as normal').toHaveLength(2)
+      expect(r!.fault).toBeNull()
+      expect(r!.newlyDropped).toEqual([])
+    }
+    expect(first!.canary).toBeNull()
+    expect(second!.canary).toBeNull()
 
-    // The last rejection completes the wave: nothing is bisected for it, and
-    // every probe already handed out for the others is withdrawn.
-    expect(last!.probes).toEqual([])
-    expect(last!.newlyDropped).toEqual([])
-    expect(last!.fault).toMatchObject({ kind: 'documents' })
-    expect(last!.fault!.retry.map((s) => s.key)).toEqual(groups.map((g) => g.sub.key))
-    expect(last!.fault!.retry).toEqual(groups.map((g) => g.sub))
-    expect([...last!.fault!.withdrawn].sort()).toEqual(
-      [...first!.probes, ...second!.probes].map((p) => p.key).sort(),
-    )
-    expect(last!.fault!.restored).toEqual([])
+    expect(last!.canary).toMatchObject({ stream: 'state', properties: [CANARY_PROPERTY] })
+    expect(last!.canary!.doc).toEqual(vehicleStateDocument(VEHICLE, [CANARY_PROPERTY]))
+    expect(CANARY_PROPERTY).toBe('batteryLevel')
+    // The canary is not one of the groups, and has a key no group has.
+    expect(groups.map((g) => g.sub.key)).not.toContain(last!.canary!.key)
   })
 
-  it('drops nothing, however long it goes on', () => {
-    const { plan, groups } = threeGroups()
-    rejectAll(plan, groups.map((g) => g.id))
+  it('is a document fault when the canary is rejected too: nothing dropped, nothing searched, everything retried', () => {
+    const { plan, groups, results, canaryId, canary } = waveWithCanary()
+    expect(plan.streamOf(canaryId)).toBe('state')
+
+    const verdict = plan.rejected(canaryId, NOW + 500)
+
+    expect(verdict.probes).toEqual([])
+    expect(verdict.newlyDropped).toEqual([])
+    expect(verdict.canary).toBeNull()
+    expect(verdict.fault).toMatchObject({ kind: 'documents' })
+    // The groups, whole, and the canary, all go back on the backoff.
+    expect(verdict.fault!.retry).toEqual([...groups.map((g) => g.sub), canary])
+    // Every probe handed out for the wave's groups, the last one's included, is withdrawn.
+    expect([...verdict.fault!.withdrawn].sort()).toEqual(
+      results.flatMap((r) => r.probes.map((p) => p.key)).sort(),
+    )
+    expect(verdict.fault!.restored).toEqual([])
     expect(plan.dropped).toEqual([])
   })
 
-  it('does not search the group again when a retry of it is rejected again', () => {
-    const { plan, groups } = threeGroups()
-    const results = rejectAll(plan, groups.map((g) => g.id))
-    const retried = results.at(-1)!.fault!.retry[0]!
+  it('never bisects the canary, and never drops batteryLevel when it is rejected', () => {
+    const { plan, canaryId } = waveWithCanary()
+    const verdict = plan.rejected(canaryId, NOW + 500)
+    expect(verdict.probes).toEqual([])
+    expect(verdict.newlyDropped).toEqual([])
+    expect(plan.dropped).not.toContain(CANARY_PROPERTY)
+    expect(plan.dropped).toEqual([])
+  })
 
-    const again = plan.rejected(plan.activate(retried), NOW + HOUR)
-    expect(again.probes).toEqual([])
-    expect(again.newlyDropped).toEqual([])
-    expect(again.fault).toMatchObject({ kind: 'documents', retry: [retried], withdrawn: [], restored: [] })
+  it('is a field fault when the canary is not rejected: the rejected groups are searched, and only the bad fields dropped', () => {
+    // Three groups, a bad field in each: every group is rejected, the canary is not.
+    const names = props(40)
+    const bad = new Set([names[3]!, names[20]!, names[35]!])
+    const plan = planOf(names)
+    const initial = plan.initial()
+    const canaries: PlannedSubscription[] = []
+    const live = new Map<string, PlannedSubscription>()
+    for (const { id, sub } of initial) live.set(id, sub)
+    const dropped: string[] = []
+    let at = NOW
+    for (;;) {
+      const next = [...live].find(([, sub]) => sub.stream === 'state' && sub.properties!.some((p) => bad.has(p)))
+      if (next === undefined) break
+      live.delete(next[0])
+      const result = plan.rejected(next[0], at)
+      at += 100
+      expect(result.fault).toBeNull()
+      dropped.push(...result.newlyDropped)
+      if (result.canary !== null) {
+        canaries.push(result.canary)
+        live.set(plan.activate(result.canary), result.canary)
+      }
+      for (const probe of result.probes) live.set(plan.activate(probe), probe)
+    }
+
+    expect(canaries).toHaveLength(1)
+    expect([...dropped].sort()).toEqual([...bad].sort())
+    expect([...plan.dropped].sort()).toEqual([...bad].sort())
+    // The canary is still subscribed, and everything good still is.
+    expect([...live.values()].some((s) => s.key === canaries[0]!.key)).toBe(true)
+    const held = [...live.values()].filter((s) => s.key !== canaries[0]!.key).flatMap((s) => s.properties ?? [])
+    expect([...held].sort()).toEqual(names.filter((n) => !bad.has(n)).sort())
+  })
+
+  it('does not judge the canary rejected long after the wave: it is retried alone, with no verdict on the groups', () => {
+    const { plan, canaryId, canary } = waveWithCanary()
+    // The canary was accepted, and is rejected much later for some other reason.
+    const late = plan.rejected(canaryId, NOW + 10 * MINUTE)
+
+    expect(late.probes).toEqual([])
+    expect(late.newlyDropped).toEqual([])
+    expect(late.fault).toEqual({ kind: 'canary', retry: [canary], withdrawn: [], restored: [] })
+    expect(plan.dropped).toEqual([])
+  })
+
+  it('does not search the canary or the groups again when retries of them are rejected again', () => {
+    const { plan, groups, canaryId } = waveWithCanary()
+    const retry = plan.rejected(canaryId, NOW + 500).fault!.retry
+
+    for (const sub of retry) {
+      const again = plan.rejected(plan.activate(sub), NOW + HOUR)
+      expect(again.probes, sub.key).toEqual([])
+      expect(again.newlyDropped, sub.key).toEqual([])
+      expect(again.fault, sub.key).toMatchObject({ kind: 'documents', retry: [sub], withdrawn: [], restored: [] })
+    }
+    expect(retry).toHaveLength(groups.length + 1)
     expect(plan.dropped).toEqual([])
   })
 
   it('goes back to searching once a state frame shows the documents are fine', () => {
-    const { plan, groups } = threeGroups()
-    const retry = rejectAll(plan, groups.map((g) => g.id)).at(-1)!.fault!.retry
-    // One group's retry is accepted and a frame arrives; another is still refused.
-    plan.activate(retry[0]!)
+    const { plan, canaryId } = waveWithCanary()
+    const retry = plan.rejected(canaryId, NOW + 500).fault!.retry
+    // The canary's retry is accepted and a frame arrives; a group's is still refused.
+    plan.activate(retry.at(-1)!)
     plan.documentAccepted()
 
-    const genuine = plan.rejected(plan.activate(retry[1]!), NOW + HOUR)
+    const genuine = plan.rejected(plan.activate(retry[0]!), NOW + HOUR)
     expect(genuine.fault).toBeNull()
     expect(genuine.probes).toHaveLength(2)
   })
@@ -652,6 +728,16 @@ describe('SubscriptionPlan.rejected: when every state group of the first wave is
     expect(second.fault).toBeNull()
     expect(third.fault).toBeNull()
     expect(third.probes).toHaveLength(2)
+    // The wave was never completed, so no canary is asked for.
+    expect(third.canary).toBeNull()
+  })
+
+  it('does not judge a canary rejected after a state frame: that is a late rejection, not the wave', () => {
+    const { plan, canaryId } = waveWithCanary()
+    plan.documentAccepted()
+    const late = plan.rejected(canaryId, NOW + 500)
+    expect(late.fault).toMatchObject({ kind: 'canary', withdrawn: [], restored: [] })
+    expect(plan.dropped).toEqual([])
   })
 
   it('is not a document fault when one group is not rejected: that one bad field is bisected', () => {
@@ -659,6 +745,7 @@ describe('SubscriptionPlan.rejected: when every state group of the first wave is
     const results = rejectAll(plan, groups.slice(0, 2).map((g) => g.id))
     expect(results.every((r) => r.fault === null)).toBe(true)
     expect(results.every((r) => r.probes.length === 2)).toBe(true)
+    expect(results.every((r) => r.canary === null)).toBe(true)
   })
 
   it('is not one wave if the rejections are more than 20 s apart', () => {
@@ -666,20 +753,22 @@ describe('SubscriptionPlan.rejected: when every state group of the first wave is
     const results = rejectAll(plan, groups.map((g) => g.id), NOW, 21_000)
     expect(results.map((r) => r.fault)).toEqual([null, null, null])
     expect(results.map((r) => r.probes.length)).toEqual([2, 2, 2])
+    expect(results.map((r) => r.canary)).toEqual([null, null, null])
   })
 
-  it('needs at least two groups: a lone group that is rejected is bisected', () => {
+  it('needs at least two groups: a lone group that is rejected is bisected, with no canary', () => {
     const plan = planOf(props(16))
     const id = plan.initial().find((s) => s.sub.stream === 'state')!.id
     const result = plan.rejected(id, NOW)
     expect(result.fault).toBeNull()
+    expect(result.canary).toBeNull()
     expect(result.probes).toHaveLength(2)
   })
 
-  it('takes a property back that a one-property group lost before the wave was complete', () => {
+  it('takes a property back that a one-property group lost, when the canary says it was the documents', () => {
     // 17 properties: a group of 16 and a group of one. The lone one is dropped
-    // at once, as a lone rejected property is; the wave then completes, and the
-    // drop is undone because it was a document fault, not that property.
+    // at once, as a lone rejected property is; the wave then completes and the
+    // canary is rejected too, so the drop is undone: it was the documents.
     const names = props(17)
     const plan = planOf(names)
     const [big, lone] = plan.initial().filter((s) => s.sub.stream === 'state')
@@ -689,21 +778,38 @@ describe('SubscriptionPlan.rejected: when every state group of the first wave is
     expect(plan.dropped).toEqual([names[16]])
 
     const last = plan.rejected(big!.id, NOW + 100)
-    expect(last.fault).toMatchObject({ kind: 'documents', restored: [names[16]] })
-    expect(last.fault!.retry.map((s) => s.key)).toEqual(['state:0', 'state:1'])
+    expect(last.fault).toBeNull()
+    // Still dropped: the canary has not answered yet.
+    expect(plan.dropped).toEqual([names[16]])
+
+    const verdict = plan.rejected(plan.activate(last.canary!), NOW + 200)
+    expect(verdict.fault).toMatchObject({ kind: 'documents', restored: [names[16]] })
+    expect(verdict.fault!.retry.map((s) => s.key)).toEqual(['state:0', 'state:1', last.canary!.key])
     expect(plan.dropped).toEqual([])
     expect(stateSubs(plan.initial()).flatMap((s) => s.properties!)).toContain(names[16])
   })
 
-  it('starts again with a new wave when initial() does', () => {
-    const { plan, groups } = threeGroups()
-    rejectAll(plan, groups.map((g) => g.id))
+  it('keeps a property a one-property group lost when the canary is accepted: it was that property', () => {
+    const names = props(17)
+    const plan = planOf(names)
+    const [big, lone] = plan.initial().filter((s) => s.sub.stream === 'state')
+    plan.rejected(lone!.id, NOW)
+    const last = plan.rejected(big!.id, NOW + 100)
+    plan.activate(last.canary!)
+    // The canary is never rejected.
+    expect(plan.dropped).toEqual([names[16]])
+  })
+
+  it('starts again with a new wave when initial() does, and forgets a canary that was pending', () => {
+    const { plan, groups, canaryId } = waveWithCanary()
+    plan.rejected(canaryId, NOW + 500)
 
     const again = plan.initial().filter((s) => s.sub.stream === 'state')
     const first = plan.rejected(again[0]!.id, NOW + DAY)
     // No leftover verdict: it is a rejection, and it is searched.
     expect(first.fault).toBeNull()
     expect(first.probes).toHaveLength(2)
+    expect(groups).toHaveLength(3)
   })
 })
 

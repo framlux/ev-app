@@ -877,7 +877,7 @@ describe('a fault in the documents is not a fault in a field (design §5.4)', ()
   const STATE_GROUPS = Math.ceil(RIVIAN_PROPERTIES.length / 16)
   const FAULT_LINE = 'every vehicleState group refused: GRAPHQL_VALIDATION_FAILED'
 
-  it('does not bisect, drop or persist anything when every state group is rejected, however long it goes on', async () => {
+  it('does not bisect, drop or persist anything when every state group and the canary are rejected, however long it goes on', async () => {
     h = await makeHarness()
     const times = new Map<string, number[]>()
     h.fake.respond = (socket, id, doc) => {
@@ -887,25 +887,29 @@ describe('a fault in the documents is not a fault in a field (design §5.4)', ()
       socket.reject(id)
     }
     await h.connect()
-    expect(h.socket.subscribes.filter((s) => s.doc.operationName === 'VehicleState')).toHaveLength(STATE_GROUPS)
+    const stateSubscribes = () => h.socket.subscribes.filter((s) => s.doc.operationName === 'VehicleState')
+    // The groups, and the canary the completed wave asked for, at once.
+    expect(stateSubscribes()).toHaveLength(STATE_GROUPS + 1)
+    expect(stateSubscribes().filter((s) => propertiesOf(s.doc).join() === 'batteryLevel')).toHaveLength(1)
 
     // Two minutes: the first retry is 30 s after the wave, and that is all.
     await h.clock.tick(2 * MINUTE)
-    const stateAfterTwoMinutes = h.socket.subscribes.filter((s) => s.doc.operationName === 'VehicleState')
-    expect(stateAfterTwoMinutes).toHaveLength(STATE_GROUPS * 3)
+    expect(stateSubscribes()).toHaveLength((STATE_GROUPS + 1) * 3)
 
     await h.clock.tick(HOUR)
 
-    // Always the groups as first subscribed: never a half, never a single property.
-    const asked = new Set(
-      h.socket.subscribes.filter((s) => s.doc.operationName === 'VehicleState').map((s) => s.doc.query),
-    )
-    expect(asked.size).toBe(STATE_GROUPS)
+    // Always the groups as first subscribed and the canary: never a half, never
+    // another single property.
+    const asked = new Set(stateSubscribes().map((s) => s.doc.query))
+    expect(asked.size).toBe(STATE_GROUPS + 1)
     // Each retried on the per-subscription schedule (30 s doubling, jitter 0 here).
-    expect(times.size).toBe(STATE_GROUPS)
+    expect(times.size).toBe(STATE_GROUPS + 1)
+    expect([...times.keys()]).toContain('canary')
     for (const [key, at] of times) {
       expect(at.slice(0, 5), key).toEqual([0, 30, 90, 210, 450].map((s) => s * SECOND))
     }
+    // An hour and two minutes in (3,720 s): the subscribes at 0 ... 3,630 s, and no more.
+    for (const [key, at] of times) expect(at, key).toHaveLength(9)
     // Nothing dropped, so nothing written, taped or counted as dropped.
     expect(h.store.writes.every((w) => w.droppedProperties.length === 0)).toBe(true)
     expect(h.meta('droppedProperties').every((m) => (m as { properties: string[] }).properties.length === 0)).toBe(true)
@@ -915,6 +919,60 @@ describe('a fault in the documents is not a fault in a field (design §5.4)', ()
     expect(h.store.writes.at(-1)!.lastError).toBe(FAULT_LINE)
     // The other seven subscriptions were never affected.
     expect(h.socket.liveIds.length).toBeGreaterThanOrEqual(7)
+  })
+
+  describe('a canary that is accepted: the groups were rejected for their fields', () => {
+    /** One bad field in each of the groups, none of them the canary's. */
+    const bad = new Set(
+      Array.from({ length: Math.ceil(RIVIAN_PROPERTIES.length / 16) }, (_, g) => RIVIAN_PROPERTIES[g * 16 + 3]!.name),
+    )
+
+    function rejectBadFields(): void {
+      h.fake.respond = (socket, id, doc) => {
+        if (doc.operationName === 'VehicleState' && propertiesOf(doc).some((p) => bad.has(p))) socket.reject(id)
+      }
+    }
+
+    it('bisects every group as normal and drops exactly the bad fields', async () => {
+      h = await makeHarness()
+      expect(bad.size).toBe(STATE_GROUPS)
+      expect(bad.has('batteryLevel')).toBe(false)
+      rejectBadFields()
+      await h.connect()
+      await h.clock.tick(10 * MINUTE)
+
+      expect(h.store.writes.at(-1)!.droppedProperties.sort()).toEqual([...bad].sort())
+      expect([...(h.meta('droppedProperties').at(-1) as { properties: string[] }).properties].sort()).toEqual(
+        [...bad].sort(),
+      )
+      expect(h.store.writes.at(-1)!.lastError).toBeNull()
+      expect(h.connector.state).toBe('subscribed')
+      // Everything that is not bad is subscribed, and batteryLevel is never dropped.
+      expect(new Set(liveStateProperties(h.socket))).toEqual(
+        new Set(RIVIAN_PROPERTIES.map((p) => p.name).filter((n) => !bad.has(n))),
+      )
+      expect(h.store.writes.some((w) => w.droppedProperties.includes('batteryLevel'))).toBe(false)
+      // The canary is still subscribed on its own, and was not bisected.
+      expect(h.socket.liveIds.some((id) => id.startsWith('canary#'))).toBe(true)
+      expect(h.fake.opens).toHaveLength(1)
+    })
+
+    it('stays on the bisection schedule: the groups and the canary at once, one probe pair per group 30 s later', async () => {
+      h = await makeHarness()
+      rejectBadFields()
+      await h.connect()
+      const stateSubscribes = () => h.socket.subscribes.filter((s) => s.doc.operationName === 'VehicleState')
+
+      await h.clock.tick(29 * SECOND)
+      expect(stateSubscribes()).toHaveLength(STATE_GROUPS + 1)
+      await h.clock.tick(SECOND)
+      expect(stateSubscribes()).toHaveLength(STATE_GROUPS + 1 + 2 * STATE_GROUPS)
+      // The canary is asked for once, however long it takes.
+      await h.clock.tick(10 * MINUTE)
+      expect(stateSubscribes().filter((s) => s.id.startsWith('canary#')).length).toBeLessThanOrEqual(11)
+      // And what is left rejected is a single property at a time, never a retried whole group.
+      expect(h.store.writes.at(-1)!.droppedProperties).toHaveLength(STATE_GROUPS)
+    })
   })
 
   it('subscribes every state group again after a restart: nothing was persisted to leave them out', async () => {
@@ -960,8 +1018,10 @@ describe('a fault in the documents is not a fault in a field (design §5.4)', ()
     // Now the group with the bad field is searched, as it always was, and dropped.
     await h.clock.tick(HOUR)
     expect(h.store.writes.at(-1)!.droppedProperties).toEqual([bad])
-    expect(liveStateProperties(h.socket)).not.toContain(bad)
-    expect(liveStateProperties(h.socket)).toHaveLength(RIVIAN_PROPERTIES.length - 1)
+    // (The canary's batteryLevel is a second subscription of a property that is also in a group.)
+    const asked = new Set(liveStateProperties(h.socket))
+    expect(asked).not.toContain(bad)
+    expect(asked.size).toBe(RIVIAN_PROPERTIES.length - 1)
   })
 
   it('still finds exactly one bad field when only its group is rejected (nothing changes for a field fault)', async () => {

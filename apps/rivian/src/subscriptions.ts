@@ -36,14 +36,22 @@ import {
  *
  *    A SECOND KIND OF FAULT LOOKS LIKE THE FIRST AND MUST NOT BE SEARCHED. If
  *    every `vehicleState` group of a fresh subscribe is rejected, or a group's
- *    search ends with every one of its properties rejected, the likelier fault
- *    is the DOCUMENT (the wrong type, the wrong variable) and not a hundred
- *    fields retiring at once. Bisecting it would take the whole catalogue down
- *    to single properties in a couple of minutes (261 subscribes), drop all 135
- *    and persist that, so a restart would then subscribe no state at all. The
- *    plan reports such a rejection as a `fault`: nothing is dropped, what was
- *    dropped on the way is taken back, and the groups are handed back to retry
- *    on a backoff. A `vehicleState` frame is what shows the documents are fine
+ *    search ends with every one of its properties rejected, the fault may be
+ *    the DOCUMENT (the wrong type, the wrong variable) and not a hundred
+ *    fields retiring at once. Bisecting a document fault would take the whole
+ *    catalogue down to single properties in a couple of minutes (261
+ *    subscribes), drop all 135 and persist that, so a restart would then
+ *    subscribe no state at all. But every group being rejected is ALSO what a
+ *    model that lacks a few fields in each group looks like (an R2 against an
+ *    R1 snapshot), and treating that as a document fault would never find them.
+ *    So the rejection that completes a wave asks for a CANARY: a group of the
+ *    one property every Rivian has (`CANARY_PROPERTY`). A canary that is
+ *    rejected too says the documents are wrong, and the plan reports a `fault`:
+ *    nothing is dropped, what was dropped on the way is taken back, and the
+ *    groups and the canary are handed back to retry on a backoff. A canary that
+ *    is not rejected says the documents are fine and the groups were rejected
+ *    for their fields, so the bisection that was already planned just goes
+ *    ahead. A `vehicleState` frame also shows the documents are fine
  *    (`documentAccepted`).
  *
  * 2. `graphql-transport-ws` forbids reusing a subscription id on a socket
@@ -72,9 +80,12 @@ export interface PlannedSubscription {
  *   unproven). The document is wrong, not a field.
  * - `group`: a group was searched down to its single properties and every one
  *   of them was rejected. Nothing in the group is known to be good.
+ * - `canary`: the canary was rejected outside the moment that decides a wave
+ *   (long after it, or after a state frame). It says nothing about the groups;
+ *   it is retried alone.
  */
 export interface Fault {
-  kind: 'documents' | 'group'
+  kind: 'documents' | 'group' | 'canary'
   /** The groups to subscribe again on a backoff, whole and as they were first subscribed. */
   retry: PlannedSubscription[]
   /**
@@ -96,6 +107,12 @@ export interface Rejection {
   newlyDropped: string[]
   unavailable: string | null
   fault: Fault | null
+  /**
+   * Set only by the rejection that completes a wave: a one-property group for
+   * the connector to subscribe AT ONCE (through `activate`), not after the 30 s
+   * a probe waits. Whether it is rejected decides what the wave was.
+   */
+  canary: PlannedSubscription | null
 }
 
 /** A group's search for its bad field: the group first rejected, and the properties found rejected alone since. */
@@ -153,6 +170,32 @@ const REPROBE_SPACING_MS = MINUTE_MS
 const WAVE_WINDOW_MS = 20_000
 
 /**
+ * The one `vehicleState` property that a canary asks for.
+ *
+ * It has to be a property that every Rivian has, whatever its generation and
+ * model year: if it were one a newer model dropped, a canary rejected for the
+ * field would be read as a document fault and a connector for that model would
+ * retry forever. `batteryLevel` is the state of charge, the one value the
+ * whole product is about; a vehicle that lacked it would not be one this
+ * connector could do anything for. It is the same name in every group
+ * document of the catalogue, so a canary rejected on its own can only be the
+ * document (the type, the variable, the selection shape) or the endpoint.
+ */
+export const CANARY_PROPERTY = 'batteryLevel'
+
+/** The canary's key. It is not a `state:<n>`, so it can never be mistaken for a group or a probe. */
+const CANARY_KEY = 'canary'
+
+/**
+ * How long after the wave completed a rejection of the canary still counts as
+ * the answer to it. A server that rejects the documents rejects the canary as
+ * promptly as it rejected the groups; this is the 30 s a bisection probe waits,
+ * so that the answer is in before any probe planned for the wave is subscribed.
+ * A rejection later than this is some other matter (see `Fault`, `canary`).
+ */
+const CANARY_WINDOW_MS = 30_000
+
+/**
  * How long a bisection stays one search. Its rejections come one probe (30 s)
  * after another, so a leaf rejected minutes after the last is not part of the
  * same search: it is a probe that was accepted at the time and is rejected now
@@ -184,6 +227,11 @@ function isQueryable(name: unknown): name is string {
   }
 }
 
+/** A `Rejection` with nothing in it, but what is given. */
+function answer(parts: Partial<Rejection>): Rejection {
+  return { probes: [], newlyDropped: [], unavailable: null, fault: null, canary: null, ...parts }
+}
+
 export class SubscriptionPlan {
   readonly #vehicleId: string
   readonly #parallaxRvms: string[] | null
@@ -202,6 +250,13 @@ export class SubscriptionPlan {
 
   /** The first subscribe wave, while it can still turn out to be one document fault. Null when it cannot. */
   #wave: Wave | null = null
+
+  /**
+   * A wave that has completed and whose canary has not yet answered, with the
+   * time it completed. Cleared by `documentAccepted`, by the canary's answer,
+   * and by `initial()`.
+   */
+  #pendingCanary: { wave: Wave; at: number } | null = null
 
   /** Bisection searches in progress or lately finished, by the key of each probe in them. */
   readonly #lineages = new Map<string, Lineage>()
@@ -299,6 +354,7 @@ export class SubscriptionPlan {
     this.#lineages.clear()
     this.#faulted.clear()
     this.#exhausted.clear()
+    this.#pendingCanary = null
     const live = this.#properties.filter((name) => !this.#dropped.has(name))
     const groups = groupProperties(live, MAX_GROUP_SIZE).map((names) => this.#stateGroup(names))
     // A wave needs at least two groups: with one, "every group was rejected"
@@ -363,14 +419,19 @@ export class SubscriptionPlan {
    *   and reported in `newlyDropped`, for the connector to persist and publish.
    * - Anything else has no properties to bisect. It is marked unavailable, named
    *   in `unavailable`, and tried again once a day by `dueForReprobe`.
-   * - But a rejection that is more likely the DOCUMENT than a field comes back
-   *   as a `fault` instead, with nothing dropped and nothing bisected: the
-   *   rejection that completes a wave (every state group of `initial()`
-   *   rejected), a search in which every property of the group was rejected, and
-   *   a retry of a group that has already been so judged. The connector retries
-   *   the `fault.retry` groups on a backoff, cancels the `fault.withdrawn`
-   *   probes it was holding, and writes the dropped list again if
-   *   `fault.restored` is not empty.
+   * - The rejection that completes a wave (every state group of `initial()`
+   *   rejected) is bisected like the others, and also returns a `canary` for
+   *   the connector to subscribe at once. If the canary is rejected the matter
+   *   is the DOCUMENT and not a field: the answer is a `fault`, with nothing
+   *   dropped and nothing bisected. If it is not, nothing more happens and the
+   *   bisection already planned goes ahead.
+   * - The same goes for a search in which every property of the group was
+   *   rejected, and for a retry of a group already judged so. The connector
+   *   retries the `fault.retry` groups on a backoff, cancels the
+   *   `fault.withdrawn` probes it was holding, and writes the dropped list
+   *   again if `fault.restored` is not empty.
+   *
+   * The canary itself is never bisected, and its property is never dropped.
    *
    * An id the plan does not hold (already renewed, ended or rejected) answers
    * nothing and changes nothing: it is a stale error for a subscription that
@@ -378,13 +439,15 @@ export class SubscriptionPlan {
    */
   rejected(id: string, now: number): Rejection {
     const sub = this.#live.get(id)
-    if (sub === undefined) return { probes: [], newlyDropped: [], unavailable: null, fault: null }
+    if (sub === undefined) return answer({})
     this.#live.delete(id)
+
+    if (sub.key === CANARY_KEY) return this.#canaryRejected(sub, now)
 
     const properties = sub.properties
     if (properties === undefined) {
       this.#unavailable.set(sub.key, { sub, dueAt: now + REPROBE_INTERVAL_MS })
-      return { probes: [], newlyDropped: [], unavailable: sub.key, fault: null }
+      return answer({ unavailable: sub.key })
     }
 
     // Already judged: it was a fault when it was last rejected and nothing since
@@ -393,28 +456,56 @@ export class SubscriptionPlan {
     if (this.#exhausted.has(sub.key)) return this.#retryOnly('group', sub)
 
     const wave = this.#waveFor(sub, now)
-    if (wave !== null && wave.rejected.size + (wave.rejected.has(sub.key) ? 0 : 1) === wave.groups.size) {
-      return this.#documentFault(wave)
-    }
     const result = this.#search(sub, properties, now)
-    if (wave !== null && result.fault === null) {
-      wave.rejected.set(sub.key, {
-        probes: result.probes.map((p) => p.key),
-        dropped: result.newlyDropped,
-      })
-    }
-    return result
+    if (wave === null || result.fault !== null) return result
+    wave.rejected.set(sub.key, {
+      probes: result.probes.map((p) => p.key),
+      dropped: result.newlyDropped,
+    })
+    if (wave.rejected.size < wave.groups.size) return result
+
+    // Every group was rejected. It is the documents, or it is a field in each
+    // group; the canary tells which. Its answer is judged against this wave,
+    // and the bisection that `result` carries stands until then.
+    this.#wave = null
+    this.#pendingCanary = { wave, at: now }
+    return { ...result, canary: this.#canary() }
   }
 
   /**
    * A `vehicleState` frame arrived: the documents are valid, so a rejection
-   * from now on is about a field. A wave still open cannot be all-rejected, and
-   * groups waiting to be retried as document faults are searched when they are
-   * rejected again.
+   * from now on is about a field. A wave still open cannot be all-rejected, a
+   * canary still pending has been answered, and groups waiting to be retried as
+   * document faults are searched when they are rejected again.
    */
   documentAccepted(): void {
     this.#wave = null
+    this.#pendingCanary = null
     this.#faulted.clear()
+  }
+
+  /** The canary: one group for the one property in `CANARY_PROPERTY`. Its key is fixed, so a retry of it is the same subscription. */
+  #canary(): PlannedSubscription {
+    return {
+      key: CANARY_KEY,
+      stream: 'state',
+      doc: vehicleStateDocument(this.#vehicleId, [CANARY_PROPERTY]),
+      properties: [CANARY_PROPERTY],
+    }
+  }
+
+  /**
+   * The canary was rejected. Within `CANARY_WINDOW_MS` of the wave it
+   * completed, that is the answer: the documents are wrong. Otherwise it is not
+   * about the wave and the groups are left to their own search; the canary goes
+   * back on its backoff. Either way nothing is bisected and nothing is dropped.
+   */
+  #canaryRejected(canary: PlannedSubscription, now: number): Rejection {
+    if (this.#faulted.has(canary.key)) return this.#retryOnly('documents', canary)
+    const pending = this.#pendingCanary
+    this.#pendingCanary = null
+    if (pending === null || now - pending.at > CANARY_WINDOW_MS) return this.#retryOnly('canary', canary)
+    return this.#documentFault(pending.wave, canary)
   }
 
   /** The wave `sub` belongs to, while it is still one wave; null if it belongs to none, or took too long. */
@@ -429,8 +520,8 @@ export class SubscriptionPlan {
     return wave
   }
 
-  /** The last group of a wave was rejected: it was the documents. Take back what the others did. */
-  #documentFault(wave: Wave): Rejection {
+  /** The canary was rejected too: it was the documents. Take back what the groups did. */
+  #documentFault(wave: Wave, canary: PlannedSubscription): Rejection {
     const withdrawn: string[] = []
     const restored: string[] = []
     for (const entry of wave.rejected.values()) {
@@ -439,23 +530,16 @@ export class SubscriptionPlan {
     }
     for (const key of withdrawn) this.#lineages.delete(key)
     for (const name of restored) this.#dropped.delete(name)
-    for (const key of wave.groups.keys()) this.#faulted.add(key)
-    this.#wave = null
-    return {
-      probes: [],
-      newlyDropped: [],
-      unavailable: null,
-      fault: { kind: 'documents', retry: [...wave.groups.values()], withdrawn, restored },
-    }
+    // A probe that had already been subscribed when the canary answered cannot
+    // be withdrawn, and is rejected as its group was: it is retried, not searched.
+    for (const key of [...wave.groups.keys(), canary.key, ...withdrawn]) this.#faulted.add(key)
+    return answer({
+      fault: { kind: 'documents', retry: [...wave.groups.values(), canary], withdrawn, restored },
+    })
   }
 
   #retryOnly(kind: Fault['kind'], sub: PlannedSubscription): Rejection {
-    return {
-      probes: [],
-      newlyDropped: [],
-      unavailable: null,
-      fault: { kind, retry: [sub], withdrawn: [], restored: [] },
-    }
+    return answer({ fault: { kind, retry: [sub], withdrawn: [], restored: [] } })
   }
 
   /**
@@ -478,16 +562,11 @@ export class SubscriptionPlan {
           for (const n of restored) this.#dropped.delete(n)
           for (const [key, l] of [...this.#lineages]) if (l === lineage) this.#lineages.delete(key)
           this.#exhausted.add(lineage.group.key)
-          return {
-            probes: [],
-            newlyDropped: [],
-            unavailable: null,
-            fault: { kind: 'group', retry: [lineage.group], withdrawn: [], restored },
-          }
+          return answer({ fault: { kind: 'group', retry: [lineage.group], withdrawn: [], restored } })
         }
       }
       this.#dropped.set(name, this.#dueAfterDrop(now))
-      return { probes: [], newlyDropped: [name], unavailable: null, fault: null }
+      return answer({ newlyDropped: [name] })
     }
 
     const middle = Math.ceil(properties.length / 2)
@@ -498,7 +577,7 @@ export class SubscriptionPlan {
     const search = lineage ?? { group: sub, rejected: new Set<string>(), lastAt: now }
     search.lastAt = now
     for (const probe of probes) this.#lineages.set(probe.key, search)
-    return { probes, newlyDropped: [], unavailable: null, fault: null }
+    return answer({ probes })
   }
 
   /** The search this probe belongs to, unless it is old enough to be a different matter (see `LINEAGE_WINDOW_MS`). */
