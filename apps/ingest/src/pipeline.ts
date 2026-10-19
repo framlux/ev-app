@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util'
 import {
   classifyCharge,
   priceCharge,
@@ -193,8 +194,10 @@ export class FieldAccumulator {
    */
   apply(decoded: Decoded, at: Date): void {
     const ms = at.getTime()
-    // Before the slots move: a rising counter is judged against where it stood.
-    const charging = this.showsCharging(decoded.slots)
+    // Decide what lands BEFORE anything moves, so that "is this charging" is
+    // judged over the slots that actually land, against the values held before
+    // this frame (a rising counter is judged against where it stood).
+    const landing = new Map<string, Entry>()
     for (const [key, value] of Object.entries(decoded.slots)) {
       if (value === undefined) continue
       // The vehicle's own observation time where the vendor gives one (spec
@@ -205,15 +208,33 @@ export class FieldAccumulator {
       // (a resubscribe replays the car's last-known values); it must not
       // overwrite a newer one. Only values with an observation time compete
       // this way - Tesla never sets one, so its behaviour is unchanged.
+      //
+      // The SAME observation of the SAME value is a replay too, and is a no-op
+      // rather than a rewrite: the held entry's `at` may since have been moved
+      // forward by the charge refresh below, and rewriting it would put `at`
+      // back at the observation and shorten the carry window the refresh
+      // bought. It is strictly the same observation AND the same value - a
+      // different value at the same instant is real news and still applies.
       const held = this.slots.get(key)
-      if (observed !== undefined && held?.observed !== undefined && stamp < held.observed) continue
-      this.slots.set(key, { value, at: stamp, observed: observed === undefined ? undefined : stamp })
+      if (observed !== undefined && held?.observed !== undefined) {
+        if (stamp < held.observed) continue
+        if (stamp === held.observed && isDeepStrictEqual(value, held.value)) continue
+      }
+      landing.set(key, { value, at: stamp, observed: observed === undefined ? undefined : stamp })
     }
+    // Over what landed, not over what arrived: an older power or energy value
+    // that was skipped above is a replay, and must not refresh the charge state
+    // as if the car had just said it.
+    const charging = this.showsCharging(landing)
+    for (const [key, entry] of landing) this.slots.set(key, entry)
     if (charging) {
       for (const key of this.profile.chargeStateSlots) {
         const entry = this.slots.get(key)
-        // A new entry, not a mutation: `clone` shares entries with its copy.
-        if (entry) this.slots.set(key, { value: entry.value, at: ms })
+        // A new entry, not a mutation: `clone` shares entries with its copy. It
+        // keeps `observed`: the refresh moves when we last heard of the value,
+        // not when the car saw it, and dropping that would let an older replay
+        // of the same slot past the guard above.
+        if (entry) this.slots.set(key, { value: entry.value, at: ms, observed: entry.observed })
       }
     }
     this.newestAt = ms
@@ -224,13 +245,13 @@ export class FieldAccumulator {
    * Positive power, or an energy counter above where it stood. The slots are the
    * profile's; the reasoning is on `CHARGE_STATE_SLOTS` in `profiles/tesla.ts`.
    */
-  private showsCharging(slots: Record<string, unknown>): boolean {
+  private showsCharging(landing: ReadonlyMap<string, Entry>): boolean {
     for (const key of this.profile.chargingPowerSlots) {
-      const value = slots[key]
+      const value = landing.get(key)?.value
       if (typeof value === 'number' && value > 0) return true
     }
     for (const key of this.profile.chargingEnergySlots) {
-      const value = slots[key]
+      const value = landing.get(key)?.value
       const before = this.slots.get(key)?.value
       if (typeof value === 'number' && typeof before === 'number' && value > before) return true
     }
@@ -454,6 +475,12 @@ export class Pipeline {
    * `now` stands in for the previous worker's shutdown flush, so the replay
    * ends where it did; if that worker crashed instead, the last burst it never
    * emitted is written here.
+   *
+   * NOT SAFE UNDER LIVE TRAFFIC. It swaps `this.runner` for the dry store
+   * without holding the lock, so a handle() or flush() arriving meanwhile would
+   * run against the dry store and its writes would vanish. It is only safe
+   * before the subscription and the flush timer start, which is where `main.ts`
+   * calls it.
    */
   async resume(
     tape: Iterable<RawMessage> | AsyncIterable<RawMessage>,
@@ -546,8 +573,11 @@ export class Pipeline {
    * middle of a handle(): each snapshots the in-memory state, and a rollback in
    * one restored its snapshot over the other's committed progress - and flush
    * read `this.accumulators` before a queued handle had run. A promise chain,
-   * not a mutex library: the queue is never deeper than one flush and the
-   * message mqtt.js is already waiting on.
+   * not a mutex library. The queue is short but not bounded to one flush: the
+   * flush timer fires every second with no in-flight guard (main.ts), so a
+   * stalled transaction queues a flush per tick behind it, plus the message
+   * mqtt.js is waiting on. They drain in order once it resolves, and a flush
+   * that finds nothing due is cheap.
    *
    * NEVER call `locked` or `transactionally` from inside a `locked` callback:
    * the inner call would wait on the outer one forever.
