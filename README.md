@@ -213,7 +213,7 @@ a derived number, the service refuses to start instead.
 | `TESLAPROXY_URL` | yes | Your `tesla/vehicle-command` proxy, which holds the signing key. |
 | `EV_TELEMETRY_HOSTNAME` | to push config | The public name **the car dials**, e.g. `ev-telemetry.example.com`. Pushing a configuration without it is refused: Tesla would accept an empty hostname and the car would then stream to nowhere. |
 | `EV_TELEMETRY_PORT` | no | Defaults to 443, which is the only port guaranteed to survive whatever network the car is on. |
-| `RIVIAN_CREDENTIAL_PUBLIC_KEY` | to sign in to Rivian | The **public** half of the credential keypair, as one line of JSON, from `scripts/rivian-keygen.mjs`. Unset, a sign-in attempt answers that Rivian sign-in is not configured on this server, and nothing else is affected. Set but unusable, the first sign-in fails naming this variable. A private key is refused here on purpose: a web pod that held it could read back every credential it writes. |
+| `RIVIAN_CREDENTIAL_PUBLIC_KEY` | to sign in to Rivian | The **public** half of the credential keypair, as one line of JSON, from `scripts/rivian-keygen.mjs`. Unset, a sign-in attempt answers that Rivian sign-in is not configured on this server, and nothing else is affected. Set but unusable (damaged JSON, the wrong curve, a private key), the first sign-in fails with only a generic error in the browser (`Internal Error`, or `the request failed (500)`); the web pod's log has the line `RIVIAN_CREDENTIAL_PUBLIC_KEY is not usable: …` naming the variable and what is wrong with it, and signing out still works. A private key is refused here on purpose: a web pod that held it could read back every credential it writes. It must be the public half of the **same** `scripts/rivian-keygen.mjs` run as the connector's private key (see "Rivian setup", step 1). The web pod also needs outbound HTTPS to `rivian.com`, because it performs the sign-in itself. |
 | `PGHOST` `PGPORT` `PGUSER` `PGPASSWORD` `PGDATABASE` | yes | Standard libpq names. `PGPOOL_MAX` tunes the pool. |
 
 ### ev-ingest
@@ -224,7 +224,7 @@ differ only in their environment.
 | Variable | Required | Notes |
 |---|---|---|
 | `EV_VENDOR` | yes | `tesla` or `rivian`. **No default on purpose.** It picks the decoder, the topic parser and the `vendor` stamped on the tape and the vehicle row, and a default would let a manifest that forgot it tape one car's payloads as the other's, silently and for good. |
-| `EV_VEHICLE_ID` | yes | Your stable id for the car; also the display name unless `EV_VEHICLE_NAME` is set. |
+| `EV_VEHICLE_ID` | yes | Your stable id for the car; also the display name unless `EV_VEHICLE_NAME` is set. **One id, one car**: a Rivian worker needs an id that is new and unique, never the Tesla's. Every table is keyed by it and registering an existing id changes nothing, so a worker that reused another car's id would file its tape and samples under that car, silently and for good. The worker therefore reads the row at startup (`reprocess`, `backfill-costs` and `parallax-dump` do the same, before they delete or write anything) and refuses to run if the row belongs to the other vendor, or if both it and `EV_VEHICLE_VIN` hold a VIN and they differ. The error names `EV_VEHICLE_ID`, `EV_VENDOR` and `EV_VEHICLE_VIN` and quotes no value. An id with no row yet is fine. |
 | `EV_USABLE_CAPACITY_KWH` | yes | **No default on purpose.** A guessed capacity rescales every drive's energy and efficiency figure, and the error is plausible enough never to be noticed. For a Rivian it depends on the pack that was ordered, so only you can supply it. |
 | `MQTT_PASSWORD` | yes | |
 | `MQTT_URL` | no | Defaults to the in-cluster broker. |
@@ -232,7 +232,7 @@ differ only in their environment.
 | `MQTT_CLIENT_ID` | no | Defaults to `ev-ingest` for Tesla and `ev-ingest-rivian` for Rivian. Startup refuses the receiver's `ev-fleet-telemetry`, the connector's `ev-rivian`, and the other vendor's id: MQTT allows one connection per client id, so sharing one makes two processes evict each other in a permanent loop where both look healthy alone, and a Rivian worker that took `ev-ingest` would be handed the Tesla backlog and acknowledge it as parse failures. |
 | `MQTT_TOPIC` | no | Defaults to `ev/#` for Tesla and `rivian/#` for Rivian. Startup refuses a topic outside the vendor's own tree (`ev/` or `rivian/`), a bare `#` included, for the same reason. |
 | `EV_CURSOR_SOURCE` | no | The key the worker files its resume watermark under, in `ingest_cursor`. Defaults to `tesla:mqtt` for Tesla (what it has always been) and `rivian:mqtt` for Rivian, so two workers never share one. |
-| `EV_VEHICLE_VIN` | Rivian: yes | Optional for Tesla, where it only keys the vehicle row and the app works without it. Required for Rivian: it is the vehicle's vendor id and what the worker checks every topic against, and without it frames for any VIN on `rivian/#` would be taped as this car's, so the worker refuses to start. |
+| `EV_VEHICLE_VIN` | Rivian: yes | Optional for Tesla, where it only keys the vehicle row and the app works without it. Required for Rivian: it is the vehicle's vendor id and what the worker checks every topic against, and without it frames for any VIN on `rivian/#` would be taped as this car's, so the worker refuses to start. Upper-cased at startup for both vendors, as the connector's is, so the two always agree on the topic. |
 | `EV_HOME_LAT` / `EV_HOME_LON` | no | All or nothing — half a coordinate is not a location, and ignoring the set half fails invisibly. Enables "charged at home" classification. |
 | `EV_HOME_RADIUS_KM` | no | Defaults to 0.1 — a driveway, not a postcode. |
 | `OPENEI_API_KEY` | no | Without it, charge pricing falls back entirely to the rate you enter in the UI, which is still a working product. |
@@ -249,7 +249,7 @@ The connector. It holds the one Rivian websocket, publishes what arrives to
 
 | Variable | Required | Notes |
 |---|---|---|
-| `EV_VEHICLE_VIN` | yes | The car to find. Never guessed: an account can hold several. Letters and digits only, because it becomes a segment of the MQTT topic and a `/`, `+` or `#` in it would publish somewhere ingest is not listening. |
+| `EV_VEHICLE_VIN` | yes | The car to find. Never guessed: an account can hold several. Letters and digits only, because it becomes a segment of the MQTT topic and a `/`, `+` or `#` in it would publish somewhere ingest is not listening. Upper-cased at startup, because ingest upper-cases its own and a lower-case topic would publish where nothing listens. It is also what the settings page shows as the VIN, in every state, including the ones before the car has been found. |
 | `RIVIAN_CREDENTIAL_PRIVATE_KEY` | yes | The **private** half of the credential keypair, as one line of JSON, from `scripts/rivian-keygen.mjs`. Checked as a P-256 key at startup. It goes to this pod only, never to `ev-web`. |
 | `MQTT_PASSWORD` | yes | |
 | `MQTT_URL` | no | Defaults to the in-cluster broker. |
@@ -378,10 +378,15 @@ adds.
    and nowhere else; `RIVIAN_CREDENTIAL_PUBLIC_KEY` goes to `ev-web`. The script
    writes no file, so the only copy of the private key is the one you store.
    Anyone holding it can read the stored Rivian session: keep it out of chats,
-   tickets and terminals whose output is logged. Running the script again makes
-   a *new* pair, and a credential sealed to the old public key will not open
-   with the new private one, so the connector reports `credential_invalid`
-   until someone signs in again. Rotate on purpose.
+   tickets and terminals whose output is logged. The two lines are a pair, so
+   take both from **one** run. A public key from one run and a private key from
+   another seals every sign-in to a key the connector cannot open, and the
+   connector reports `credential_invalid` even straight after a fresh sign-in:
+   that is the usual cause of it on a first setup, and signing in again cannot
+   fix it. Running the script again makes a *new* pair, and a credential sealed
+   to the old public key will not open with the new private one, so the
+   connector reports `credential_invalid` until someone signs in again. Rotate
+   on purpose.
 2. **Deploy the workloads.** None of this is in this repo, and nothing changes
    in production without your go-ahead. Two things on the list only you can
    supply: the manifests themselves, and `EV_USABLE_CAPACITY_KWH`, which has no
@@ -392,7 +397,9 @@ adds.
      probe on the metrics port says the process is up, not that a session is
      held — `rivian_connector_state` says that.
    - **`ev-ingest-rivian`**: the `ev-ingest` image with `EV_VENDOR=rivian`;
-     `EV_VEHICLE_ID` (for example `r2`), `EV_VEHICLE_VIN`, `EV_VEHICLE_NAME`;
+     `EV_VEHICLE_ID` (for example `r2`: **new and unique, never the Tesla's**,
+     since the worker refuses to start against a row that belongs to the other
+     vendor or has a different VIN), `EV_VEHICLE_VIN`, `EV_VEHICLE_NAME`;
      `EV_USABLE_CAPACITY_KWH`; the home location, as for the Tesla. Leave
      `MQTT_CLIENT_ID`, `MQTT_TOPIC` and `EV_CURSOR_SOURCE` unset: the Rivian
      defaults are the safe ones.
@@ -402,11 +409,17 @@ adds.
      matching `ev-ingest`'s.
    - **Alerts**: the connector in `backing_off`, `unauthenticated` or
      `credential_invalid` for over 15 minutes; any increase in
-     `rivian_frames_dropped_total`. The existing stall alert already covers
-     `ev-ingest-rivian` through its `vehicle` label, but it must **exclude the
-     Rivian until delivery**, because before then no samples is the correct
-     state.
-3. **Sign in** at `/settings/rivian`. Use the owner account until the car is
+     `rivian_frames_dropped_total`; `rivian_mqtt_connected == 0` for more than
+     a few minutes, which is the only sign of a wrong broker password (the
+     client retries for ever and no frame fails, so nothing else moves). The
+     existing stall alert already covers `ev-ingest-rivian` through its
+     `vehicle` label, but it must **exclude the Rivian until delivery**, because
+     before then no samples is the correct state.
+3. **Sign in** at `/settings/rivian`. The Rivian vehicle's Settings tab leads
+   there, but the vehicle only exists once `ev-ingest-rivian` has started and
+   registered it, so deploy that first (or open the URL directly: the page does
+   not depend on the vehicle). The web pod signs in to Rivian itself, so it
+   needs outbound HTTPS to `rivian.com`. Use the owner account until the car is
    delivered: whether a secondary-driver account can see an undelivered car is
    unknown, and after delivery a secondary-driver account can be revoked from
    the Rivian app without changing the owner's password. If the account has a
@@ -424,7 +437,10 @@ adds.
    1. The settings page shows the account you signed in with.
    2. The connector's state on that page reaches `waiting_for_vehicle` (the
       VIN is not on the account yet, and it asks again every hour) or
-      `subscribed`.
+      `subscribed`. The VIN tile shows the VIN the connector was configured to
+      look for, in every state. `credential_invalid` straight after a first
+      sign-in means the web's public key and the connector's private key came
+      from different keygen runs (step 1), which signing in again cannot fix.
    3. The tape holds the account's vehicles, taped by `ev-ingest-rivian`:
 
       ```sql
@@ -435,10 +451,12 @@ adds.
         AND payload->'body'->>'kind' = 'userInfo'
       ORDER BY received_at DESC LIMIT 1;
       ```
-   4. `dropped_properties` on the page, and the latest `meta.schema` record on
-      the tape, show what the gateway accepts today. A non-empty dropped list is
-      the connector working as designed: it found a field Rivian rejects, and
-      stopped asking for it.
+   4. Once the car is listed (so **not** while the state is
+      `waiting_for_vehicle`, where nothing has been subscribed and the page says
+      "not probed yet"), `dropped_properties` on the page, and the latest
+      `meta.schema` record on the tape, show what the gateway accepts today. A
+      non-empty dropped list is the connector working as designed: it found a
+      field Rivian rejects, and stopped asking for it.
 
 Parallax, Rivian's opaque channel, is taped verbatim and decoded by nothing.
 `parallax-dump` reads the tape back as schema-less protobuf trees, so that what
@@ -458,6 +476,67 @@ It loads the ingest worker's configuration (so `EV_VENDOR=rivian` and the rest
 of that table), and it is read-only, so it is safe to run in the ingest pod
 beside the live worker.
 
+### Reading what the connector reports
+
+The page's State, Last error, Backing off until and Dropped properties come
+from the connector's own row, `rivian_status`, and each has a meaning that is
+easy to misread.
+
+- **State.** `subscribed` only says the socket was acknowledged, and it stays
+  that when the server then refuses or ends every subscription. The page
+  therefore calls it *Streaming* only once a frame is on record, and otherwise
+  says *Subscribed, no frame yet*. A `signed_out` row beside a stored credential
+  means the connector has not yet read the new sign-in (it polls every 15 s),
+  not that nothing was saved.
+- **A dead session.** `unauthenticated` is Rivian refusing the saved session:
+  a websocket close with code 4401 or 4403 (whatever its text says), an HTTP
+  401 with no Rivian error code, or a subscription refused as `UNAUTHENTICATED`.
+  The connector stops and waits for a new sign-in (sign out, then sign in)
+  instead of retrying, because retrying a dead session is how accounts get
+  flagged.
+- **A refused subscription** shows as `last_error` on the page, as
+  `subscription <stream> refused: <CODE>`, and as a line in the connector's log,
+  and it clears when that subscription is next heard from. Each refused or ended
+  subscription retries on **its own** backoff, 30 s doubling with up to 30 s of
+  jitter and capped at 900 s, reset by its own next frame, so one bad stream
+  never slows another and a stream that is refused for ever settles at one
+  attempt per 15 minutes. A subscription the server merely ends carries no
+  code, so it retries on the same backoff and leaves `last_error` alone. The
+  state stays `subscribed` throughout, which is why *Last error* is the place
+  to look.
+- **A restart does not cut a backoff short.** The connector saves
+  `backoff_until` and honours it after a restart, so a deploy or a crash loop
+  cannot become the reconnect storm the backoff exists to prevent.
+- **Dropped properties** are the `vehicleState` fields Rivian rejected by name.
+  The connector finds them by splitting a rejected group, saves the list in
+  `rivian_status.dropped_properties`, reads it back at start, and tries each
+  saved name again an hour after start (spread over the hour after that); a
+  newly dropped name is tried again after a day. Before the connector has
+  subscribed to anything the page says *not probed yet*, not *None*.
+- **Whole-request rejection drops nothing.** If Rivian rejects *every*
+  `vehicleState` group of a subscribe (or a group on every one of its
+  properties), the fault is the request and not any field, so the connector
+  drops nothing. When every group is rejected it also subscribes a one-property
+  `batteryLevel` canary: a canary refused too means the documents are wrong,
+  and one accepted means each group has a bad field of its own, so the search
+  goes ahead. `last_error` says `every vehicleState group refused:
+  GRAPHQL_VALIDATION_FAILED` (or `the vehicleState canary refused: …`), and the
+  groups retry on the per-subscription backoff until a state frame shows the
+  documents are fine.
+- **Clearing a dropped list.** After fixing the cause (a list saved by an
+  earlier build, say), stop the connector, run `UPDATE rivian_status SET
+  dropped_properties = '{}';`, and start it. The connector rewrites the whole
+  row from memory, so an UPDATE under a running connector is overwritten again,
+  and the list is read only at start. Left alone, saved names are re-probed an
+  hour after each start in any case.
+- **A parked car keeps its levels for seven days.** Rivian streams changes
+  only, so a car that has not moved says nothing new about its state of charge,
+  odometer, position or tyres for as long as it sits. Ingest carries those
+  levels for up to 7 days from when each last changed (speed, heading and charge
+  power for five minutes, the charge words for six hours, so a stale word cannot
+  hold a session open). After an ingest restart the connector's resubscribe,
+  which it makes after every 60 s without a frame, re-sends the levels.
+
 ### What is not known until the car is real
 
 Nothing here has run against the live account or a real payload. The decoder's
@@ -472,7 +551,9 @@ is a migration plus `reprocess`. Two things in particular need a live check:
   nothing else is affected.
 - **Whether `chargingSession` is live, and every other subscription besides
   `vehicleState` and `parallaxMessages`, is unverified.** A subscription Rivian
-  rejects is marked unavailable and retried daily. If `chargingSession` is
+  rejects as invalid is marked unavailable and retried daily; one it refuses for
+  another reason is retried on its own backoff and named in *Last error* (see
+  "Reading what the connector reports"). If `chargingSession` is
   rejected, charge power and energy stay unknown until the Parallax topics that
   carry them are found with `parallax-dump` and mapped.
 

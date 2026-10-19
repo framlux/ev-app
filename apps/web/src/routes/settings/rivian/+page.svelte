@@ -1,4 +1,7 @@
 <script lang="ts">
+	// Type-only, so nothing of the database package reaches the browser bundle.
+	// It is here so that STATES below is checked against the connector's own list.
+	import type { RivianConnectorState } from '@ev/db'
 	import type { PageData } from './$types.js'
 	import { errorMessageFrom } from '$lib/api-error.js'
 	import EmptyState from '$lib/components/EmptyState.svelte'
@@ -20,7 +23,9 @@
 	 * Null is not zero or empty anywhere below. Every observation the connector
 	 * has not made is a dash, and the one list that CAN be empty (dropped
 	 * properties) says "None" for `[]` rather than dashing it, because an empty
-	 * list is an observation and a dash is the absence of one.
+	 * list is an observation and a dash is the absence of one. Before the
+	 * connector has subscribed to anything it is not an observation either, and
+	 * says "not probed yet" (`BEFORE_SUBSCRIBING`).
 	 *
 	 * THE PASSWORD IS NEVER KEPT HERE. It is sent once, and the field is emptied
 	 * the moment Rivian has answered with anything but a refusal. A refusal keeps
@@ -68,16 +73,26 @@
 	 * new sign-in say "sign out, then sign in again" and not just "sign in":
 	 * while a credential row exists this page shows the account and a Sign out
 	 * button, and the sign-in form is hidden, so the first half of that is the
-	 * step that actually has to be taken. A state this page
-	 * has not heard of is shown as it came, so a state added later reads as
-	 * itself instead of as a blank.
+	 * step that actually has to be taken.
+	 *
+	 * Keyed by the connector's own state type, so a state added to it and not
+	 * written here is a compile error and not a page that prints the identifier.
+	 * That is all the type buys: a row a NEWER connector wrote is still looked up
+	 * as a string in `stateWords`, and a state this page has not heard of is
+	 * shown as it came, so it reads as itself instead of as a blank.
+	 *
+	 * `subscribed` and `signed_out` are the two whose words depend on more than
+	 * the state, and `stateWords` says how.
 	 */
-	const STATES: Record<string, { label: string; hint: string | null }> = {
+	const STATES: Record<RivianConnectorState, { label: string; hint: string | null }> = {
 		signed_out: { label: 'Signed out', hint: 'no credential is stored, so nothing is streaming' },
 		starting: { label: 'Starting', hint: 'reading the credential and opening an app session' },
 		credential_invalid: {
 			label: 'Credential unreadable',
-			hint: "the stored credential does not open with the connector's key — sign out, then sign in again"
+			hint:
+				"the stored credential does not open with the connector's key — sign out, then sign in again. " +
+				"If it persists after a fresh sign-in, the web's public key and the connector's private key " +
+				'come from different keygen runs'
 		},
 		finding_vehicle: { label: 'Finding the vehicle', hint: 'looking for the VIN on the account' },
 		waiting_for_vehicle: {
@@ -85,7 +100,13 @@
 			hint: 'the VIN is not on the account yet — asked again every hour'
 		},
 		connecting: { label: 'Connecting', hint: 'opening the live stream' },
-		subscribed: { label: 'Streaming', hint: 'subscribed and receiving' },
+		// The state alone only says the socket was acknowledged. It stays
+		// `subscribed` when the server then ends or refuses every subscription,
+		// so a frame is the evidence of a stream, and `STREAMING` is for that.
+		subscribed: {
+			label: 'Subscribed',
+			hint: 'no frame yet — Last error says if Rivian refused a subscription'
+		},
 		backing_off: { label: 'Backing off', hint: 'the stream dropped — retrying with a growing delay' },
 		unauthenticated: {
 			label: 'Session refused',
@@ -93,9 +114,51 @@
 		}
 	}
 
-	let stateWords = $derived(
-		status ? (STATES[status.state] ?? { label: status.state, hint: null }) : null
-	)
+	/**
+	 * `subscribed` with a frame on record. `last_frame_at` is kept across a
+	 * restart, so the frame may be an earlier run's: all the sentence claims is
+	 * that the car has been heard from, and the Last frame tile says when.
+	 */
+	const STREAMING = { label: 'Streaming', hint: 'subscribed, and the car has been heard from' }
+
+	/**
+	 * What a stored credential changes about `signed_out`. The row says the
+	 * connector last saw no credential, and the connector reports on its own
+	 * schedule: the web wrote the credential, and the connector reads it on its
+	 * next poll, so for up to fifteen seconds this page shows an account above a
+	 * report that predates it. "No credential is stored" would be false.
+	 */
+	const SIGNED_OUT_WITH_CREDENTIAL = {
+		label: 'Signed out',
+		hint: 'a sign-in is stored and the connector has not picked it up yet — it looks every 15 seconds'
+	}
+
+	/**
+	 * The states in which the connector has not yet subscribed to anything, so
+	 * an empty dropped list is not an answer: Rivian has not been asked, and
+	 * "None" would say it had been and accepted everything. The list is saved
+	 * and survives a restart, so a name in it is shown whatever the state; only
+	 * an EMPTY list is read this way. `connecting` is not here: a reconnecting
+	 * connector may already have a plan whose empty list is an answer.
+	 */
+	const BEFORE_SUBSCRIBING: ReadonlySet<RivianConnectorState> = new Set([
+		'signed_out',
+		'starting',
+		'credential_invalid',
+		'finding_vehicle',
+		'waiting_for_vehicle'
+	])
+
+	let streaming = $derived(status?.state === 'subscribed' && status.lastFrameAt !== null)
+	let probed = $derived(status ? !BEFORE_SUBSCRIBING.has(status.state) : false)
+
+	let stateWords = $derived.by(() => {
+		if (!status) return null
+		if (streaming) return STREAMING
+		if (status.state === 'signed_out' && credential) return SIGNED_OUT_WITH_CREDENTIAL
+		const known: Record<string, { label: string; hint: string | null } | undefined> = STATES
+		return known[status.state] ?? { label: status.state, hint: null }
+	})
 
 	/** An instant as its age, which is the only thing that makes it useful. */
 	const age = (iso: string | null | undefined) => formatRelative(iso, clock)
@@ -345,12 +408,12 @@
 				label="State"
 				value={stateWords?.label ?? DASH}
 				hint={stateWords?.hint ?? 'the connector has not reported'}
-				tone={status?.state === 'subscribed' ? 'accent' : 'default'}
+				tone={streaming ? 'accent' : 'default'}
 			/>
 			<StatTile
 				label="VIN"
 				value={formatText(status?.vin)}
-				hint="the car this session is subscribed to"
+				hint="the VIN the connector looks for"
 			/>
 			<StatTile
 				label="Last frame"
@@ -381,7 +444,7 @@
 					{#if !status}
 						{DASH}
 					{:else if status.droppedProperties.length === 0}
-						None
+						{probed ? 'None' : 'not probed yet'}
 					{:else}
 						<ul class="props">
 							{#each status.droppedProperties as property (property)}
@@ -394,7 +457,9 @@
 		</dl>
 		<p class="faint note">
 			A dropped property is one Rivian rejected by name when the connector subscribed. It is left
-			out of the stream and the rest are unaffected.
+			out of the stream and the rest are unaffected, and it is asked for again about a day later. A
+			rejection of every group at once is read as a fault in the request, not in the fields: nothing
+			is dropped, and Last error says so.
 		</p>
 	</div>
 </section>

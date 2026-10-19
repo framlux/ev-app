@@ -1145,6 +1145,24 @@ describe('the Rivian settings page renders in every state that occurs', () => {
 	/** The template folds source line breaks into spaces, so compare as the browser reads it. */
 	const text = (body: string) => body.replace(/\s+/g, ' ')
 
+	/**
+	 * One connector tile as the markup says it: its tone, its value and its hint.
+	 * Asserting through the tile and not through the page's text is what keeps
+	 * "the hint under VIN" from being satisfied by the same words somewhere else.
+	 */
+	function tile(body: string, label: string) {
+		const m = new RegExp(
+			`<div class="tile (\\w+)[^"]*"><div class="label[^"]*">${label}</div> ` +
+				`<div class="value[^"]*">([^<]*)</div>(?: <!--\\[0--><div class="hint[^"]*">([^<]*)</div>)?`
+		).exec(body)
+		if (!m) throw new Error(`no ${label} tile in the page`)
+		return { tone: m[1], value: m[2], hint: m[3] ?? null }
+	}
+
+	/** The Dropped properties cell, as the browser would read it. */
+	const droppedCell = (body: string) =>
+		/Dropped properties<\/dt> <dd[^>]*>(.*?)<\/dd>/.exec(text(body))?.[1] ?? null
+
 	it('day one: nobody is signed in and the connector has said nothing', () => {
 		const body = rivianPage({})
 		// The sign-in form, and no code box: no attempt is in progress.
@@ -1170,8 +1188,43 @@ describe('the Rivian settings page renders in every state that occurs', () => {
 	it('says None for an empty dropped list rather than dashing an observation away', () => {
 		const empty = text(rivianPage({ status: status({ state: 'subscribed' }) }))
 		expect(empty).toContain('Dropped properties')
-		// Svelte brackets a conditional branch with comments, hence the `<!--[1-->`.
-		expect(empty).toMatch(/Dropped properties<\/dt> <dd[^>]*><!--\[1-->None/)
+		// Svelte brackets a conditional branch with comments, hence the `<!--[n-->`.
+		expect(droppedCell(empty)).toMatch(/^<!--\[\d+-->None<!--\]-->$/)
+	})
+
+	it.each([
+		'signed_out',
+		'starting',
+		'credential_invalid',
+		'finding_vehicle',
+		'waiting_for_vehicle'
+	])(
+		'says "not probed yet", and not None, for an empty dropped list in %s, where nothing has been subscribed',
+		(state) => {
+			// "None" is a claim that Rivian accepted everything, and before the first
+			// subscribe nobody has asked it anything. The list is `[]` there because
+			// the connector has not got to it, not because the answer was no.
+			const cell = droppedCell(rivianPage({ status: status({ state }) }))
+			expect(cell).toContain('not probed yet')
+			expect(cell).not.toContain('None')
+		}
+	)
+
+	it('still lists what a restart read back, even before the connector has subscribed', () => {
+		// The list is saved and survives a restart, so a name in it is something
+		// Rivian really rejected, whatever state the connector is in now.
+		const body = rivianPage({
+			status: status({ state: 'starting', droppedProperties: ['gnssLocation'] })
+		})
+		expect(droppedCell(body)).toContain('gnssLocation')
+		expect(droppedCell(body)).not.toContain('not probed yet')
+	})
+
+	it('says None once the connector is past subscribing, and a dash while it has reported nothing', () => {
+		for (const state of ['connecting', 'subscribed', 'backing_off', 'unauthenticated']) {
+			expect(droppedCell(rivianPage({ status: status({ state }) }))).toContain('None')
+		}
+		expect(droppedCell(rivianPage({}))).toContain('—')
 	})
 
 	it('lists dropped properties, and the last error exactly as the connector redacted it', () => {
@@ -1197,7 +1250,12 @@ describe('the Rivian settings page renders in every state that occurs', () => {
 	})
 
 	it('signed in: names the account and its age, offers sign-out, and hides the sign-in form', () => {
-		const body = text(rivianPage({ credential: ACCOUNT, status: status({ state: 'subscribed' }) }))
+		const body = text(
+			rivianPage({
+				credential: ACCOUNT,
+				status: status({ state: 'subscribed', lastFrameAt: '2026-10-19T11:59:30.000Z' })
+			})
+		)
 		expect(body).toContain('Signed in as')
 		expect(body).toContain('owner@example.com')
 		// `numeric: 'auto'` says "yesterday" for exactly one day, and that is what
@@ -1227,7 +1285,7 @@ describe('the Rivian settings page renders in every state that occurs', () => {
 		['finding_vehicle', 'Finding the vehicle'],
 		['waiting_for_vehicle', 'Waiting for the vehicle'],
 		['connecting', 'Connecting'],
-		['subscribed', 'Streaming'],
+		['subscribed', 'Subscribed'],
 		['backing_off', 'Backing off'],
 		['unauthenticated', 'Session refused']
 	])('puts the connector state %s in words', (state, words) => {
@@ -1252,6 +1310,70 @@ describe('the Rivian settings page renders in every state that occurs', () => {
 			assertNoBrokenValues(body)
 		}
 	)
+
+	it('says Streaming, in the accent tone, only for a subscription that has had a frame', () => {
+		const state = tile(
+			rivianPage({
+				status: status({ state: 'subscribed', lastFrameAt: '2026-10-19T11:59:30.000Z' })
+			}),
+			'State'
+		)
+		expect(state.value).toBe('Streaming')
+		expect(state.tone).toBe('accent')
+		// Nothing in the hint may claim more than the row knows.
+		expect(state.hint).not.toMatch(/receiving/i)
+	})
+
+	it('does not call a subscription with no frame yet Streaming, or give it the accent tone', () => {
+		// The state is `subscribed` the moment the socket is acknowledged, and it
+		// stays that when the server then refuses or ends every subscription, so on
+		// its own it is no evidence that anything is arriving.
+		const body = rivianPage({ status: status({ state: 'subscribed' }) })
+		const state = tile(body, 'State')
+		expect(state.value).toBe('Subscribed')
+		expect(state.tone).toBe('default')
+		expect(state.hint).toContain('no frame')
+		expect(state.hint).not.toMatch(/receiving/i)
+		expect(text(body)).not.toContain('Streaming')
+	})
+
+	it('says the VIN is the one the connector looks for, and shows it before the car is on the account', () => {
+		// The connector writes its CONFIGURED VIN in every state, `waiting_for_vehicle`
+		// included, which is exactly when no car is subscribed to anything.
+		const body = rivianPage({
+			status: status({ state: 'waiting_for_vehicle', vin: '7FCTGAAA0PN000000' })
+		})
+		const vin = tile(body, 'VIN')
+		expect(vin.value).toBe('7FCTGAAA0PN000000')
+		expect(vin.hint).toBe('the VIN the connector looks for')
+		expect(body).not.toContain('is subscribed to')
+	})
+
+	it('says a credential that does not open may be a mismatched keygen pair, not only a stale sign-in', () => {
+		const body = text(rivianPage({ credential: ACCOUNT, status: status({ state: 'credential_invalid' }) }))
+		expect(body).toContain('sign out, then sign in again')
+		// A fresh sign-in is sealed to the web's CURRENT public key, so if it still
+		// does not open the two halves were never a pair.
+		expect(body).toMatch(
+			/persists after a fresh sign-in.*public key.*private key.*different keygen runs/
+		)
+	})
+
+	it('with a credential stored and a signed_out row, says the connector has not picked the sign-in up yet', () => {
+		// The web wrote the credential, and the connector's last report predates it:
+		// "no credential is stored" would be false on the same page that shows the
+		// account. It looks every fifteen seconds.
+		const body = text(rivianPage({ credential: ACCOUNT, status: status({ state: 'signed_out' }) }))
+		expect(body).toContain('Signed in as')
+		expect(tile(body, 'State').hint).toMatch(/not picked .*up yet/)
+		expect(tile(body, 'State').hint).toContain('15 seconds')
+		expect(body).not.toContain('no credential is stored')
+	})
+
+	it('with no credential and a signed_out row, still says no credential is stored', () => {
+		const body = text(rivianPage({ status: status({ state: 'signed_out' }) }))
+		expect(tile(body, 'State').hint).toContain('no credential is stored')
+	})
 
 	it('shows a state it has not heard of as it came, rather than as a blank', () => {
 		const body = rivianPage({ status: status({ state: 'rate_limited_for_a_while' }) })
