@@ -91,6 +91,19 @@ describe('loadConfig: the vendor', () => {
       .toBe('5YJ3E1EA1JF000001')
   })
 
+  it('upper-cases EV_VEHICLE_VIN for both vendors', () => {
+    // The VIN keys the vehicle row and is compared with the one on every topic,
+    // and both are upper-case on the wire. A VIN typed in lower case would
+    // never match either, and for Rivian every frame would be dropped as
+    // another car's. A Tesla VIN that is already upper-case is unchanged.
+    expect(loadConfig({ ...RIVIAN, EV_VEHICLE_VIN: '7pdsgaba1rn000001' }).vehicle.vin)
+      .toBe('7PDSGABA1RN000001')
+    expect(loadConfig({ ...BASE, EV_VEHICLE_VIN: '5yj3e1ea1jf00000a' }).vehicle.vin)
+      .toBe('5YJ3E1EA1JF00000A')
+    expect(loadConfig({ ...BASE, EV_VEHICLE_VIN: '5YJ3E1EA1JF000001' }).vehicle.vin)
+      .toBe('5YJ3E1EA1JF000001')
+  })
+
   it('lets an explicit cursor source override the vendor default', () => {
     expect(loadConfig({ ...RIVIAN, EV_CURSOR_SOURCE: 'rivian:r1' }).cursorSource).toBe('rivian:r1')
   })

@@ -8,7 +8,7 @@ import { runMigrationsUnderGate } from '../src/migrate.js'
 import { withTransaction } from '../src/repo/types.js'
 import { insertRaw, streamRaw } from '../src/repo/raw.js'
 import { ensurePartitions, insertSample, upsertSample } from '../src/repo/samples.js'
-import { ensureVehicle, findVehicleIdByVendorId } from '../src/repo/vehicles.js'
+import { ensureVehicle, findVehicle, findVehicleIdByVendorId } from '../src/repo/vehicles.js'
 import {
   abandonSession, appendPoint, closeSession, deleteDerived, findOpenSession, giveUpPendingCharges,
   discardSession, hasPendingCharges, openSession, pendingChargesSince, priceSession, resetSession,
@@ -788,6 +788,26 @@ describe.skipIf(!hasDb)('repositories', () => {
       const id = await withTransaction(getPool(), (c) =>
         findVehicleIdByVendorId(c, 'rivian', 'VIN-REPO'))
       expect(id).toBeNull()
+    })
+  })
+
+  /**
+   * What a worker reads before it trusts its own `EV_VEHICLE_ID`: the row that
+   * id already names, whatever vendor it belongs to. `ensureVehicle` is DO
+   * NOTHING on conflict, so without this read a worker configured with another
+   * vendor's id would "register" itself, change nothing, and file its data under
+   * the other car.
+   */
+  describe('reading the vehicle row an id names', () => {
+    it('returns the vendor, the vendor id and the name, whoever created the row', async () => {
+      const row = await withTransaction(getPool(), (c) => findVehicle(c, VEHICLE))
+      expect(row).toEqual({
+        id: VEHICLE, vendor: 'tesla', vendorVehicleId: 'VIN-REPO', displayName: 'Repo',
+      })
+    })
+
+    it('answers null for an id nobody has registered', async () => {
+      expect(await withTransaction(getPool(), (c) => findVehicle(c, 'repo-test-nobody'))).toBeNull()
     })
   })
 

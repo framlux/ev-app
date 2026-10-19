@@ -26,6 +26,7 @@ import {
 } from '@ev/db'
 import type { Config } from './config.js'
 import type { RawMessage, Vendor } from './deps.js'
+import { assertVehicleMatchesConfig } from './vehicle-guard.js'
 import {
   STALE_VALUE_MS,
   type OpenRow,
@@ -57,20 +58,31 @@ import {
  * `vendor` is the worker's own (EV_VENDOR): one image serves both vendors, a
  * Deployment each, and a worker registers the car it was configured for under
  * its own vendor rather than assuming one.
+ *
+ * It also REFUSES to start as a car the database knows as another: see
+ * `assertVehicleMatchesConfig`. DO NOTHING on conflict is right for a restart
+ * and wrong for a misconfiguration, and only a read can tell them apart.
  */
 export async function registerVehicle(
   pool: DbPool,
   vehicle: Config['vehicle'],
   vendor: Vendor,
 ): Promise<void> {
-  await withTransaction(pool, (client) =>
-    ensureVehicle(client, {
+  await withTransaction(pool, async (client) => {
+    await ensureVehicle(client, {
       vendor,
       id: vehicle.id,
       vendorVehicleId: vehicle.vin ?? vehicle.id,
       displayName: vehicle.displayName,
-    }),
-  )
+    })
+    // AFTER the insert, so that it is the row as it now stands that is checked,
+    // whoever wrote it: `ensureVehicle` is DO NOTHING on conflict, which is
+    // exactly how a worker configured with another car's id would otherwise
+    // pass. Checking first and inserting after would let two workers started
+    // together both see no row. A refusal rolls the transaction back, so a row
+    // this call just made is not left behind.
+    await assertVehicleMatchesConfig(client, { vendor, vehicle })
+  })
 }
 
 /**

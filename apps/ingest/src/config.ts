@@ -124,7 +124,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     },
     vehicle: {
       id: required(env, 'EV_VEHICLE_ID'),
-      vin: vendor === 'rivian' ? requiredVin(env) : env['EV_VEHICLE_VIN'] ?? null,
+      // Upper-cased for both vendors. The VIN keys the vehicle row and is
+      // compared with the one in every topic, and both are upper-case on the
+      // wire: one typed in lower case would never match either (every Rivian
+      // frame would be dropped as another car's), and would be stored as typed.
+      // A Tesla VIN is already upper-case, so nothing there changes.
+      vin: (vendor === 'rivian' ? requiredVin(env) : env['EV_VEHICLE_VIN'])?.toUpperCase() ?? null,
       displayName: env['EV_VEHICLE_NAME'] ?? required(env, 'EV_VEHICLE_ID'),
     },
     // No default. A guessed capacity silently rescales every drive's energy and

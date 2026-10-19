@@ -23,6 +23,7 @@ import { pathToFileURL } from 'node:url'
 import { closePool, getPool, streamRaw, type RawRow } from '@ev/db'
 import { decodeWire, readRivianEnvelope, type WireNode } from '@ev/rivian'
 import { loadConfig } from './config.js'
+import { assertVehicleMatchesConfig } from './vehicle-guard.js'
 
 export interface DumpArgs {
   rvm: string
@@ -199,6 +200,10 @@ async function main(): Promise<void> {
   const pool = getPool()
   const client = await pool.connect()
   try {
+    // A tool that reads this vehicle's tape should not read it under another
+    // car's id: a row that disagrees with the environment stops it, as it stops
+    // the worker and `reprocess`.
+    await assertVehicleMatchesConfig(client, config)
     // This vehicle's rows and no other's, as the replay narrows its stream.
     const tape = streamRaw(
       client, args.from ?? TAPE_START, args.to ?? TAPE_END, undefined, config.vehicle.id)

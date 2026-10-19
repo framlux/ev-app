@@ -26,6 +26,36 @@ export async function ensureVehicle(c: DbClient, v: VehicleIdentity): Promise<vo
   )
 }
 
+/** The `vehicle` row an id names, as `findVehicle` reads it. */
+export type VehicleRow = VehicleIdentity
+
+/**
+ * The row an id already names, whatever vendor it belongs to, or null.
+ *
+ * The read that `ensureVehicle` cannot be: it is DO NOTHING on conflict, so a
+ * worker configured with the id of another vendor's car "registers" itself,
+ * changes nothing, and goes on to file every message under that car. A worker
+ * reads the row first and compares it with what it was configured as (see
+ * `assertVehicleMatchesConfig` in `apps/ingest`).
+ *
+ * Keyed on the id alone, deliberately, which is the opposite of
+ * `findVehicleIdByVendorId` below: that one must not cross vendors, and this one
+ * exists to see that the id has.
+ */
+export async function findVehicle(c: DbClient, id: string): Promise<VehicleRow | null> {
+  const { rows } = await c.query(
+    `SELECT id, vendor, vendor_vehicle_id, display_name FROM vehicle WHERE id=$1`,
+    [id])
+  const r = rows[0]
+  if (!r) return null
+  return {
+    id: r.id,
+    vendor: r.vendor,
+    vendorVehicleId: r.vendor_vehicle_id,
+    displayName: r.display_name,
+  }
+}
+
 /**
  * The local `vehicle.id` for the identifier a vendor API reports, or null.
  *

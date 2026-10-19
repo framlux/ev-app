@@ -24,6 +24,7 @@ import { loadConfig, type Config } from './config.js'
 import { profileFor } from './deps.js'
 import { Pipeline } from './pipeline.js'
 import { replayStoreOn } from './store.js'
+import { assertVehicleMatchesConfig } from './vehicle-guard.js'
 
 export interface Window { from: Date; to: Date }
 
@@ -76,6 +77,14 @@ export async function replayWindow(
   w: Window,
 ): Promise<number> {
   const { from, to } = w
+  // FIRST, before anything is read or deleted. `deleteDerived` below clears this
+  // vehicle's rows in the window and the replay decodes the tape with this
+  // vendor's profile, so run under the wrong EV_VENDOR (or the wrong
+  // EV_VEHICLE_ID) it would erase one car's history and rebuild nothing, or
+  // rebuild it from another vendor's decoder. A row that disagrees with the
+  // configuration stops the run here; no row at all is fine, there is nothing
+  // for a mismatch to damage.
+  await assertVehicleMatchesConfig(client, config)
   const adoptable = openOutsideWindow(await findOpenSessions(client, config.vehicle.id), w)
   if (adoptable.length > 0) {
     const names = adoptable.map((s) => `${s.kind} ${s.id} (started ${s.startedAt.toISOString()})`)

@@ -35,6 +35,7 @@ import {
 } from '@ev/db'
 import { makeSample, type SessionSummary, type VehicleSample } from './deps.js'
 import { loadConfig } from './config.js'
+import { assertVehicleMatchesConfig } from './vehicle-guard.js'
 import {
   classifyCharge,
   priceCharge,
@@ -314,6 +315,12 @@ async function main(): Promise<void> {
   const { apply } = parseArgs(process.argv.slice(2))
   const config = loadConfig()
   const now = new Date()
+
+  // The charges this prices are every vehicle's, not just the configured one's,
+  // so the environment does not scope it. It is still the environment of a
+  // worker, and one that names another vendor's car is a misconfiguration worth
+  // stopping on, as `reprocess` does, before anything is written.
+  await withTransaction(getPool(), (c) => assertVehicleMatchesConfig(c, config))
 
   const counts = await runBackfill(pgBackfillStore(getPool()), {
     home: config.home, now, apply,

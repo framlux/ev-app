@@ -4,10 +4,14 @@ import type { Config } from '../src/config.js'
 
 // Only the reads and deletes the replay makes are replaced, so that what is
 // being asserted is the argument `streamRaw` was given and not a database.
+// `findVehicle` is the guard's read of the vehicle row (see vehicle-guard.ts): no
+// row, so nothing for it to refuse. The guard itself is tested against a real
+// Postgres in vehicle-guard.test.ts.
 const streamRaw = vi.hoisted(() => vi.fn())
 vi.mock('@ev/db', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@ev/db')>()),
   streamRaw,
+  findVehicle: vi.fn(async () => null),
   findOpenSessions: vi.fn(async () => []),
   ensurePartitions: vi.fn(async () => {}),
   deleteDerived: vi.fn(async () => {}),
