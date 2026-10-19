@@ -33,6 +33,8 @@ jobs:
             dockerfile: apps/web/Dockerfile
           - name: ev-ingest
             dockerfile: apps/ingest/Dockerfile
+          - name: ev-rivian
+            dockerfile: apps/rivian/Dockerfile
           - name: ev-migrator
             dockerfile: packages/db/Dockerfile
     steps:
