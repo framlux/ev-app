@@ -2,11 +2,15 @@
 /**
  * Generates the keypair the Rivian credential is sealed with (design §4.2).
  *
- *   pnpm --filter @ev/rivian build
+ *   pnpm --filter "@ev/rivian..." build
  *   node scripts/rivian-keygen.mjs
  *
  * Build @ev/rivian first: this imports the BUILT package, as every script here
  * does, so on a fresh checkout it fails with "cannot find module" until you do.
+ * The trailing `...` is not decoration: @ev/rivian imports @ev/core, and
+ * `--filter @ev/rivian` alone builds only the one package, so on a fresh
+ * checkout its compile fails for want of @ev/core's built types. `...` builds
+ * what it depends on first (`pnpm -r build` does the same, for everything).
  *
  * It prints two lines, each ready to paste as an environment variable:
  *

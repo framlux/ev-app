@@ -71,8 +71,8 @@ Three properties are worth knowing before you judge the design:
   decoding. The session token is sealed by `ev-web` to the connector's public
   key, so the web pod can store it and can never read it back. The broker is the
   only buffer: the connector holds at most 32 MiB of frames while the broker is
-  away, then drops the oldest and counts them, and production alerts on that
-  count.
+  away, then drops the oldest and counts them. The alert on that count is one to
+  create (it is on the list under "Rivian setup"), not one that already exists.
 
 ---
 
@@ -238,8 +238,8 @@ differ only in their environment.
 | `OPENEI_API_KEY` | no | Without it, charge pricing falls back entirely to the rate you enter in the UI, which is still a working product. |
 | `METRICS_PORT` | no | Prometheus endpoint, default 9090. |
 
-The backfill-costs job (`pnpm --filter @ev/ingest backfill-costs`), `reprocess`
-and `parallax-dump` read this same configuration, so each of them also needs
+The backfill-costs job (`apps/ingest/dist/backfill-costs.js`), `reprocess` and
+`parallax-dump` read this same configuration, so each of them also needs
 `EV_VENDOR` now.
 
 ### ev-rivian
@@ -303,7 +303,9 @@ migration `008`:
 
 1. **Scale `ev-ingest` to 0.** The broker keeps queueing the Tesla messages in
    the worker's durable session, up to the 100,000 messages or 128 MiB described
-   under "How it works", so keep the gap short.
+   under "How it works", so keep the gap short. A worker at zero replicas is
+   exactly what the existing worker-not-consuming alert fires on, so expect it,
+   or silence it for the length of the upgrade.
 2. **Run the migrator.** `008` rewrites each stored Tesla gear from its raw
    string (`ShiftStateD`) to the canonical `P`, `R`, `N` or `D`, and anything
    unmatched (`ShiftStateSNA`) becomes NULL, which is what the decoder now
@@ -367,7 +369,7 @@ adds.
 1. **Generate the credential keypair, once.**
 
    ```sh
-   pnpm --filter @ev/rivian build
+   pnpm --filter "@ev/rivian..." build   # or pnpm -r build
    node scripts/rivian-keygen.mjs
    ```
 
@@ -443,7 +445,12 @@ Parallax, Rivian's opaque channel, is taped verbatim and decoded by nothing.
 is in a topic can be worked out from the tape:
 
 ```sh
+# from a checkout (after pnpm -r build)
 pnpm --filter @ev/ingest parallax-dump -- --rvm <topic> \
+  [--from <date>] [--to <date>] [--limit <n>]
+
+# inside the ingest pod, which has no pnpm: the image's WORKDIR is /app
+node apps/ingest/dist/parallax-dump.js --rvm <topic> \
   [--from <date>] [--to <date>] [--limit <n>]
 ```
 
