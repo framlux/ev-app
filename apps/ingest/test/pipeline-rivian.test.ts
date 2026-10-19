@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { RawMessage } from '@ev/core'
 import { profileFor } from '../src/deps.js'
 import { Pipeline } from '../src/pipeline.js'
-import { rivianProfile } from '../src/profiles/rivian.js'
+import { RIVIAN_LEVEL_STALE_MS, rivianProfile } from '../src/profiles/rivian.js'
 import { STALE_VALUE_MS, VOLATILE_STALE_MS } from '../src/timing.js'
 // The synthetic envelopes Task 5's decoder tests are written from. Reaching into
 // another package's test directory is deliberate: one set of hand-written
@@ -103,15 +103,25 @@ describe('the Rivian profile', () => {
     expect(rivianProfile.vendor).toBe('rivian')
   })
 
-  it('gives speed, heading and charge power the short window and everything else the long one', () => {
+  it('gives speed, heading and charge power the short window, the charge words six hours, and every level seven days', () => {
     for (const slot of ['speedKph', 'gpsHeading', 'chargePowerKw']) {
       expect(rivianProfile.staleWindowFor(slot)).toBe(VOLATILE_STALE_MS)
     }
-    // Position and gear are levels here: a parked car is where it parked and in
-    // the gear it left (spec §7.6). The Tesla profile has to carve these out of
-    // its drive tier; Rivian has no such tier to carve them from.
-    for (const slot of ['lat', 'lon', 'gear', 'socPct', 'chargerState', 'odometerKm']) {
+    // The slots a charge's state lives in keep Tesla's six hours: an old
+    // charging word must not hold a session open (spec §7.6).
+    for (const slot of ['chargerState', 'chargerStatus']) {
       expect(rivianProfile.staleWindowFor(slot)).toBe(STALE_VALUE_MS)
+    }
+    // Everything else is a level, and Rivian streams CHANGES only, so a level
+    // that has not moved is simply still true. Position and gear are among
+    // them: a parked car is where it parked and in the gear it left. The Tesla
+    // profile has to carve these out of its drive tier; Rivian has no such tier.
+    expect(RIVIAN_LEVEL_STALE_MS).toBe(7 * 24 * HOUR)
+    for (const slot of [
+      'lat', 'lon', 'gear', 'socPct', 'odometerKm', 'tpmsFl', 'cloudOnline', 'powerStateRaw',
+      'chargeEnergyAddedKwh', 'doorFrontLeftLocked',
+    ]) {
+      expect(rivianProfile.staleWindowFor(slot)).toBe(RIVIAN_LEVEL_STALE_MS)
     }
   })
 
@@ -480,6 +490,210 @@ describe('Pipeline with the Rivian profile: replays cannot hold a session open',
     expect(replayed.replayResults.every((r) => r.unmapped === 1 && r.fieldsApplied === 0)).toBe(true)
     expect(replayed.db.state.samples).toHaveLength(plain.db.state.samples.length)
     expect(replayed.db.state.raw).toHaveLength(plain.db.state.raw.length + 117)
+  })
+})
+
+/**
+ * `cloudConnection` has no `timeStamp`, and the `charging` stream has none per
+ * field, so the decoder stamps them with the frame's arrival. Every snapshot's
+ * arrival is strictly newer than the last, so the newer-wins guard alone cannot
+ * tell an UNCHANGED one from news: each minute's resubscribe landed, scheduled a
+ * carried-state sample at its own arrival, and the segmenter's gap close never
+ * saw a gap. The same comparison as above, with those values in the snapshot.
+ */
+describe('Pipeline with the Rivian profile: arrival-stamped values re-sent unchanged', () => {
+  const isOnline = (at: number) => ({ isOnline: true, lastSync: iso(at - 30 * SEC) })
+
+  it('a drive ends where it would have, however often the cloud connection is re-sent beside it', async () => {
+    const lastWord = ms('10:02:00')
+    const { plain, replayed } = await withAndWithoutReplays(
+      {
+        frames: [
+          stateFrame(ms('10:00:00'), {
+            gearStatus: 'park', gnssSpeed: 0, batteryLevel: 80, vehicleMileage: 1_000_000,
+          }, { cloudConnection: isOnline(ms('10:00:00')) }),
+          ...Array.from({ length: 12 }, (_, i) => stateFrame(ms('10:00:10') + i * 10 * SEC, {
+            gearStatus: 'drive', gnssSpeed: 20, vehicleMileage: 1_000_200 + 200 * i,
+          })),
+        ],
+        replayFrom: '10:03:00',
+        replayTo: '11:59:00',
+        // What a snapshot re-sends: the timed properties as they were said, and
+        // the cloud connection, which has no stamp and so arrives "now".
+        replay: (at) => stateFrame(at, {}, {
+          gearStatus: tv(iso(lastWord), 'drive'),
+          gnssSpeed: tv(iso(lastWord), 20),
+          cloudConnection: isOnline(at),
+        }),
+      },
+      stateFrame(ms('12:00:00'), { gearStatus: 'park', gnssSpeed: 0 }),
+      'drive',
+    )
+
+    expect(plain.sessions).toHaveLength(1)
+    expect(plain.sessions[0]!.summary!.endedAt).toEqual(date(lastWord))
+
+    expect(replayed.sessions).toHaveLength(1)
+    expect(replayed.sessions[0]!.isOpen).toBe(false)
+    expect(replayed.sessions[0]!.summary!.endedAt).toEqual(date(lastWord))
+    expect(replayed.sessions[0]!.summary!.distanceKm).toBe(plain.sessions[0]!.summary!.distanceKm)
+
+    // Not a sample for any of the 117 replays, all of them taped and unmapped.
+    expect(replayed.replayResults).toHaveLength(117)
+    expect(replayed.replayResults.every((r) => r.unmapped === 1 && r.fieldsApplied === 0)).toBe(true)
+    expect(replayed.db.state.samples).toHaveLength(plain.db.state.samples.length)
+    expect(replayed.db.state.raw).toHaveLength(plain.db.state.raw.length + 117)
+  })
+
+  it('a charge ends where it would have, however often the charging stream\'s last values are re-sent', async () => {
+    const lastLive = { powerKW: 7.2, totalChargedEnergy: 6 }
+    const { plain, replayed } = await withAndWithoutReplays(
+      {
+        frames: [
+          stateFrame(ms('08:00:00'), {
+            chargerStatus: 'chrgr_sts_connected_charging', chargerState: 'charging_active',
+          }),
+          ...[0, 1, 2, 3, 4, 5, 6].map((j) =>
+            chargingFrame(ms('08:00:00') + j * 5 * MIN, { powerKW: 7.2, totalChargedEnergy: j })),
+        ],
+        replayFrom: '08:31:00',
+        replayTo: '15:30:00',
+        replay: (at) => chargingFrame(at, lastLive),
+      },
+      stateFrame(ms('15:40:00'), { batteryLevel: 70 }),
+      'charge',
+    )
+
+    expect(plain.sessions).toHaveLength(1)
+    expect(plain.sessions[0]!.summary!.endedAt).toEqual(date(ms('08:30:00')))
+
+    expect(replayed.sessions).toHaveLength(1)
+    expect(replayed.sessions[0]!.isOpen).toBe(false)
+    expect(replayed.sessions[0]!.summary!.endedAt).toEqual(date(ms('08:30:00')))
+    expect(replayed.sessions[0]!.summary!.energyKwh).toBe(plain.sessions[0]!.summary!.energyKwh)
+
+    expect(replayed.replayResults).toHaveLength(420)
+    expect(replayed.replayResults.every((r) => r.unmapped === 1 && r.fieldsApplied === 0)).toBe(true)
+    expect(replayed.db.state.samples).toHaveLength(plain.db.state.samples.length)
+    expect(replayed.db.state.raw).toHaveLength(plain.db.state.raw.length + 420)
+    // The car speaks again about something else: no charge word was ever re-said.
+    expect(sampleAt(replayed.db, ms('15:40:00')).chargeState).toBeNull()
+  })
+
+  it('counts a re-sent cloud stream frame unmapped too, and applies one that says something new', async () => {
+    const { db, pipeline } = setup()
+    const cloud = (at: number, online: boolean) =>
+      otherFrame('cloud', at, { data: { vehicleCloudConnection: { isOnline: online } } })
+
+    expect((await pipeline.handle(cloud(ms('10:00:00'), true))).fieldsApplied).toBe(1)
+    for (let at = ms('10:01:00'); at <= ms('10:30:00'); at += MIN) {
+      const result = await pipeline.handle(cloud(at, true))
+      expect(result.unmapped).toBe(1)
+      expect(result.fieldsApplied).toBe(0)
+    }
+    // The car dropping off the cloud is news, and is a sample.
+    expect((await pipeline.handle(cloud(ms('10:31:00'), false))).fieldsApplied).toBe(1)
+    await finish(pipeline, '10:40:00')
+
+    expect(db.state.samples.map((x) => [x.ts.getTime(), x.powerState])).toEqual([
+      [ms('10:00:00'), null],
+      [ms('10:31:00'), 'offline'],
+    ])
+  })
+
+  it('keeps a steady charge power alive across re-sends, though they are not news', async () => {
+    // 7.2 kW says nothing new after its first report, but it is what the car is
+    // drawing, and a re-send is the car saying so. It must not run out of its
+    // five minutes while the snapshots keep arriving, or the next real frame
+    // would read a charge with no power.
+    const { db, pipeline } = setup()
+    await pipeline.handle(stateFrame(ms('08:00:00'), {
+      chargerStatus: 'chrgr_sts_connected_charging', chargerState: 'charging_active',
+    }))
+    await pipeline.handle(chargingFrame(ms('08:00:10'), { powerKW: 7.2, totalChargedEnergy: 1 }))
+    for (let at = ms('08:01:10'); at <= ms('08:30:10'); at += MIN) {
+      await pipeline.handle(chargingFrame(at, { powerKW: 7.2, totalChargedEnergy: 1 }))
+    }
+    // A real frame with nothing of its own about power, a minute after the last re-send.
+    await pipeline.handle(stateFrame(ms('08:31:10'), { batteryLevel: 71 }))
+    await finish(pipeline, '08:40:00')
+
+    expect(sampleAt(db, ms('08:31:10')).chargePowerKw).toBe(7.2)
+  })
+})
+
+describe('Pipeline with the Rivian profile: a car parked for longer than the charge window', () => {
+  // Rivian streams CHANGES only, so a level that has not moved is not re-sent as
+  // news: the connector's snapshot re-sends it with its ORIGINAL stamp. Held to
+  // Tesla's six hours, a car parked since 07:00 lost its SoC, odometer, position
+  // and tyre pressures from every sample after 13:00, and a charge that began
+  // after that could not be placed at home.
+  const TYRES = { tirePressureFrontLeft: 2.9, tirePressureFrontRight: 2.9, tirePressureRearLeft: 3.0, tirePressureRearRight: 3.0 }
+
+  it('carries position, SoC, odometer and tyres into a charge that starts eight hours later', async () => {
+    const { db, pipeline } = setup()
+    const parkedAt = ms('07:00:00')
+    const stamped = {
+      batteryLevel: tv(iso(parkedAt), 70),
+      vehicleMileage: tv(iso(parkedAt), 1_000_000),
+      gnssLocation: location(parkedAt, 47.6, -122.33),
+      ...Object.fromEntries(Object.entries(TYRES).map(([k, v]) => [k, tv(iso(parkedAt), v)])),
+    }
+    await pipeline.handle(stateFrame(parkedAt, {}, stamped))
+    // A snapshot every minute for eight hours, each re-sending what the car last said.
+    for (let at = ms('07:01:00'); at <= ms('15:00:00'); at += MIN) {
+      await pipeline.handle(stateFrame(at, {}, stamped))
+    }
+    // The plug goes in, and the car starts to charge.
+    await pipeline.handle(stateFrame(ms('15:00:30'), {
+      chargerStatus: 'chrgr_sts_connected_charging', chargerState: 'charging_active',
+    }))
+    await pipeline.handle(chargingFrame(ms('15:00:40'), { powerKW: 7.2, totalChargedEnergy: 0.1 }))
+    await finish(pipeline, '15:10:00')
+
+    // The re-sends were not news: nothing was sampled between the park and the plug.
+    expect(db.state.samples.filter((x) => x.ts.getTime() < ms('15:00:30'))).toHaveLength(1)
+
+    const first = sampleAt(db, ms('15:00:30'))
+    expect(first.chargeState).toBe('charging')
+    expect(first.lat).toBe(47.6)
+    expect(first.lon).toBe(-122.33)
+    expect(first.socPct).toBe(70)
+    expect(first.odometerKm).toBeCloseTo(1000, 6)
+    expect(first.tpms).toEqual({ fl: 2.9, fr: 2.9, rl: 3.0, rr: 3.0 })
+    expect(sessionsOf(db, 'charge')).toHaveLength(1)
+  })
+
+  it('still lets a speed from eight hours ago go, and a charging word from seven', async () => {
+    const { db, pipeline } = setup()
+    await pipeline.handle(stateFrame(ms('07:00:00'), { batteryLevel: 70 }))
+    await pipeline.handle(stateFrame(ms('15:00:00'), {}, {
+      gnssSpeed: tv(iso(ms('07:00:00')), 15),
+      chargerState: tv(iso(ms('08:00:00')), 'charging_active'),
+      batteryLevel: tv(iso(ms('14:59:00')), 69),
+    }))
+    await finish(pipeline, '15:10:00')
+
+    expect(db.state.sessions).toEqual([])
+    const resent = sampleAt(db, ms('15:00:00'))
+    expect(resent.speedKph).toBeNull()
+    expect(resent.chargeState).toBeNull()
+    expect(resent.socPct).toBe(69)
+  })
+
+  it('still drops a level once it is older than a week', async () => {
+    const { db, pipeline } = setup()
+    const eightDays = 8 * 24 * HOUR
+    await pipeline.handle(stateFrame(ms('10:00:00') - eightDays, { batteryLevel: 70 }))
+    await pipeline.handle(stateFrame(ms('10:00:00'), {}, {
+      batteryLevel: tv(iso(ms('10:00:00') - eightDays), 70),
+      distanceToEmpty: tv(iso(ms('09:59:00')), 300),
+    }))
+    await finish(pipeline, '10:10:00')
+
+    const sample = sampleAt(db, ms('10:00:00'))
+    expect(sample.socPct).toBeNull()
+    expect(sample.rangeKm).toBe(300)
   })
 })
 

@@ -42,6 +42,13 @@
  * than its slot's window is not applied at all: it would expire at the next
  * emit, and applying it would briefly resurrect it.
  *
+ * VALUES WITH NO TIME OF THEIR OWN ARE THE OTHER HALF OF THAT. `cloudConnection`
+ * and the two flat streams have no `timeStamp`, so they are stamped with arrival,
+ * and an arrival stamp is strictly newer on every per-minute snapshot: an
+ * UNCHANGED `isOnline` or charge power would look like news each time, schedule a
+ * carried-state sample, and hold a session open. `arrivalStamped` names those
+ * slots so the accumulator can compare them by value (design §7.6).
+ *
  * UNITS. Two Rivian properties are not in our units. `vehicleMileage` is metres
  * and `gnssSpeed` is metres per second, so the slots that hold the converted
  * values carry the real unit in their names (`odometerKm`, `speedKph`), as the
@@ -215,6 +222,15 @@ export interface RivianDecoded {
   slots: Record<string, unknown>
   /** Slot -> epoch ms. A slot with no key here is stamped with the frame's arrival. */
   observedAt: Record<string, number>
+  /**
+   * The slots whose `observedAt` above is the frame's arrival because Rivian
+   * gave no observation time to read (`cloudConnection`, and both flat streams),
+   * as against one the car stamped. An arrival stamp is strictly newer on every
+   * snapshot, so the accumulator's newer-wins comparison cannot tell an
+   * unchanged value from news; this is what lets it (design §7.6). Not the
+   * untimed properties: those have no `observedAt` key at all and are counted.
+   */
+  arrivalStamped: ReadonlySet<string>
   /** Properties whose own `timeStamp` was missing or unparseable (design §6.4). */
   untimed: number
 }
@@ -448,6 +464,13 @@ const gearStatus: Property = {
  * `cloudConnection`: `{isOnline, lastSync}`. It has NO `timeStamp` (`lastSync`
  * is when the car last talked, not when this was observed), so the frame's
  * arrival is its observation time and it is not counted as untimed.
+ *
+ * `lastSync` is not used as the observation time, though it looks like one: it
+ * is old for a car that is offline, and stamping `isOnline: false` with it would
+ * date the car's going offline hours back and then drop it as too old to apply.
+ * The cost of arrival is that an unchanged `isOnline` re-sent by a snapshot
+ * looks newer each time; the decoder reports the slot as arrival-stamped so the
+ * accumulator can treat that as a refresh and not as news.
  */
 const cloudConnection: Property = {
   timed: false,
@@ -502,6 +525,8 @@ export const RIVIAN_DECODED_PROPERTIES: readonly string[] = [...PROPERTIES.keys(
 interface Candidate {
   value: unknown
   observed: number | undefined
+  /** `observed` was the frame's arrival, made up here, and not a time the car gave. */
+  arrival: boolean
   rank: number
 }
 
@@ -522,23 +547,32 @@ class Collector {
 
   constructor(private readonly receivedMs: number) {}
 
-  put(update: Update, observed: number | undefined): void {
+  /**
+   * `arrival` says `observed` is the frame's arrival and not the car's own time,
+   * so the slot is reported in `arrivalStamped`. Whichever candidate wins a slot
+   * brings its flag with it.
+   */
+  put(update: Update, observed: number | undefined, arrival = false): void {
     const rank = observed ?? this.receivedMs
     for (const [slot, value] of Object.entries(update)) {
       const held = this.winners.get(slot)
       // `>=`: on a tie the later table entry wins.
-      if (held === undefined || rank >= held.rank) this.winners.set(slot, { value, observed, rank })
+      if (held === undefined || rank >= held.rank) {
+        this.winners.set(slot, { value, observed, arrival, rank })
+      }
     }
   }
 
   result(): RivianDecoded {
     const slots: Record<string, unknown> = {}
     const observedAt: Record<string, number> = {}
-    for (const [slot, { value, observed }] of this.winners) {
+    const arrivalStamped = new Set<string>()
+    for (const [slot, { value, observed, arrival }] of this.winners) {
       slots[slot] = value
       if (observed !== undefined) observedAt[slot] = observed
+      if (arrival) arrivalStamped.add(slot)
     }
-    return { slots, observedAt, untimed: this.untimed }
+    return { slots, observedAt, arrivalStamped, untimed: this.untimed }
   }
 }
 
@@ -570,8 +604,11 @@ function decodeVehicleState(
 
     if (!property.timed) {
       // Observed when it arrived: a stamp, so the accumulator's newer-wins guard
-      // covers it, but never old.
-      out.put(update, receivedMs)
+      // covers it, but never old. Flagged as arrival-stamped, because that guard
+      // is all a stamp like this one buys: every snapshot's arrival is strictly
+      // newer than the last, so the guard cannot tell an unchanged value from
+      // news, and the accumulator has to be told which slots to compare by value.
+      out.put(update, receivedMs, true)
       continue
     }
     const stamp = prop['timeStamp']
@@ -599,6 +636,12 @@ type FlatField = readonly [key: string, slot: RivianNamedSlot, decode: (v: unkno
  * snapshot of `vehicleState` can re-send an older `chargerState` than the
  * charging stream just reported, and only values with an observation time
  * compete in the accumulator's newer-wins guard.
+ *
+ * Every slot read here is reported as arrival-stamped. The same stamp that lets
+ * the guard work makes a re-sent, unchanged value look newer than the one held,
+ * so a resubscribe's snapshot of the charging session would land every minute;
+ * flagging them is what lets the accumulator treat an unchanged one as a
+ * refresh and not as news (design §7.6).
  */
 function decodeFlat(
   source: Record<string, unknown>,
@@ -612,7 +655,7 @@ function decodeFlat(
     if (value === null || value === undefined) continue
     if (typeof value === 'string' && PLACEHOLDERS.has(value)) continue
     const decoded = decode(value)
-    if (decoded !== null) out.put({ [slot]: decoded }, receivedMs)
+    if (decoded !== null) out.put({ [slot]: decoded }, receivedMs, true)
   }
   return out.result()
 }

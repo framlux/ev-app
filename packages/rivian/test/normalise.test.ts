@@ -378,6 +378,59 @@ describe('decodeRivian: clocks', () => {
   })
 })
 
+/**
+ * `arrivalStamped` names the slots whose `observedAt` the decoder made up from
+ * the frame's arrival, because Rivian gave no observation time for them. The
+ * accumulator needs the distinction: an arrival stamp is strictly newer on every
+ * snapshot, so without it an UNCHANGED value is indistinguishable from news and
+ * every per-minute resubscribe would land (spec §7.6).
+ */
+describe('decodeRivian: slots stamped with their arrival', () => {
+  it('names cloudOnline from the cloudConnection property', () => {
+    const decoded = mustDecode({ cloudConnection: { isOnline: true, lastSync: TS } })
+    expect([...decoded.arrivalStamped]).toEqual(['cloudOnline'])
+  })
+
+  it('names the cloud stream\'s cloudOnline', () => {
+    const decoded = decodeRivian(
+      envelope('cloud', { data: { vehicleCloudConnection: { isOnline: false } } }), RECEIVED, W)
+    expect([...decoded!.arrivalStamped]).toEqual(['cloudOnline'])
+  })
+
+  it('names every slot the charging stream filled, and only those', () => {
+    const decoded = decodeRivian(
+      envelope('charging', {
+        data: { chargingSession: { liveData: { powerKW: 7.2, totalChargedEnergy: 'abc', vehicleChargerState: 'charging_active' } } },
+      }),
+      RECEIVED,
+      W,
+    )
+    expect([...decoded!.arrivalStamped].sort()).toEqual(['chargePowerKw', 'chargerState'])
+  })
+
+  it('does not name a property that carried its own timeStamp', () => {
+    const decoded = mustDecode({
+      batteryLevel: tv(TS, 50),
+      cloudConnection: { isOnline: true },
+    })
+    expect([...decoded.arrivalStamped]).toEqual(['cloudOnline'])
+    expect(decoded.slots).toHaveProperty('socPct')
+  })
+
+  it('does not name an untimed property, which has no observedAt to be suspicious of', () => {
+    // It falls back to arrival with NO observedAt key and is counted untimed
+    // (spec §6.4); the accumulator already lands it every time.
+    const decoded = mustDecode({ batteryLevel: tv('garbage', 50) })
+    expect(decoded.slots).toEqual({ socPct: 50 })
+    expect([...decoded.arrivalStamped]).toEqual([])
+  })
+
+  it('is empty for a frame of timed properties only', () => {
+    expect([...mustDecode({ batteryLevel: tv(TS, 50), gearStatus: tv(TS, 'park') }).arrivalStamped])
+      .toEqual([])
+  })
+})
+
 describe('decodeRivian: gear', () => {
   it('reads gearStatus as a canonical letter', () => {
     expect(slotsOf({ gearStatus: tv(TS, 'drive') })).toEqual({ gear: 'D' })

@@ -209,6 +209,18 @@ export class FieldAccumulator {
    * one-hour gap close, and a drive last seen in D was held open the same way.
    * Tesla never sets `observedAt`, so every defined value lands there and this is
    * always true for it.
+   *
+   * ARRIVAL-STAMPED SLOTS (`Decoded.arrivalStamped`) are the same failure by
+   * another road. Their observation time is the frame's own arrival, strictly
+   * newer than the last frame's every time, so the comparison above would call
+   * each unchanged re-send news: `cloudConnection` arrives with every
+   * resubscribe snapshot, and a parked car then emitted a carried-state sample a
+   * minute for as long as the snapshots kept coming (a drive last seen in D at
+   * 10:02 ended at 15:34 instead). For them, a value equal to the held one is a
+   * REFRESH and not a landing: the held entry's `at` and `observed` move to the
+   * re-send, so a value the car keeps saying (a steady charge power) does not
+   * run out of its window while it is still being said, and nothing is
+   * scheduled. A value that differs lands as any other.
    */
   apply(decoded: Decoded, at: Date): boolean {
     const ms = at.getTime()
@@ -216,6 +228,9 @@ export class FieldAccumulator {
     // judged over the slots that actually land, against the values held before
     // this frame (a rising counter is judged against where it stood).
     const landing = new Map<string, Entry>()
+    // Held values an arrival-stamped re-send re-asserted unchanged. Applied with
+    // what lands, so that a frame that lands nothing still keeps them alive.
+    const refreshed = new Map<string, Entry>()
     for (const [key, value] of Object.entries(decoded.slots)) {
       if (value === undefined) continue
       // The vehicle's own observation time where the vendor gives one (spec
@@ -238,8 +253,17 @@ export class FieldAccumulator {
         if (stamp < held.observed) continue
         if (stamp === held.observed && isDeepStrictEqual(value, held.value)) continue
       }
+      if (held !== undefined && decoded.arrivalStamped?.has(key) && isDeepStrictEqual(value, held.value)) {
+        // Past the guard above, so `stamp` is not older than what is held. `at`
+        // never goes backwards: the charge refresh may already have moved it
+        // past this frame's stamp.
+        refreshed.set(key, { value: held.value, at: Math.max(held.at, stamp), observed: stamp })
+        continue
+      }
       landing.set(key, { value, at: stamp, observed: observed === undefined ? undefined : stamp })
     }
+    // A new entry, not a mutation: `clone` shares entries with its copy.
+    for (const [key, entry] of refreshed) this.slots.set(key, entry)
     if (landing.size === 0) return false
     // Over what landed, not over what arrived: an older power or energy value
     // that was skipped above is a replay, and must not refresh the charge state

@@ -84,6 +84,13 @@ export const RESUME_MAX_LOOKBACK_MS = 2 * 24 * 60 * 60_000
  * Where `resumeFromTape` starts: before the earliest open session by the time a
  * value is carried (STALE_VALUE_MS), so what the car last said is known again
  * by the time that session began, and never further back than the cap.
+ *
+ * Six hours for both vendors, though a Rivian LEVEL is carried for seven days
+ * (`RIVIAN_LEVEL_STALE_MS`). The replay window is not the carry window: a
+ * parked Rivian's connector re-sends every level once a minute, so whatever
+ * the six hours of tape leaves out is back in the accumulator within a minute
+ * of the worker subscribing, and a replay of a week of tape at every start is a
+ * delay the restart would feel for levels it gets back for free.
  */
 export function resumeWindowStart(open: readonly OpenRow[], now: Date): Date {
   const earliest = Math.min(now.getTime(), ...open.map((r) => r.startedAt.getTime()))

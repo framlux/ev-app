@@ -210,3 +210,129 @@ describe('FieldAccumulator: a message that changes nothing', () => {
     expect(acc.apply({ slots: { state: 'charging' } }, at(2_000))).toBe(true)
   })
 })
+
+/**
+ * Slots the decoder stamped with the frame's arrival because the source gave no
+ * observation time of its own (Rivian's `cloudConnection` and its `charging`
+ * stream). The newer-wins guard cannot tell an unchanged one from news, since
+ * every arrival is strictly newer than the last: a resubscribe snapshot every
+ * minute would land, schedule a carried-state sample, and hold a session open
+ * for as long as the snapshots kept coming.
+ *
+ * So `Decoded.arrivalStamped` names them, and an UNCHANGED one is a refresh of
+ * the carry and not a landing.
+ */
+describe('FieldAccumulator: slots stamped with their arrival', () => {
+  const MINUTE = 60_000
+  const stamped = (slots: Record<string, unknown>, arrival: number) => ({
+    slots,
+    observedAt: Object.fromEntries(Object.keys(slots).map((k) => [k, arrival])),
+    arrivalStamped: new Set(Object.keys(slots)),
+  })
+
+  it('does not count an unchanged value as landing, and schedules no sample', () => {
+    const acc = fresh()
+    expect(acc.apply(stamped({ power: 7 }, 1_000), at(1_000))).toBe(true)
+    acc.take()
+    expect(acc.pending).toBe(false)
+
+    // The same value, a minute later, observed (that is, arrived) strictly later.
+    expect(acc.apply(stamped({ power: 7 }, 1_000 + MINUTE), at(1_000 + MINUTE))).toBe(false)
+    expect(acc.pending).toBe(false)
+    expect(acc.due(at(1_000 + 10 * MINUTE))).toBe(false)
+  })
+
+  it('refreshes the held value, so its carry outlives the window it was first given', () => {
+    // `power` is volatile: five minutes. Said at 0 and re-said at 4 minutes, it
+    // is carried at 8 minutes, which it would not be had the re-say been dropped.
+    const acc = fresh()
+    acc.apply(stamped({ power: 7 }, 0), at(0))
+    acc.take()
+    acc.apply(stamped({ power: 7 }, 4 * MINUTE), at(4 * MINUTE))
+    expect(carried(acc, 8 * MINUTE).power).toBe(7)
+  })
+
+  it('lets the refreshed value expire a window after the last re-say, and not before', () => {
+    const acc = fresh()
+    acc.apply(stamped({ power: 7 }, 0), at(0))
+    acc.take()
+    acc.apply(stamped({ power: 7 }, 4 * MINUTE), at(4 * MINUTE))
+    expect(carried(acc, 4 * MINUTE + VOLATILE_STALE_MS - 1).power).toBe(7)
+    expect(carried(acc, 4 * MINUTE + VOLATILE_STALE_MS).power).toBeUndefined()
+  })
+
+  it('leaves a pending burst\'s timing where it was', () => {
+    const acc = fresh()
+    acc.apply({ slots: { odometer: 5 } }, at(1_000))
+    expect(acc.apply(stamped({ power: 7 }, 2_000), at(2_000))).toBe(true)
+    // The unchanged re-say at 2.5 s is not part of the burst: due at 4 s (2 s
+    // after the last thing that landed), stamped at 2 s.
+    expect(acc.apply(stamped({ power: 7 }, 2_500), at(2_500))).toBe(false)
+    expect(acc.due(at(4_000))).toBe(true)
+    expect(acc.take()?.ts).toEqual(at(2_000))
+  })
+
+  it('lands a changed value as news', () => {
+    const acc = fresh()
+    acc.apply(stamped({ power: 7 }, 1_000), at(1_000))
+    acc.take()
+
+    expect(acc.apply(stamped({ power: 11 }, 1_000 + MINUTE), at(1_000 + MINUTE))).toBe(true)
+    expect(acc.pending).toBe(true)
+    expect(acc.take()?.state.power).toBe(11)
+  })
+
+  it('lands a value it does not hold yet', () => {
+    const acc = fresh()
+    expect(acc.apply(stamped({ power: 7 }, 1_000), at(1_000))).toBe(true)
+    expect(acc.pending).toBe(true)
+  })
+
+  it('lands a changed value even where the held one carried the car\'s own timestamp', () => {
+    // The charging stream says `charging_active` at arrival; the vehicleState
+    // `chargerState` it replaces was timed by the car. A different word is news
+    // whichever clock the held one had.
+    const acc = fresh()
+    acc.apply({ slots: { state: 'idle' }, observedAt: { state: 500 } }, at(500))
+    acc.take()
+    expect(acc.apply(stamped({ state: 'charging' }, 1_000), at(1_000))).toBe(true)
+  })
+
+  it('treats an arrival-stamped re-say of a timed value as unchanged, and refreshes it', () => {
+    const acc = fresh()
+    acc.apply({ slots: { state: 'charging' }, observedAt: { state: 0 } }, at(0))
+    acc.take()
+    expect(acc.apply(stamped({ state: 'charging' }, 5 * HOUR), at(5 * HOUR))).toBe(false)
+    expect(carried(acc, 10 * HOUR).state).toBe('charging')
+  })
+
+  it('does not let an unchanged re-say refresh the charge state, as a rising counter does', () => {
+    // The charge refresh is judged over what LANDED. A re-sent power is the same
+    // power, not the car saying again that energy is flowing, so it must not
+    // keep a charge state alive that would otherwise run out.
+    const acc = fresh()
+    acc.apply({ slots: { state: 'charging' }, observedAt: { state: 0 } }, at(0))
+    acc.apply(stamped({ power: 7 }, 1_000), at(1_000))
+    acc.take()
+    acc.apply(stamped({ power: 7 }, 5 * HOUR), at(5 * HOUR))
+    // `state` was last refreshed at 1 s, when the power landed, and a re-say at
+    // 5 h did not move it: at 6 h + 1 s it is a full window old.
+    expect(carried(acc, STALE_VALUE_MS + 1_000).state).toBeUndefined()
+  })
+
+  it('never moves a value backwards for an older arrival stamp', () => {
+    const acc = fresh()
+    acc.apply(stamped({ power: 7 }, 10_000), at(10_000))
+    acc.take()
+    // A tape out of order: a stamp older than the one held is a replay, as for any observation.
+    expect(acc.apply(stamped({ power: 9 }, 5_000), at(10_500))).toBe(false)
+    expect(carried(acc, 10_500).power).toBe(7)
+  })
+
+  it('is inert for a profile that never sets it', () => {
+    // Tesla: no `arrivalStamped`, no `observedAt`. Every defined value lands, always.
+    const acc = fresh()
+    expect(acc.apply({ slots: { power: 7 } }, at(1_000))).toBe(true)
+    expect(acc.apply({ slots: { power: 7 } }, at(2_000))).toBe(true)
+  })
+})

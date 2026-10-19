@@ -16,6 +16,16 @@ export interface Decoded {
   slots: Record<string, unknown>
   /** Slot -> when the vehicle observed it, epoch ms. Absent: the message's receivedAt. */
   observedAt?: Record<string, number>
+  /**
+   * The slots whose `observedAt` the decoder made up from the message's arrival
+   * because the source gave no observation time (spec §7.6). An arrival stamp is
+   * strictly newer on every resubscribe snapshot, so the accumulator's
+   * newer-wins comparison cannot tell an unchanged value from news. For these
+   * slots a value equal to the one held refreshes the held entry's carry but
+   * does not count as landing: it schedules no sample. A changed value lands as
+   * usual. Absent for Tesla, which stamps nothing and lands every value.
+   */
+  arrivalStamped?: ReadonlySet<string>
   /** Properties whose own timestamp was missing or unparseable (spec §6.4), for the metric. */
   untimed?: number
 }
