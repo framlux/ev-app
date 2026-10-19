@@ -159,10 +159,19 @@ describe('decodeTeslaField: Gear', () => {
 
 In `packages/core/test/segmenter.test.ts`, replace every `'ShiftStateP'`, `'ShiftStateD'`, `'ShiftStateR'` and `'ShiftStateN'` with `'P'`, `'D'`, `'R'` and `'N'`. In `apps/ingest/test/pipeline.test.ts`, change only the **expected sample values** that assert a decoded gear to the letters. Leave the raw `field(at, 'Gear', 'ShiftStateD')` payloads alone: the car still sends those strings.
 
-Create `packages/db/test/migration-008.test.ts` modelled on `packages/db/test/migration-004.test.ts`: same skip-without-Postgres guard, same way of running migrations to a target. It must assert:
+Also change `packages/tesla/test/normalise.test.ts:105` (`expect(decoded('Gear','ShiftStateD')).toEqual({ gear: 'ShiftStateD' })`, outside the describe above) to expect `{ gear: 'D' }`. `apps/ingest/test/pipeline.test.ts` has no decoded-gear assertions; grep it for `ShiftState` and change only assertions on emitted samples, if any.
+
+Create `packages/db/test/migration-008.test.ts`. **Do not model it on `migration-004.test.ts`** (a text-only drift test), and **do not migrate the shared `ev` database down**: other test files run concurrently against it.
+- Use the skip guard from `packages/db/test/migrate.test.ts:34-44` (`hasDb`, plus throw-in-CI).
+- In `beforeAll`, connect a `pg.Client` to `ev`, `CREATE DATABASE ev_mig008_<random hex>`, and connect a second client to it.
+- Call node-pg-migrate's runner directly against that client, with the same `dir`/`migrationsTable` options `packages/db/src/migrate.ts` uses: `direction: 'up', count: 7` (to 007), seed, then `count: 1` up (008), then `direction: 'down', count: 1`.
+- In `afterAll`, close the clients and `DROP DATABASE`.
+
+It must assert:
 
 ```ts
-// seed after migrating to 007, as a tesla vehicle 'v-t' and a rivian vehicle 'v-r':
+// seed after migrating to 007, as a tesla vehicle 'v-t' and a rivian vehicle 'v-r'
+// (create the month partition first if 002_partitions.sql requires it):
 //   (v-t, t1, 'ShiftStateD'), (v-t, t2, 'ShiftStateSNA'), (v-t, t3, 'ShiftStateP'), (v-r, t4, 'D')
 // migrate up to 008:
 //   gear at t1 = 'D', t2 = NULL, t3 = 'P', t4 = 'D'
@@ -379,7 +388,7 @@ describe('vendor packages are imported only at the seam', () => {
   it('no other module imports @ev/tesla or @ev/rivian', () => {
     const offenders = files(SRC)
       .filter((f) => !ALLOWED.has(relative(SRC, f)))
-      .filter((f) => /from '@ev\/(tesla|rivian)'/.test(readFileSync(f, 'utf8')))
+      .filter((f) => /from\s+['"]@ev\/(tesla|rivian)(\/[^'"]*)?['"]/.test(readFileSync(f, 'utf8')))
       .map((f) => relative(SRC, f))
     expect(offenders).toEqual([])
   })
@@ -452,7 +461,14 @@ export function profileFor(vendor: Vendor): VendorProfile {
       // The vehicle's own observation time where the vendor gives one (spec
       // §6.4), never later than the frame that carried it; arrival otherwise.
       const observed = decoded.observedAt?.[key]
-      this.slots.set(key, { value, at: observed === undefined ? ms : Math.min(observed, ms) })
+      const at = observed === undefined ? ms : Math.min(observed, ms)
+      // A re-sent snapshot can carry an OLDER observation than the one we hold
+      // (a resubscribe replays the car's last-known values); it must not
+      // overwrite a newer one. Only values with an observation time compete
+      // this way - Tesla never sets one, so its behaviour is unchanged.
+      const held = this.slots.get(key)
+      if (observed !== undefined && held?.observed !== undefined && at < held.observed) continue
+      this.slots.set(key, { value, at, observed: observed === undefined ? undefined : at })
     }
     if (charging) {
       for (const key of this.profile.chargeStateSlots) {
@@ -471,33 +487,62 @@ export function profileFor(vendor: Vendor): VendorProfile {
    - `Pipeline` constructor: `(private profile: VendorProfile, private runner: StoreRunner, private opts: MetricsOptions, private home: HomeLocation | null = null)`.
    - `accumulatorFor` builds `new FieldAccumulator(this.profile)`. `emit` calls `this.profile.toSample(...)`. `handle` calls `this.profile.decode(raw)`, adding `result.untimed = decoded.untimed ?? 0`.
    - Add `untimed: 0` to `EMPTY`, and `untimed: a.untimed + b.untimed` to `merge`. Document `untimed` on `PipelineResult`.
-   - **Serialise work.** Add `private chain: Promise<unknown> = Promise.resolve()`, and route `transactionally` through it:
+   - **Serialise work.** Split today's `transactionally` into two private methods, and route every public entry point through the lock exactly once:
 
 ```ts
+  private chain: Promise<unknown> = Promise.resolve()
+
   /**
    * One unit of work at a time. The flush timer used to be able to run in the
    * middle of a handle(): each snapshots the in-memory state, and a rollback in
-   * one restored its snapshot over the other's committed progress. A promise
-   * chain, not a mutex library: the queue is never deeper than one flush and
-   * the message mqtt.js is already waiting on.
+   * one restored its snapshot over the other's committed progress - and flush
+   * read `this.accumulators` before a queued handle had run. A promise chain,
+   * not a mutex library: the queue is never deeper than one flush and the
+   * message mqtt.js is already waiting on.
+   *
+   * NEVER call `locked` or `transactionally` from inside a `locked` callback:
+   * the inner call would wait on the outer one forever.
    */
-  private async transactionally<T>(fn: (store: Store) => Promise<T>): Promise<T> {
-    const run = async (): Promise<T> => {
-      const snapshot = this.snapshot()
-      try {
-        return await this.runner.run(fn)
-      } catch (err) {
-        this.restore(snapshot)
-        throw err
-      }
-    }
-    const next = this.chain.then(run, run)
+  private locked<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.chain.then(fn, fn)
     this.chain = next.catch(() => undefined)
     return next
   }
+
+  /** Snapshot, run one transaction, restore on failure. No lock: callers hold it. */
+  private async attempt<T>(fn: (store: Store) => Promise<T>): Promise<T> {
+    const snapshot = this.snapshot()
+    try {
+      return await this.runner.run(fn)
+    } catch (err) {
+      this.restore(snapshot)
+      throw err
+    }
+  }
+
+  private transactionally<T>(fn: (store: Store) => Promise<T>): Promise<T> {
+    return this.locked(() => this.attempt(fn))
+  }
+
+  // flush takes the lock ONCE for its whole loop and uses attempt() inside,
+  // re-reading each accumulator from the map (an earlier rollback replaces it):
+  async flush(now: Date = new Date(), force = false): Promise<PipelineResult> {
+    return this.locked(async () => {
+      let result = { ...EMPTY }
+      for (const vehicleId of [...this.accumulators.keys()]) {
+        const acc = this.accumulators.get(vehicleId)
+        if (!acc || !(force ? acc.pending : acc.due(now))) continue
+        result = merge(result, await this.attempt((s) => this.emit(s, vehicleId, this.accumulators.get(vehicleId)!)))
+      }
+      return result
+    })
+  }
 ```
 
-     `handle` must **not** read `this.accumulators` outside `transactionally`; today it doesn't. `flush` iterates accumulators and calls `transactionally` per vehicle, which is fine. `resume` swaps `this.runner` and calls `handle`/`flush`, each of which chains, and `reconcile` runs through `transactionally` afterwards, so nothing nests.
+     The other entry points:
+     - `handle` and `handleSample` call `transactionally` once each.
+     - `resume` swaps `this.runner` and calls `handle`/`flush`, each locking per call. `reconcile` runs afterwards via `transactionally`.
+     - `emit`, `applySample` and `finish` never call `transactionally` or `locked`.
 6. **Callers:**
    - `main.ts` passes `profileFor('tesla')` for now (Task 4 wires the vendor).
    - `reprocess.ts` builds `new Pipeline(profileFor('tesla'), …)` for now.
@@ -508,22 +553,24 @@ export function profileFor(vendor: Vendor): VendorProfile {
 
 ```ts
 it('runs a flush started during a handle after it, not interleaved with it', async () => {
-  const db = new FakeDb()
+  const db = new FakeDb()               // FakeDb IS the StoreRunner: it has run(fn), no .runner
   const order: string[] = []
   let release!: () => void
   const gate = new Promise<void>((r) => { release = r })
   const runner = { run: async <T,>(fn: (s: Store) => Promise<T>) => {
-    order.push('start'); const out = await db.runner.run(fn); await gate; order.push('end'); return out } }
+    order.push('start'); const out = await db.run(fn); await gate; order.push('end'); return out } }
   const p = new Pipeline(teslaProfile, runner, OPTS)
   const h = p.handle(field('2026-09-01T00:00:00Z', 'Soc', 50))
+  // A minute later the burst is due, so the flush has real work - once the handle has run.
   const f = p.flush(new Date('2026-09-01T00:01:00Z'))
-  await Promise.resolve(); release()
+  await new Promise((r) => setTimeout(r, 0)); release()
   await Promise.all([h, f])
   expect(order).toEqual(['start', 'end', 'start', 'end'])
+  expect(db.state.samples).toHaveLength(1)
 })
 ```
 
-   Adjust it to `FakeDb`'s real API: read `test/support/fake-db.ts` for how a runner is obtained.
+   Confirm `FakeDb`'s property names (`run`, `state.samples`) in `test/support/fake-db.ts`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -646,11 +693,11 @@ Run `pnpm install`. Confirm `vitest.workspace.ts` (`['packages/*', 'apps/*']`) p
 
 `test/protobuf.test.ts`, with hand-encoded bytes:
 - `[0x08, 0x96, 0x01]` gives `[{field:1, wire:'varint', value:'150'}]`.
-- `[0x12, 0x02, 0x68, 0x69]` gives field 2 len `{utf8:'hi'}`.
+- `[0x12, 0x02, 0x6f, 0x6b]` gives field 2 len `{utf8:'ok'}`. (`0x6f` is wire type 7, so it can't parse as a nested message. Don't use `'hi'`: `0x68 0x69` IS a valid one-field message, and the message rule wins.)
 - A nested message `[0x1a, 0x03, 0x08, 0x96, 0x01]` gives field 3 len `[ {field:1,varint '150'} ]`.
 - A fixed32 `[0x25, 0x00, 0x00, 0x80, 0x3f]` gives field 4 i32 `'0000803f'`.
 - A truncated buffer `[0x08]` gives `null`.
-- Recursion is bounded: build 20 levels of nesting, and the node at depth 16 is shown as `{hex}`, not parsed further.
+- Recursion is bounded. Build 20 levels of nesting, each level a single field-1 len wrapper, with the innermost payload `[0x08,0x96,0x01]`. The top level is depth 0. Levels 0–15 parse as messages, and the len value at depth 15 is `{hex}`. Keep every length byte non-printable (they are: lengths stay under 0x20 at these sizes) so no level falls back to utf8.
 - A varint of `2^63` gives `'9223372036854775808'`.
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -751,32 +798,33 @@ git commit -m "feat(rivian): envelope, property catalogue, gear and a schema-les
 `config.test.ts` additions:
 
 ```ts
-const BASE = { MQTT_PASSWORD: 'p', EV_VEHICLE_ID: 'v', EV_USABLE_CAPACITY_KWH: '75' }
+// NB: config.test.ts already declares a `BASE` at line 5 - reuse it (adding EV_VENDOR where needed) rather than redeclaring.
+const V = { MQTT_PASSWORD: 'p', EV_VEHICLE_ID: 'v', EV_USABLE_CAPACITY_KWH: '75' }
 it('requires EV_VENDOR', () => {
-  expect(() => loadConfig({ ...BASE })).toThrow(/EV_VENDOR/)
-  expect(() => loadConfig({ ...BASE, EV_VENDOR: 'ford' })).toThrow(/EV_VENDOR/)
+  expect(() => loadConfig({ ...V })).toThrow(/EV_VENDOR/)
+  expect(() => loadConfig({ ...V, EV_VENDOR: 'ford' })).toThrow(/EV_VENDOR/)
 })
 it('derives the Tesla defaults exactly as before', () => {
-  const c = loadConfig({ ...BASE, EV_VENDOR: 'tesla' })
+  const c = loadConfig({ ...V, EV_VENDOR: 'tesla' })
   expect([c.vendor, c.mqtt.clientId, c.mqtt.topic, c.cursorSource]).toEqual(['tesla', 'ev-ingest', 'ev/#', 'tesla:mqtt'])
 })
 it('derives the Rivian defaults', () => {
-  const c = loadConfig({ ...BASE, EV_VENDOR: 'rivian' })
+  const c = loadConfig({ ...V, EV_VENDOR: 'rivian' })
   expect([c.vendor, c.mqtt.clientId, c.mqtt.topic, c.cursorSource]).toEqual(['rivian', 'ev-ingest-rivian', 'rivian/#', 'rivian:mqtt'])
 })
 it.each(['ev-ingest', 'ev-fleet-telemetry', 'ev-rivian'])('refuses a Rivian worker with client id %s', (id) => {
-  expect(() => loadConfig({ ...BASE, EV_VENDOR: 'rivian', MQTT_CLIENT_ID: id })).toThrow(/MQTT_CLIENT_ID/)
+  expect(() => loadConfig({ ...V, EV_VENDOR: 'rivian', MQTT_CLIENT_ID: id })).toThrow(/MQTT_CLIENT_ID/)
 })
 it.each(['ev-ingest-rivian', 'ev-fleet-telemetry', 'ev-rivian'])('refuses a Tesla worker with client id %s', (id) => {
-  expect(() => loadConfig({ ...BASE, EV_VENDOR: 'tesla', MQTT_CLIENT_ID: id })).toThrow(/MQTT_CLIENT_ID/)
+  expect(() => loadConfig({ ...V, EV_VENDOR: 'tesla', MQTT_CLIENT_ID: id })).toThrow(/MQTT_CLIENT_ID/)
 })
 it('refuses a topic outside the vendor root', () => {
-  expect(() => loadConfig({ ...BASE, EV_VENDOR: 'rivian', MQTT_TOPIC: 'ev/#' })).toThrow(/MQTT_TOPIC/)
-  expect(() => loadConfig({ ...BASE, EV_VENDOR: 'tesla', MQTT_TOPIC: 'rivian/#' })).toThrow(/MQTT_TOPIC/)
+  expect(() => loadConfig({ ...V, EV_VENDOR: 'rivian', MQTT_TOPIC: 'ev/#' })).toThrow(/MQTT_TOPIC/)
+  expect(() => loadConfig({ ...V, EV_VENDOR: 'tesla', MQTT_TOPIC: 'rivian/#' })).toThrow(/MQTT_TOPIC/)
 })
 ```
 
-Update every existing test that calls `loadConfig` to pass `EV_VENDOR: 'tesla'`.
+Update every existing test that calls `loadConfig` to pass `EV_VENDOR: 'tesla'`, including `main.test.ts`'s spawned-process env (about lines 43-53). Otherwise its `ECONNREFUSED` assertion fails on the new startup error. Every client-id refusal message must contain both `MQTT_CLIENT_ID` and `must not be`: the existing test at `config.test.ts:24` matches `/must not be/`.
 
 `mqtt-rivian.test.ts` drives `makeRivianMessageHandler(opts, onMessage, hooks)` with fake packets. Cases:
 
@@ -796,7 +844,7 @@ Update every existing test that calls `loadConfig` to pass `EV_VENDOR: 'tesla'`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm vitest run --project @ev/ingest test/config.test.ts test/mqtt-rivian.test.ts`
+Run: `pnpm install` (for the new `@ev/rivian` dependency), then `pnpm vitest run --project @ev/ingest test/config.test.ts test/mqtt-rivian.test.ts`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement**
@@ -827,8 +875,8 @@ Expected: FAIL.
 - `initialiseSeries(config.vehicle.id, config.vendor)` and `registerVehicle(pool, config.vehicle, config.vendor)`.
 - `new Pipeline(profileFor(config.vendor), …)`, and vendor labels from config.
 - `record()` increments `untimedValuesTotal` by `result.untimed`.
-- The `onRecord` hook passes the stream or kind.
-- **Skew-corrected flush:**
+- The `onRecord` hook passes the stream or kind. Widen `MqttHooks.onRecord(record: RecordKind)` to `onRecord(record: string)` in `mqtt.ts`: a Rivian stream isn't a Tesla `RecordKind`.
+- **Skew-corrected flush.** Put the logic in a new `apps/ingest/src/flush-clock.ts`: `export function flushClock(now = () => Date.now()) { return { observe(receivedAt: Date): void, now(): Date } }`. `observe` records `skew = now() - receivedAt`, and `now()` returns `new Date(now() - skew)`. Unit-test it in `test/flush-clock.test.ts`: with no observation it gives wall time; after observing a stamp 10 min old it gives wall time minus 10 min; after observing a current stamp it gives wall time. `main.ts` uses it like this:
 
 ```ts
   // The connector's clock, not ours, stamps a Rivian message (spec §6.2): during
@@ -1025,7 +1073,7 @@ git commit -m "feat(rivian): normalise vehicle state and charging onto the canon
 
 - [ ] **Step 1: Write the failing tests**
 
-`pipeline-rivian.test.ts` uses `FakeDb` and `new Pipeline(rivianProfile, db.runner, { usableCapacityKwh: 80 })`, feeding `RawMessage`s built from Task 5's fixture helpers (`vendor: 'rivian'`, `source: 'graphql_ws'`, `receivedAt = new Date(envelope.receivedAt)`). Scenarios:
+`pipeline-rivian.test.ts` uses `FakeDb` and `new Pipeline(rivianProfile, db, { usableCapacityKwh: 80 })` (`FakeDb` is itself the `StoreRunner`), feeding `RawMessage`s built from Task 5's fixture helpers (`vendor: 'rivian'`, `source: 'graphql_ws'`, `receivedAt = new Date(envelope.receivedAt)`). Scenarios:
 
 1. **Drive.**
    - At 10:00:00, a state frame: `gearStatus park`, `gnssSpeed 0`, `batteryLevel 80`, `vehicleMileage 1000000`, `powerState go`.
@@ -1041,14 +1089,16 @@ git commit -m "feat(rivian): normalise vehicle state and charging onto the canon
    - Expect one charge, `energyKwh` ≈ 10, `maxChargePowerKw` 7.2.
 3. **Snapshot resurrection** (Review Focus 1).
    - A parked car (`gearStatus park`, `gnssSpeed 0` at 09:00).
-   - At 12:00 a resubscribe snapshot frame re-sends `gnssSpeed` 15 m/s with `timeStamp` 09:00 and `gearStatus drive` with `timeStamp` 08:59.
+   - At 09:01 a frame carries `gearStatus drive` stamped 08:59, an OLDER observation than the 09:00 park. Assert the emitted sample's gear is still `P`, because an older observation never overwrites a newer one.
+   - At 12:00 a resubscribe snapshot re-sends `gearStatus park` stamped 09:00, and `gnssSpeed` 15 m/s stamped 08:58 (the last moving reading before parking).
    - Expect **no** drive opened, and the emitted 12:00 sample's `speedKph` null or 0.
 4. **GPS jitter while charging.**
    - During scenario 2's charge, add state frames with `gnssSpeed 0.4` (below the floor) and `gearStatus park` with `gnssSpeed 0.6`.
    - Expect the charge not split.
 5. **Other streams.**
    - `parallax`, `meta` and `ota` envelopes are taped (`db.state.raw` grows), contribute `unmapped: 1`, and open nothing.
-6. **Untimed count.**
+6. **Empty frames.** A state frame with only null and unknown properties gives `unmapped: 1` and `fieldsApplied: 0`.
+7. **Untimed count.**
    - A frame with `tv('garbage', 50)` returns a result with `untimed: 1`.
 
 `parallax-dump.test.ts`:
@@ -1073,7 +1123,11 @@ export const rivianProfile: VendorProfile = {
   decode(raw) {
     if (raw.vendor !== 'rivian') return null
     const d = decodeRivian(raw.payload, raw.receivedAt, rivianStaleWindowFor)
-    return d === null ? null : { slots: d.slots, observedAt: d.observedAt, untimed: d.untimed }
+    // A frame carrying nothing we place (only unknown or null properties) is
+    // unmapped, not an applied field: counting it would schedule an emit of
+    // carried-only state on every 60 s resubscribe.
+    if (d === null || (Object.keys(d.slots).length === 0 && d.untimed === 0)) return null
+    return { slots: d.slots, observedAt: d.observedAt, untimed: d.untimed }
   },
   toSample: rivianStateToSample,
   staleWindowFor: rivianStaleWindowFor,
@@ -1155,13 +1209,13 @@ export class RivianHttp {
 export function findVehicle(userInfo: unknown, vin: string): { id: string; vin: string } | null
 export function connectionInitPayload(userSessionToken: string): Record<string, string>   // {client-name, client-version, dc-cid, u-sess}
 
-// credential.ts
+// credential.ts  (import type { JWK } from 'jose' - JsonWebKey is not declared under this repo's lib: ["ES2023"])
 export interface RivianCredential { userSessionToken: string }
-export function sealCredential(publicJwk: JsonWebKey, c: RivianCredential): Promise<string>
-export function unsealCredential(privateJwk: JsonWebKey, sealed: string): Promise<RivianCredential>   // throws CredentialUnreadable
+export function sealCredential(publicJwk: JWK, c: RivianCredential): Promise<string>
+export function unsealCredential(privateJwk: JWK, sealed: string): Promise<RivianCredential>   // throws CredentialUnreadable
 export class CredentialUnreadable extends Error {}
-export function generateCredentialKeys(): Promise<{ privateJwk: JsonWebKey; publicJwk: JsonWebKey }>
-export function parseJwk(text: string, kind: 'private' | 'public'): JsonWebKey   // validates kty EC, crv P-256, d present iff private
+export function generateCredentialKeys(): Promise<{ privateJwk: JWK; publicJwk: JWK }>
+export function parseJwk(text: string, kind: 'private' | 'public'): JWK   // validates kty EC, crv P-256, d present iff private
 ```
 
 - [ ] **Step 1: Write the failing tests**
@@ -1271,6 +1325,7 @@ export function writeRivianStatus(c: DbClient, s: Omit<RivianStatusRow, 'updated
 - [ ] **Step 1: Write the failing test**
 
 `rivian-repo.test.ts`, against real Postgres with the same skip guard as `repo.test.ts`, migrated to latest:
+- Add a `beforeEach` that runs `DELETE FROM rivian_credential; DELETE FROM rivian_status` so local reruns are idempotent.
 - Credential: null when empty. Upsert then read. A second upsert changes `sealed` and makes `updated_at` strictly greater (sleep 10 ms between). Read the stamp. Delete, then null.
 - Status: write then read round-trips every field, including `droppedProperties: ['a','b']` and the default `[]`.
 - Inserting a second row with `id = 2` directly fails the CHECK, for both tables.
@@ -1304,7 +1359,14 @@ git commit -m "feat(db): a sealed Rivian credential and the connector's status, 
 ### Task 9: Connector building blocks: backoff, socket, subscription plan
 
 **Files:**
-- Create: `apps/rivian/package.json` (`@ev/rivian-connector`; deps `@ev/core`, `@ev/db`, `@ev/rivian`, `mqtt` ^5.10.0, `prom-client` ^15.1.0, `ws` ^8.18.0; devDeps `@types/ws`), `apps/rivian/tsconfig.json` (copy `apps/ingest`'s), `apps/rivian/vitest.config.ts` if `apps/ingest` has one (else rely on the workspace and a `test/` dir), `apps/rivian/src/{backoff,socket,subscriptions}.ts`, `apps/rivian/test/{backoff,socket,subscriptions}.test.ts`, `apps/rivian/test/support/fake-rivian-ws.ts`
+- Create: `apps/rivian/package.json`, exactly:
+  ```json
+  {"name":"@ev/rivian-connector","version":"0.0.0","private":true,"type":"module",
+   "scripts":{"build":"tsc -p tsconfig.json","typecheck":"tsc -p tsconfig.json --noEmit","start":"node dist/main.js"},
+   "dependencies":{"@ev/core":"workspace:*","@ev/db":"workspace:*","@ev/rivian":"workspace:*","mqtt":"^5.10.0","prom-client":"^15.1.0","ws":"^8.18.0"},
+   "devDependencies":{"@types/ws":"^8.5.0"}}
+  ```
+  Also: `apps/rivian/tsconfig.json` (copy `apps/ingest`'s), `apps/rivian/vitest.config.ts` if `apps/ingest` has one (else rely on the workspace and a `test/` dir), `apps/rivian/src/{backoff,socket,subscriptions}.ts`, `apps/rivian/test/{backoff,socket,subscriptions}.test.ts`, `apps/rivian/test/support/fake-rivian-ws.ts`
 
 **Interfaces:**
 
@@ -1339,7 +1401,8 @@ export function openSocket(opts: {
 // subscriptions.ts: pure state, no I/O
 export interface PlannedSubscription { key: string; stream: RivianStream; doc: SubscriptionDocument; properties?: string[] }
 export class SubscriptionPlan {
-  constructor(vehicleId: string, opts: { properties: readonly string[]; dropped: readonly string[]; parallaxRvms: string[] | null })
+  constructor(vehicleId: string, opts: { properties: readonly string[]; dropped: readonly string[]; parallaxRvms: string[] | null; now: number })
+  // constructor-supplied `dropped` entries are first reprobed 24 h after `now`
   /** Everything to subscribe now, each with a fresh id. */
   initial(): { id: string; sub: PlannedSubscription }[]
   /** Map an incoming frame id to its stream; null for a stale id. */
@@ -1347,7 +1410,7 @@ export class SubscriptionPlan {
   /** Fresh ids for every active subscription (silence or post-drop). Returns [oldId, newId, sub][]. */
   renewAll(): { oldId: string; id: string; sub: PlannedSubscription }[]
   /** A GRAPHQL_VALIDATION_FAILED for this id: returns the probes to subscribe after the 30 s delay, and any newly dropped properties. */
-  rejected(id: string): { probes: PlannedSubscription[]; newlyDropped: string[]; unavailable: string | null }
+  rejected(id: string, now: number): { probes: PlannedSubscription[]; newlyDropped: string[]; unavailable: string | null }
   /** Subscribe a probe (assigns a fresh id). */
   activate(sub: PlannedSubscription): string
   /** A server complete/error that is not a validation failure: the sub to resubscribe after 30 s. */
@@ -1443,6 +1506,10 @@ export class Publisher {
   pump(): void
   /** Wait until the queue is empty or timeoutMs passes; returns frames left. */
   drain(timeoutMs: number): Promise<number>
+  /** End the MQTT client cleanly. */
+  end(): Promise<void>
+  /** Called whenever the queue becomes empty (the connector uses it to schedule a post-drop renewal). */
+  onEmpty(fn: () => void): void
 }
 export function connectMqtt(opts: { url: string; username: string; password: string; clientId: string }): MqttLike
 ```
@@ -1492,7 +1559,7 @@ git commit -m "feat(rivian-connector): a byte-bounded publish queue and an ackno
 ```ts
 // config.ts
 export interface ConnectorConfig {
-  vin: string; privateJwk: JsonWebKey
+  vin: string; privateJwk: JWK
   mqtt: { url: string; username: string; password: string; clientId: string }
   parallaxRvms: string[] | null; metricsPort: number
 }
@@ -1503,6 +1570,7 @@ export function loadConnectorConfig(env?: NodeJS.ProcessEnv): ConnectorConfig
 // store.ts: the connector's DB seam, so connector.ts is testable without pg
 export interface ConnectorStore {
   credentialStamp(): Promise<Date | null>          // throws on query failure
+  status(): Promise<RivianStatusRow | null>         // read once in `starting` for dropped_properties; a failure means []
   credential(): Promise<{ sealed: string } | null>
   writeStatus(s: Omit<RivianStatusRow, 'updatedAt'>): Promise<void>
 }
@@ -1511,10 +1579,17 @@ export function pgConnectorStore(pool: DbPool): ConnectorStore
 // connector.ts
 export interface Clock { now(): number; setTimeout(fn: () => void, ms: number): unknown; clearTimeout(h: unknown): void }
 export interface ConnectorDeps {
-  config: ConnectorConfig; store: ConnectorStore; http: RivianHttp
+  config: ConnectorConfig; store: ConnectorStore
+  http: Pick<RivianHttp, 'createCsrf' | 'userInfo' | 'vehicle' | 'chargingSummaries' | 'introspectVehicleState'>
   openSocket: typeof openSocket; queue: PublishQueue; publisher: Publisher
   clock: Clock; random?: () => number
   metrics: ConnectorMetrics; log: (line: string) => void
+}
+// metrics.ts exports this, wrapping the prom-client objects, so tests can pass a recording fake:
+export interface ConnectorMetrics {
+  setState(s: RivianConnectorState): void; frame(stream: RivianStream): void; dropped(n: number): void
+  publishFailure(): void; reconnect(reason: string): void; droppedProperties(n: number): void
+  pollFailure(): void; lastFrame(atMs: number): void
 }
 export class Connector {
   constructor(deps: ConnectorDeps)
@@ -1529,7 +1604,7 @@ export class Connector {
   - A throw increments `rivian_credential_poll_failures_total` and changes nothing.
   - `null` from a successful query closes everything and moves to `signed_out`.
   - A changed stamp restarts from `starting`.
-- **`starting`:** `unsealCredential` (`CredentialUnreadable` moves to `credential_invalid`, and no retry until the stamp changes), then `http.createCsrf()`.
+- **`starting`:** read `store.status()` for `droppedProperties` (a failure or null means `[]`), then `unsealCredential` (`CredentialUnreadable` moves to `credential_invalid`, and no retry until the stamp changes), then `http.createCsrf()`.
 - **`finding_vehicle`:** `http.userInfo`, published as `meta` kind `userInfo` (change-only). `findVehicle(…, config.vin)`. If absent, `waiting_for_vehicle`, retried hourly.
 - **HTTP `UNAUTHENTICATED`:** `createCsrf` once and retry. A second one moves to `unauthenticated`.
 - **`connecting`:**
@@ -1537,7 +1612,7 @@ export class Connector {
   - On ack, subscribe everything in `plan.initial()` and move to `subscribed`.
   - Close reason `unauthenticated` moves to `unauthenticated`, which stops until the stamp changes. Any other close or reject moves to `backing_off` with `Backoff.next()`.
   - The first `next` after a connect resets the backoff.
-- **Each `next`:** `queue.push(frameFor(vin, plan.streamOf(id), new Date(clock.now()), payload))` with the whole payload, then `publisher.pump()`. If the push dropped frames, add them to `rivian_frames_dropped_total` and `renewAll()` (spec §5.5).
+- **Each `next`:** `queue.push(frameFor(vin, plan.streamOf(id), new Date(clock.now()), payload))` with the whole payload, then `publisher.pump()`. If the push dropped frames, add them to `rivian_frames_dropped_total` and set `renewPending`. **Don't renew on every drop.** Each renewal brings a fresh snapshot, which would overflow again into a resubscribe storm against Rivian. Instead, when `renewPending` is set and the publisher reports the queue empty (`publisher.onEmpty`), call `renewAll()` once, then clear the flag. Never renew more than once a minute.
 - **Errors from the server:**
   - A `GRAPHQL_VALIDATION_FAILED` error on an id goes to `plan.rejected`; probes are subscribed after 30 s. Newly dropped properties are persisted via `writeStatus` and published as `meta` kind `droppedProperties`.
   - Any other error or complete resubscribes after 30 s.
@@ -1549,7 +1624,7 @@ export class Connector {
   2. `publisher.drain(5000)`; frames left count as dropped.
   3. `complete` every id.
   4. `socket.close()`.
-  5. `mqtt.end()`.
+  5. `publisher.end()`.
 - **Never log a token.** `last_error` is always `RivianApiError.redacted()` or a fixed string.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1559,7 +1634,7 @@ export class Connector {
 
 `fake-gateway.ts`: a fake `RivianHttp`-shaped object with programmable responses per method and call counters.
 
-`connector.test.ts` uses a manual fake `Clock` (a timer list advanced by `tick(ms)`), the in-process fake `ws` server from Task 9, a fake store whose methods can be made to throw, a real `PublishQueue`, and a `Publisher` over a fake MQTT that records frames. One test per bullet:
+`connector.test.ts` uses a manual fake `Clock` (a timer list advanced by `tick(ms)`). It doesn't use a real socket: it passes a fake `openSocket` that returns a scripted `SocketLike` (records `subscribe`/`complete`/`close`; the test drives `handlers.onNext/onError/onComplete/onClose`), and never touches `SUBSCRIPTIONS_URL`. The real ws server stays in `socket.test.ts`. The test also uses a fake store whose methods can be made to throw, a real `PublishQueue`, and a `Publisher` over a fake MQTT that records frames. One test per bullet:
 
 | Area | Expected |
 |---|---|
@@ -1575,6 +1650,12 @@ export class Connector {
 | Queue overflow | a small `capBytes` drops frames, counts them, and resubscribes all |
 | Status writes | a `writeStatus` that throws doesn't change state or close the socket |
 | Shutdown | `stop()` drains, completes every id, and closes |
+| Restart | with `store.status()` returning `droppedProperties: ['badOne']`, the plan leaves `badOne` out of the subscribed groups; with `status()` throwing, it starts with none dropped |
+| Overflow storm | 100 drops during a broker outage cause exactly one `renewAll`, after the queue empties |
+| Change-only `meta` | two identical `userInfo` results publish one `meta` frame; a changed one publishes a second |
+| Discovery | an introspection result containing `TimeStampedFloat` field `newThing` makes the next `subscribe` include `newThing`; a non-TimeStamped unknown field is listed in `meta.schema` and not subscribed |
+| Server `complete`/`error` | a non-validation error resubscribes that subscription after 30 s under a fresh id |
+| Envelope `errors` | a `next` whose payload carries `errors` alongside `data` is published with `body.errors` intact |
 | Redaction | across the whole run, the captured log lines and every `writeStatus.lastError` contain no `userSessionToken` value (seed a recognisable token) |
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1611,7 +1692,7 @@ git commit -m "feat(rivian-connector): hold one Rivian session open and publish 
   - `apps/web/src/routes/api/v1/rivian/login/+server.ts`, `apps/web/src/routes/api/v1/rivian/otp/+server.ts` and `apps/web/src/routes/api/v1/rivian/logout/+server.ts`
   - `apps/web/src/routes/settings/rivian/+page.server.ts` and `apps/web/src/routes/settings/rivian/+page.svelte`
   - `apps/web/test/rivian-auth.test.ts`, `apps/web/test/rivian-routes.test.ts` and `apps/web/test/rivian-page-load.test.ts`
-- Modify: `apps/web/src/routes/vehicles/[id]/+layout.svelte` (the Settings tab by vendor), `apps/web/package.json` (add `"@ev/rivian": "workspace:*"`), `apps/web/src/lib/server/db.ts` if it re-exports repo functions page loads use
+- Modify: `apps/web/src/routes/vehicles/[id]/+layout.svelte` (the Settings tab by vendor), `apps/web/package.json` (add `"@ev/rivian": "workspace:*"`), `apps/web/src/lib/server/db.ts` (re-export the Rivian repo functions)
 
 **Interfaces:**
 
@@ -1626,14 +1707,16 @@ export function clearPendingOtp(subject: string): void
 // rivian-auth.ts: the testable core; routes are thin
 export interface RivianAuthDeps {
   http: Pick<RivianHttp, 'createCsrf' | 'login' | 'loginWithOtp'>
-  publicJwk: JsonWebKey | null          // from RIVIAN_CREDENTIAL_PUBLIC_KEY; null means "not configured"
+  publicJwk: JWK | null          // from RIVIAN_CREDENTIAL_PUBLIC_KEY; null means "not configured"
   save(v: { sealed: string; account: string }): Promise<void>
   remove(): Promise<void>
   now(): Date
 }
 export type SignInOutcome =
   | { status: 'signed_in' } | { status: 'otp_required' }
-  | { status: 'error'; message: string }      // one of spec §4.4's five messages, or 'Rivian sign-in is not configured on this server'
+  | { status: 'error'; message: string }
+// messages, EXACTLY: 'Wrong email or password' | 'Wrong or expired code' | 'Account temporarily locked'
+//   | 'Rivian is rate-limiting, try later' | `Rivian error ${code}` | 'Rivian sign-in is not configured on this server'
 export function signIn(deps: RivianAuthDeps, subject: string, email: string, password: string): Promise<SignInOutcome>
 export function submitOtp(deps: RivianAuthDeps, subject: string, code: string): Promise<SignInOutcome>
 export function signOut(deps: RivianAuthDeps, subject: string): Promise<void>
@@ -1655,7 +1738,10 @@ The routes accept `POST` JSON bodies (`{email, password}`, `{code}`, `{}`), call
 
 `rivian-routes.test.ts`:
 - All three routes return 401 without `locals` user.
-- With a user, they delegate. Use an injectable deps hook the same way `telemetry-routes.test.ts` injects `TelemetryDeps`; mirror that seam.
+- There is no route-level deps seam in this codebase (`telemetry-routes.test.ts` tests routes only for 401/409 and tests the core with injected deps). So:
+  - `login` with a user and `RIVIAN_CREDENTIAL_PUBLIC_KEY` unset gives the "not configured" outcome.
+  - `logout` with a user: `vi.mock('../src/lib/server/db.js', …)` the way `telemetry-page-load.test.ts:18-28` does, so it never deletes a real row. Assert the mocked delete was called.
+- Re-export the Rivian repo functions from `$lib/server/db.ts` (unconditionally), so routes and loads import them from there and tests can mock that module.
 
 `rivian-page-load.test.ts`:
 - **No rows:** `{credential: null, status: null}`.
@@ -1666,7 +1752,7 @@ Also add a component render test in `components.test.ts` style (if practical) th
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -r build && pnpm vitest run --project web test/rivian-auth.test.ts test/rivian-routes.test.ts test/rivian-page-load.test.ts`
+Run: `pnpm install && pnpm -r build && pnpm vitest run --project web test/rivian-auth.test.ts test/rivian-routes.test.ts test/rivian-page-load.test.ts`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement**
