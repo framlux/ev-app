@@ -580,6 +580,80 @@ describe('Pipeline with the Rivian profile: arrival-stamped values re-sent uncha
     expect(sampleAt(replayed.db, ms('15:40:00')).chargeState).toBeNull()
   })
 
+  it('a charge ends where it would have though the charging word is re-sent with it for seven hours', async () => {
+    // The charging stream's liveData carries the charger state as well as the
+    // power and the counter, stamped with arrival like them. Re-sent unchanged,
+    // the word must NOT have its window renewed by it: only the car changing
+    // something (power moving, the counter rising) shows energy flowing, and
+    // that is what keeps a real charge's word alive. Renewed by replays, an
+    // `charging_active` last changed at 08:00 would still be carried at 15:40
+    // and the next real frame would open a second, phantom charge.
+    const live = { powerKW: 7.2, totalChargedEnergy: 6, vehicleChargerState: 'charging_active' }
+    const { plain, replayed } = await withAndWithoutReplays(
+      {
+        frames: [
+          stateFrame(ms('08:00:00'), {
+            chargerStatus: 'chrgr_sts_connected_charging', chargerState: 'charging_active',
+          }),
+          ...[0, 1, 2, 3, 4, 5, 6].map((j) =>
+            chargingFrame(ms('08:00:00') + j * 5 * MIN, { ...live, totalChargedEnergy: j })),
+        ],
+        replayFrom: '08:31:00',
+        replayTo: '15:30:00',
+        replay: (at) => chargingFrame(at, live),
+      },
+      stateFrame(ms('15:40:00'), { batteryLevel: 70 }),
+      'charge',
+    )
+
+    expect(plain.sessions).toHaveLength(1)
+    expect(plain.sessions[0]!.summary!.endedAt).toEqual(date(ms('08:30:00')))
+
+    // One charge, closed where the energy stopped, and no second one.
+    expect(replayed.sessions).toHaveLength(1)
+    expect(replayed.sessions[0]!.isOpen).toBe(false)
+    expect(replayed.sessions[0]!.summary!.endedAt).toEqual(date(ms('08:30:00')))
+    expect(replayed.replayResults.every((r) => r.unmapped === 1 && r.fieldsApplied === 0)).toBe(true)
+    expect(replayed.db.state.samples).toHaveLength(plain.db.state.samples.length)
+    expect(sampleAt(replayed.db, ms('15:40:00')).chargeState).toBeNull()
+  })
+
+  it('a real charge stays one charge past six hours, its charging word re-sent unchanged', async () => {
+    // The other half: what keeps a long charge's word alive is the car's power
+    // and counter moving, through the charge refresh, with no help from the
+    // re-sent word. A 12 h charge (a long Level 1 session) at 08:00 to 20:00.
+    const { db, pipeline } = setup()
+    await pipeline.handle(stateFrame(ms('08:00:00'), {
+      chargerStatus: 'chrgr_sts_connected_charging', chargerState: 'charging_active',
+    }))
+    let j = 0
+    for (let at = ms('08:00:10'); at <= ms('20:00:10'); at += 5 * MIN, j++) {
+      await pipeline.handle(chargingFrame(at, {
+        // The power wobbles and the counter rises, as a real session's do.
+        powerKW: j % 2 === 0 ? 1.4 : 1.3,
+        totalChargedEnergy: j * 0.1,
+        vehicleChargerState: 'charging_active',
+      }))
+      // And the snapshot a minute later re-sends the same liveData, word included.
+      await pipeline.handle(chargingFrame(at + MIN, {
+        powerKW: j % 2 === 0 ? 1.4 : 1.3,
+        totalChargedEnergy: j * 0.1,
+        vehicleChargerState: 'charging_active',
+      }))
+    }
+    await pipeline.handle(stateFrame(ms('20:05:00'), { chargerState: 'charging_complete' }))
+    await finish(pipeline, '20:30:00')
+
+    const charges = sessionsOf(db, 'charge')
+    expect(charges).toHaveLength(1)
+    expect(charges[0]!.isOpen).toBe(false)
+    expect(charges[0]!.startedAt).toEqual(date(ms('08:00:00')))
+    // Past the word's six hours, the samples still say charging.
+    expect(sampleAt(db, ms('14:30:10')).chargeState).toBe('charging')
+    expect(sampleAt(db, ms('19:55:10')).chargeState).toBe('charging')
+    expect(charges[0]!.summary!.endedAt!.getTime()).toBeGreaterThan(ms('19:55:00'))
+  })
+
   it('counts a re-sent cloud stream frame unmapped too, and applies one that says something new', async () => {
     const { db, pipeline } = setup()
     const cloud = (at: number, online: boolean) =>

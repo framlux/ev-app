@@ -300,10 +300,53 @@ describe('FieldAccumulator: slots stamped with their arrival', () => {
 
   it('treats an arrival-stamped re-say of a timed value as unchanged, and refreshes it', () => {
     const acc = fresh()
-    acc.apply({ slots: { state: 'charging' }, observedAt: { state: 0 } }, at(0))
+    acc.apply({ slots: { power: 7 }, observedAt: { power: 0 } }, at(0))
     acc.take()
-    expect(acc.apply(stamped({ state: 'charging' }, 5 * HOUR), at(5 * HOUR))).toBe(false)
-    expect(carried(acc, 10 * HOUR).state).toBe('charging')
+    expect(acc.apply(stamped({ power: 7 }, 4 * MINUTE), at(4 * MINUTE))).toBe(false)
+    expect(carried(acc, 8 * MINUTE).power).toBe(7)
+  })
+
+  describe('in a charge-state slot', () => {
+    // `state` is the test profile's charge state. An unchanged re-say there is
+    // neither news nor a refresh: the word's window runs from its last REAL
+    // change, so a replayed `charging_active` cannot hold a session open. What
+    // keeps a genuine charge's word alive is the charge refresh (power moving or
+    // the counter rising), which is judged over what landed.
+    it('neither lands nor moves the held entry', () => {
+      const acc = fresh()
+      acc.apply(stamped({ state: 'charging' }, 0), at(0))
+      acc.take()
+      expect(acc.apply(stamped({ state: 'charging' }, 5 * HOUR), at(5 * HOUR))).toBe(false)
+      expect(acc.pending).toBe(false)
+      // Still running out at 6 h from the change, not from the re-say at 5 h.
+      expect(carried(acc, STALE_VALUE_MS - 1).state).toBe('charging')
+      expect(carried(acc, STALE_VALUE_MS).state).toBeUndefined()
+    })
+
+    it('does the same to a word the car timed itself', () => {
+      const acc = fresh()
+      acc.apply({ slots: { state: 'charging' }, observedAt: { state: 0 } }, at(0))
+      acc.take()
+      expect(acc.apply(stamped({ state: 'charging' }, 5 * HOUR), at(5 * HOUR))).toBe(false)
+      expect(carried(acc, STALE_VALUE_MS).state).toBeUndefined()
+    })
+
+    it('still lands a changed word', () => {
+      const acc = fresh()
+      acc.apply(stamped({ state: 'charging' }, 0), at(0))
+      acc.take()
+      expect(acc.apply(stamped({ state: 'complete' }, 5 * HOUR), at(5 * HOUR))).toBe(true)
+      expect(acc.take()?.state.state).toBe('complete')
+    })
+
+    it('is kept alive by the charge refresh, as before, when the power really moves', () => {
+      const acc = fresh()
+      acc.apply(stamped({ state: 'charging' }, 0), at(0))
+      acc.apply({ slots: { power: 7 }, observedAt: { power: 5 * HOUR } }, at(5 * HOUR))
+      // The re-say beside it changes nothing; the landed power refreshed the word at 5 h.
+      acc.apply(stamped({ state: 'charging' }, 5 * HOUR + MINUTE), at(5 * HOUR + MINUTE))
+      expect(carried(acc, STALE_VALUE_MS + MINUTE).state).toBe('charging')
+    })
   })
 
   it('does not let an unchanged re-say refresh the charge state, as a rising counter does', () => {

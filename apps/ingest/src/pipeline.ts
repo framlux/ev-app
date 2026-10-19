@@ -220,7 +220,10 @@ export class FieldAccumulator {
    * REFRESH and not a landing: the held entry's `at` and `observed` move to the
    * re-send, so a value the car keeps saying (a steady charge power) does not
    * run out of its window while it is still being said, and nothing is
-   * scheduled. A value that differs lands as any other.
+   * scheduled. A value that differs lands as any other. The profile's charge
+   * state slots are the exception: an unchanged re-send there does not even
+   * refresh, so the word's window runs from its last real change (see the
+   * comment at the refresh).
    */
   apply(decoded: Decoded, at: Date): boolean {
     const ms = at.getTime()
@@ -254,6 +257,15 @@ export class FieldAccumulator {
         if (stamp === held.observed && isDeepStrictEqual(value, held.value)) continue
       }
       if (held !== undefined && decoded.arrivalStamped?.has(key) && isDeepStrictEqual(value, held.value)) {
+        // The charge state is exempt from the refresh (and, like the rest, is
+        // not a landing): its window runs from its last REAL change. A re-sent
+        // `charging_active` is the stream repeating itself, not the car saying
+        // again that energy is flowing, and renewed by it the word would be
+        // carried for as long as the snapshots kept coming, so the next real
+        // frame hours after the last charging data opened a second charge. What
+        // keeps a genuine charge's word alive is the refresh below, which fires
+        // when power or the counter actually moves.
+        if (this.profile.chargeStateSlots.includes(key)) continue
         // Past the guard above, so `stamp` is not older than what is held. `at`
         // never goes backwards: the charge refresh may already have moved it
         // past this frame's stamp.

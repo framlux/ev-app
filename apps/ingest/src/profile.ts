@@ -23,7 +23,9 @@ export interface Decoded {
    * newer-wins comparison cannot tell an unchanged value from news. For these
    * slots a value equal to the one held refreshes the held entry's carry but
    * does not count as landing: it schedules no sample. A changed value lands as
-   * usual. Absent for Tesla, which stamps nothing and lands every value.
+   * usual. A slot in `chargeStateSlots` is not even refreshed: its window runs
+   * from its last real change, so a repeated word cannot hold a charge open.
+   * Absent for Tesla, which stamps nothing and lands every value.
    */
   arrivalStamped?: ReadonlySet<string>
   /** Properties whose own timestamp was missing or unparseable (spec §6.4), for the metric. */
