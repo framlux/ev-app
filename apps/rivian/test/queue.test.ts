@@ -54,6 +54,17 @@ describe('frameFor', () => {
     })
   })
 
+  it('builds the topic from the cleaned VIN, so it and the envelope name the same car', () => {
+    // A NUL in a VIN is garbage, but the topic is what ingest reads the VIN
+    // from and the envelope is what it reads it from again: they must not be
+    // able to disagree about which vehicle a frame belongs to.
+    const f = frameFor('VIN\u00001', 'state', receivedAt, { n: 1 })
+
+    expect(f.topic).toBe('rivian/VIN1/state')
+    expect(JSON.parse(f.body).vin).toBe('VIN1')
+    expect(f.topic).not.toContain('\u0000')
+  })
+
   it('measures bytes as the UTF-8 length of what will be published', () => {
     // Multi-byte on purpose: a character count would undercount this, and the
     // cap is in bytes because it stands in for memory.

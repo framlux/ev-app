@@ -18,13 +18,38 @@ import type { PublishQueue, QueuedFrame } from './queue.js'
  *
  * Fixed and short, unlike the 30 s floor on Rivian (design §2.3): that floor
  * exists because Rivian rate-limits and flags accounts, and this is our own
- * broker, where waiting longer only lets the queue fill. One second keeps a
- * client that is failing in a tight loop (a closed connection fails a publish
- * at once) from spinning, and is short enough that a blip costs almost no
- * ordering delay. mqtt.js reconnects every 2 s on its own, so the retry that
- * lands after it does is the one that goes through.
+ * broker, where waiting longer only lets the queue fill.
+ *
+ * A "failed publish" is narrower than it sounds, and an outage is NOT one.
+ * With QoS 1 and `reconnectPeriod` set, mqtt.js keeps an unacknowledged
+ * publish in its own store and resends it, with the DUP flag, once it has
+ * reconnected; the callback simply does not fire until the broker answers. So
+ * with the broker down the frame stays in flight, the queue grows behind it,
+ * and nothing here is called (against an unreachable broker, mqtt.js 5.15.2
+ * held one frame in flight for five seconds and called `onFailure` zero times). The
+ * callback gets an error only when the client throws synchronously, when
+ * mqtt.js reports "Connection closed" for a publish made while it was
+ * replaying its store as the connection dropped, and with "client
+ * disconnecting" for one made after `end`. Those can all come back at once,
+ * so the wait is what keeps a client that fails every publish from spinning;
+ * one second is short enough that it costs almost no ordering delay.
  */
 const RETRY_MS = 1_000
+
+/**
+ * How long a graceful `end` may take before `Publisher.end` gives up on it.
+ *
+ * A graceful end sends DISCONNECT and then waits for the connection to close
+ * from the broker's side. A connection that is already dead without anyone
+ * having noticed (a broker that vanished without a FIN, a network that
+ * dropped) never completes that, and mqtt.js has no limit of its own. The
+ * shutdown that calls this has already spent its 5 s draining (design §5.2)
+ * and is racing the orchestrator's grace period, so the step that finishes it
+ * cannot be the one with no bound. Five seconds is generous for a DISCONNECT
+ * to a broker on the same network, and still leaves the grace period most of
+ * its room.
+ */
+const END_GRACE_MS = 5_000
 
 /**
  * The part of an mqtt.js client the publisher drives, which is what keeps the
@@ -44,8 +69,21 @@ export interface MqttLike {
 export interface PublisherHooks {
   /** One frame was acknowledged by the broker. */
   onPublished(): void
-  /** One publish failed. The frame is back at the head of the queue and will be retried. */
+  /**
+   * One publish failed. The frame is back at the head of the queue and will be
+   * retried. This is NOT how a broker outage shows up (see `RETRY_MS`): during
+   * one the frame stays in flight and no failure is reported.
+   */
   onFailure(err: unknown): void
+}
+
+export interface ConnectionHooks {
+  /**
+   * The connection came up (`true`) or went away (`false`). A drop calls it
+   * with `false` more than once (mqtt.js emits `close` and `offline`), so a
+   * listener must be idempotent.
+   */
+  onConnectionChange?(connected: boolean): void
 }
 
 export class Publisher {
@@ -82,8 +120,8 @@ export class Publisher {
    * second land ahead of it. The cost is a round trip per frame to a broker
    * on the same network, and the queue is what absorbs it.
    *
-   * It never throws. A client that throws synchronously (mqtt.js does for a
-   * topic it cannot encode) is handled as a failed publish.
+   * It never throws. A client that throws synchronously is handled as a failed
+   * publish.
    */
   pump(): void {
     if (this.#ending || this.#inFlight !== null || this.#retry !== null) return
@@ -154,7 +192,9 @@ export class Publisher {
    * for it here would hang the shutdown until the orchestrator killed the
    * process, losing the `complete` frames and the status write that come after.
    * The session is clean, so a forced close leaves no state behind on the
-   * broker, and the frame that was out is still counted as left.
+   * broker, and the frame that was out is still counted as left. A graceful
+   * end that has not finished within `END_GRACE_MS` is forced the same way, so
+   * this always resolves.
    *
    * Safe to call more than once: later calls get the first call's answer.
    */
@@ -169,7 +209,28 @@ export class Publisher {
         this.#retry = null
       }
       const force = this.#inFlight !== null
-      this.#ended = new Promise<void>((resolve) => this.client.end(force, resolve))
+      this.#ended = new Promise<void>((resolve) => {
+        // Only a graceful end can hang, so only it gets the timer. It is set
+        // before the client is called, so a client that answers at once
+        // finds a timer to clear. When it fires, the close is forced and this
+        // resolves without waiting for the client to say so: a bound that
+        // waited on the thing that just overran it would not be one. (mqtt.js
+        // ignores a second `end` while one is under way, so the forced call
+        // may not tear the connection down itself. What matters is that the
+        // shutdown gets to go on and the process gets to exit.)
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const finished = (): void => {
+          clearTimeout(timer)
+          resolve()
+        }
+        if (!force) {
+          timer = setTimeout(() => {
+            this.#guard(() => this.client.end(true))
+            resolve()
+          }, END_GRACE_MS)
+        }
+        this.client.end(force, finished)
+      })
     }
     return this.#ended
   }
@@ -202,10 +263,10 @@ export class Publisher {
   }
 
   #failed(frame: QueuedFrame, err: unknown): void {
-    // Back at the head, ahead of the frames queued behind it, so a blip does
-    // not reorder the tape. The frame is not lost however long the broker
-    // stays away: it waits here, the queue fills behind it, and the queue's
-    // cap is what finally decides whether anything is dropped.
+    // Back at the head, ahead of the frames queued behind it, so a failure
+    // does not reorder the tape. The frame is not lost however many times it
+    // fails: it waits here, the queue fills behind it, and the queue's cap is
+    // what finally decides whether anything is dropped.
     this.queue.unshift(frame)
     // After `end` there is nothing to retry against: the failure is the
     // shutdown itself (a forced close fails the publish that was out).
@@ -254,18 +315,26 @@ export class Publisher {
  * The `error` listener is here because without one an mqtt.js error (a refused
  * connection, a keepalive timeout) is an `error` event nobody handles, which
  * Node turns into an uncaught exception that kills the process. A broker that
- * is down must cost frames waiting in the queue, not the connector, and the
- * connector has no use for the error itself: mqtt.js reconnects on its own
- * every 2 s, and what the outage does to publishing is reported through
- * `onFailure` and the queue's drop count. Nothing is logged here, since the
- * error can name the broker and this is a connection that carries a password.
+ * is down must cost frames waiting in the queue, not the connector. The
+ * listener discards the error itself, and so does everything below it: it can
+ * name the broker, and this is a connection that carries a password.
+ *
+ * An outage is NOT reported through `Publisher`'s `onFailure` (see `RETRY_MS`):
+ * mqtt.js holds the frame in flight and resends it after reconnecting. While
+ * the broker is away the queue grows behind that frame, and `PublishQueue.push`'s
+ * drop count is the only queue-side signal. Whether the connection is up is
+ * what `hooks.onConnectionChange` is for, and it carries a boolean and nothing
+ * else.
  */
-export function connectMqtt(opts: {
-  url: string
-  username: string
-  password: string
-  clientId: string
-}): MqttLike {
+export function connectMqtt(
+  opts: {
+    url: string
+    username: string
+    password: string
+    clientId: string
+  },
+  hooks: ConnectionHooks = {},
+): MqttLike {
   const client = mqtt.connect(opts.url, {
     clientId: opts.clientId,
     username: opts.username,
@@ -274,5 +343,20 @@ export function connectMqtt(opts: {
     reconnectPeriod: 2000,
   })
   client.on('error', () => {})
+
+  // Called as mqtt.js emits, with no attempt to collapse repeats: a drop emits
+  // both `close` and `offline`, and a failed reconnect emits `close` again, so
+  // a listener has to be idempotent (a gauge being set is). A hook that throws
+  // is swallowed, since it would otherwise unwind through mqtt.js's emitter.
+  const changed = (connected: boolean): void => {
+    try {
+      hooks.onConnectionChange?.(connected)
+    } catch {
+      // See above.
+    }
+  }
+  client.on('connect', () => changed(true))
+  client.on('close', () => changed(false))
+  client.on('offline', () => changed(false))
   return client
 }

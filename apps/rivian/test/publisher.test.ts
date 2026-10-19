@@ -45,7 +45,12 @@ class FakeMqtt implements MqttLike {
     this.published[n]!.cb()
   }
 
-  /** The nth publish fails, the way a closed connection fails it. */
+  /**
+   * The nth publish fails. Not what a broker outage does (mqtt.js holds the
+   * frame in flight and resends it after reconnecting): this is the callback
+   * with an error, as for "Connection closed" on a publish made while the
+   * store was being replayed, or "client disconnecting" after `end`.
+   */
   fail(n: number, message = 'Connection closed'): void {
     this.published[n]!.cb(new Error(message))
   }
@@ -416,6 +421,45 @@ describe('Publisher', () => {
       expect(resolved).toBe(true)
     })
 
+    it('gives up on a graceful end that never finishes, and forces the close', async () => {
+      // A connection that died without anyone noticing never completes a
+      // graceful end, and mqtt.js has no limit of its own.
+      fake.end = (force) => {
+        fake.ends.push(force)
+      }
+
+      let resolved = false
+      const ended = publisher.end().then(() => (resolved = true))
+
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(resolved).toBe(false)
+      expect(fake.ends).toEqual([false])
+
+      await vi.advanceTimersByTimeAsync(1)
+      await ended
+      expect(resolved).toBe(true)
+      expect(fake.ends).toEqual([false, true])
+    })
+
+    it('does not force the close once a graceful end has finished', async () => {
+      await publisher.end()
+      expect(vi.getTimerCount()).toBe(0)
+
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(fake.ends).toEqual([false])
+    })
+
+    it('resolves even if the client never answers the forced close either', async () => {
+      fake.end = (force) => {
+        fake.ends.push(force)
+      }
+
+      const ended = publisher.end()
+      await vi.advanceTimersByTimeAsync(5_000)
+      await ended
+      expect(fake.ends).toEqual([false, true])
+    })
+
     it('can be called twice, and ends the client once', async () => {
       await publisher.end()
       await publisher.end()
@@ -501,5 +545,66 @@ describe('connectMqtt', () => {
     connectMqtt({ url: 'mqtt://broker:1883', username: 'u', password: 'p', clientId: 'ev-rivian' })
 
     expect(() => client.emit('error', new Error('connect ECONNREFUSED'))).not.toThrow()
+  })
+
+  describe('onConnectionChange', () => {
+    it('is told true on connect and false on close or offline, and nothing else', () => {
+      const client = new FakeClient()
+      mqttMock.connect.mockReturnValue(client)
+      const onConnectionChange = vi.fn()
+      connectMqtt(
+        { url: 'mqtt://broker:1883', username: 'u', password: 'p', clientId: 'ev-rivian' },
+        { onConnectionChange },
+      )
+
+      client.emit('connect', { cmd: 'connack' })
+      client.emit('close')
+      client.emit('offline')
+      client.emit('connect', { cmd: 'connack' })
+
+      // Exactly one argument each time: a boolean, never a packet or an error.
+      expect(onConnectionChange.mock.calls).toEqual([[true], [false], [false], [true]])
+    })
+
+    it('never passes the error, or what it said, to the hook', () => {
+      const client = new FakeClient()
+      mqttMock.connect.mockReturnValue(client)
+      const onConnectionChange = vi.fn()
+      connectMqtt(
+        { url: 'mqtt://broker:1883', username: 'u', password: 'p', clientId: 'ev-rivian' },
+        { onConnectionChange },
+      )
+
+      client.emit('error', new Error('connect ECONNREFUSED 10.0.0.5:1883'))
+
+      expect(onConnectionChange).not.toHaveBeenCalled()
+    })
+
+    it('works with no hooks at all', () => {
+      const client = new FakeClient()
+      mqttMock.connect.mockReturnValue(client)
+      connectMqtt({ url: 'mqtt://broker:1883', username: 'u', password: 'p', clientId: 'ev-rivian' })
+
+      expect(() => {
+        client.emit('connect', { cmd: 'connack' })
+        client.emit('close')
+        client.emit('offline')
+      }).not.toThrow()
+    })
+
+    it('survives a hook that throws', () => {
+      const client = new FakeClient()
+      mqttMock.connect.mockReturnValue(client)
+      connectMqtt(
+        { url: 'mqtt://broker:1883', username: 'u', password: 'p', clientId: 'ev-rivian' },
+        {
+          onConnectionChange: () => {
+            throw new Error('metrics down')
+          },
+        },
+      )
+
+      expect(() => client.emit('close')).not.toThrow()
+    })
   })
 })
