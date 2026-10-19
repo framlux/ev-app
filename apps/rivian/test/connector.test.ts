@@ -465,6 +465,59 @@ describe('auth', () => {
     expect(h.metrics.reconnects).toEqual([])
   })
 
+  // The refusal is the second thing to arrive after a sign-out, and an
+  // `UNAUTHENTICATED` that lands once the lifecycle is over must not be answered
+  // by a `CreateCSRFToken`: that is a Rivian call, made for a session that has
+  // been closed on purpose, for nobody.
+  it('a refusal that arrives after the lifecycle ended makes no new app session', async () => {
+    h = await makeHarness()
+    let refuse: (e: Error) => void = () => {}
+    h.gateway.script(
+      'userInfo',
+      () =>
+        new Promise((_resolve, reject) => {
+          refuse = reject
+        }),
+    )
+    await h.signIn()
+    h.connector.start()
+    await h.until(() => h.gateway.calls.userInfo === 1, 'the pending userInfo')
+    expect(h.gateway.calls.createCsrf).toBe(1)
+
+    // The user signs out while the call is in flight.
+    h.store.stamp = null
+    await h.clock.tick(POLL)
+    expect(h.connector.state).toBe('signed_out')
+
+    refuse(unauthenticated())
+    await settle()
+
+    expect(h.gateway.calls.createCsrf).toBe(1)
+    expect(h.gateway.calls.userInfo).toBe(1)
+    expect(h.connector.state).toBe('signed_out')
+  })
+
+  it('a refusal that arrives after stop() makes no new app session', async () => {
+    h = await makeHarness()
+    let refuse: (e: Error) => void = () => {}
+    h.gateway.script(
+      'userInfo',
+      () =>
+        new Promise((_resolve, reject) => {
+          refuse = reject
+        }),
+    )
+    await h.signIn()
+    h.connector.start()
+    await h.until(() => h.gateway.calls.userInfo === 1, 'the pending userInfo')
+
+    void h.connector.stop()
+    refuse(unauthenticated())
+    await settle()
+
+    expect(h.gateway.calls.createCsrf).toBe(1)
+  })
+
   it('a refused slow call does not take a healthy stream down with it', async () => {
     h = await makeHarness()
     h.gateway.script('chargingSummaries', unauthenticated('getCompletedSessionSummaries'))
@@ -575,6 +628,56 @@ describe('backoff', () => {
     await h.clock.tick(1)
     await h.until(() => h.connector.state === 'subscribed', 'subscribed')
     expect(h.gateway.calls.userInfo).toBe(2)
+  })
+
+  // A restart is not a reason to knock again. The status row is the only place
+  // a rate-limit backoff survives a restart, and it is read at `starting`.
+  it('a restart inside a saved backoff waits it out, and asks Rivian nothing before then', async () => {
+    h = await makeHarness()
+    const until = START + 5 * MINUTE
+    h.store.statusRow = {
+      state: 'backing_off',
+      vin: VIN,
+      rivianVehicleId: 'rv-1',
+      lastFrameAt: null,
+      lastError: 'websocket closed: rate limited',
+      backoffUntil: new Date(until),
+      droppedProperties: [],
+      updatedAt: new Date(START),
+    }
+    await h.signIn()
+    h.connector.start()
+    await h.until(() => h.connector.state === 'backing_off', 'backing_off')
+    await settle()
+
+    expect(h.store.writes.at(-1)).toMatchObject({ state: 'backing_off', backoffUntil: new Date(until) })
+    expect(h.gateway.calls.createCsrf).toBe(0)
+
+    await h.clock.tick(5 * MINUTE - 1)
+    expect(h.gateway.calls.createCsrf).toBe(0)
+    expect(h.fake.opens).toHaveLength(0)
+
+    await h.clock.tick(1)
+    await h.until(() => h.connector.state === 'subscribed', 'subscribed')
+    expect(h.gateway.calls.createCsrf).toBe(1)
+  })
+
+  it('a saved backoff that has already passed delays nothing', async () => {
+    h = await makeHarness()
+    h.store.statusRow = {
+      state: 'backing_off',
+      vin: VIN,
+      rivianVehicleId: 'rv-1',
+      lastFrameAt: null,
+      lastError: 'websocket closed: rate limited',
+      backoffUntil: new Date(START - MINUTE),
+      droppedProperties: [],
+      updatedAt: new Date(START - 2 * MINUTE),
+    }
+    await h.connect()
+
+    expect(h.connector.state).toBe('subscribed')
+    expect(h.metrics.states).not.toContain('backing_off')
   })
 
   it('a new credential during a backoff still waits the backoff out', async () => {

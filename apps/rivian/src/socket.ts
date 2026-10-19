@@ -99,6 +99,17 @@ function closeReasonOf(text: string): 'rate_limited' | 'unauthenticated' | null 
 }
 
 /**
+ * `graphql-transport-ws`'s own close codes for a connection the server will not
+ * have: 4401 Unauthorized and 4403 Forbidden. Rivian says "Unauthenticated" in
+ * the reason text, but a server is free to send either code with no text, or
+ * with words the leading-token rule below has never heard of, and the code is
+ * the protocol's statement of it. Retrying a dead session is how accounts get
+ * flagged (design §5.2), so either code is the verdict whatever the text says,
+ * including text that says something milder such as "Rate limited".
+ */
+const UNAUTHENTICATED_CLOSE_CODES: ReadonlySet<number> = new Set([4401, 4403])
+
+/**
  * What to say about a socket error without repeating the error. A system error
  * code (ECONNREFUSED) and the HTTP status of a refused upgrade are fixed
  * vocabularies; the rest of the message can carry an address or a header and
@@ -253,7 +264,9 @@ export function openSocket(opts: {
       const wasAcked = phase === 'acked'
       phase = 'over'
 
-      const verdict = closeReasonOf(reasonBuffer.toString('utf8'))
+      const verdict = UNAUTHENTICATED_CLOSE_CODES.has(code)
+        ? 'unauthenticated'
+        : closeReasonOf(reasonBuffer.toString('utf8'))
       let reason: CloseReason
       let detail: string
       if (verdict === 'rate_limited') {

@@ -32,12 +32,20 @@
  * argument names, and which type each field sits on) are facts about Rivian's
  * API. They are taken from the 2025-04 snapshot of the gateway schema that the
  * design cites (§2), and from the design itself (§2.3) for the one subscription,
- * `parallaxMessages`, that the snapshot does not contain. The snapshot is old,
- * which is why the connector bisects and discovers instead of trusting it. The
- * EXPRESSION is ours: one spelling for the variable (`$vehicleId`) in every
- * document, one field per line, and fields selected in the order the snapshot
- * declares them on their type. No code, `.proto` or schema file was copied from
- * the unlicensed `rivian-python-client` (design §2.4); names are facts, and a
+ * `parallaxMessages`, that the snapshot does not contain.
+ *
+ * WHAT THAT SNAPSHOT IS, AND HOW IT WAS USED. It is the schema file the
+ * unlicensed `rivian-python-client` repository keeps for its own use, so it is
+ * not ours to copy, and it was not copied. It was READ, for facts only: which
+ * fields a type has, what each is called, what type each has, and the order the
+ * type declares them in. Nothing from the file is vendored into this repository,
+ * quoted in it or generated from it, and no `.proto` or code was taken from that
+ * repository either (design §2.4).
+ *
+ * The snapshot is old, which is why the connector bisects and discovers instead
+ * of trusting it. The EXPRESSION is ours: one spelling for the variable
+ * (`$vehicleId`) in every document, one field per line, and fields selected in
+ * the order the snapshot declares them on their type. Names are facts, and a
  * document is only as copied as its wording is.
  */
 

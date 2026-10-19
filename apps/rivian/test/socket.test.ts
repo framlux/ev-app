@@ -245,6 +245,44 @@ describe('openSocket: an acknowledged socket', () => {
     expect(calls.close[0]?.[0]).toBe('unauthenticated')
   })
 
+  // 4401 and 4403 are graphql-transport-ws's own Unauthorized and Forbidden. A
+  // server that says either has said the session is not welcome, whatever
+  // words (or none) it put beside the code, and retrying a dead session is how
+  // accounts get flagged. The code outranks the text, including text that says
+  // something milder.
+  it.each([
+    [4401, ''],
+    [4403, ''],
+    [4401, 'something the leading-token rule has never heard of'],
+    [4403, 'Rate limited'],
+  ])('calls onClose with unauthenticated for close code %i with the text %j', async (code, text) => {
+    const { calls, handlers } = recorder()
+    await open(handlers)
+    server.closeWith(code, text)
+    await server.until(() => calls.close.length === 1)
+    expect(calls.close[0]?.[0]).toBe('unauthenticated')
+    // The detail is the fixed string, with none of the server's text.
+    expect(calls.close[0]?.[1]).toBe('websocket closed: unauthenticated')
+  })
+
+  it.each([4401, 4403])('rejects with unauthenticated for close code %i sent in place of the ack, with no text', async (code) => {
+    server.ack = false
+    const pending = openSocket({ url: server.url, initPayload: INIT, ackTimeoutMs: 1_000, handlers: recorder().handlers })
+    await server.until(() => server.inits.length === 1)
+    server.closeWith(code, '')
+    await expect(pending).rejects.toMatchObject({ reason: 'unauthenticated' })
+  })
+
+  it('does not read a verdict out of the neighbouring close codes', async () => {
+    for (const code of [4400, 4402, 4404, 4500]) {
+      const { calls, handlers } = recorder()
+      await open(handlers)
+      server.closeWith(code, '')
+      await server.until(() => calls.close.length === 1)
+      expect(calls.close[0]?.[0], String(code)).toBe('closed')
+    }
+  })
+
   it('calls onClose with closed for any other close, and keeps the server text out of the detail', async () => {
     const { calls, handlers } = recorder()
     await open(handlers)
@@ -266,7 +304,7 @@ describe('openSocket: an acknowledged socket', () => {
   it('matches the close reason without regard to case or surrounding space', async () => {
     const { calls, handlers } = recorder()
     await open(handlers)
-    server.closeWith(4401, ' unauthenticated ')
+    server.closeWith(4500, ' unauthenticated ')
     await server.until(() => calls.close.length === 1)
     expect(calls.close[0]?.[0]).toBe('unauthenticated')
   })
@@ -283,7 +321,7 @@ describe('openSocket: an acknowledged socket', () => {
     for (const [text, expected] of cases) {
       const { calls, handlers } = recorder()
       await open(handlers)
-      server.closeWith(4401, text)
+      server.closeWith(4500, text)
       await server.until(() => calls.close.length === 1)
       expect(calls.close[0]?.[0], text).toBe(expected)
       // The detail is one of two fixed strings: none of the server's text.
@@ -306,7 +344,7 @@ describe('openSocket: an acknowledged socket', () => {
     ]) {
       const { calls, handlers } = recorder()
       await open(handlers)
-      server.closeWith(4401, text)
+      server.closeWith(4500, text)
       await server.until(() => calls.close.length === 1)
       expect(calls.close[0]?.[0], text).toBe('closed')
     }

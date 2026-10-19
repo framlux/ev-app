@@ -1,6 +1,7 @@
 import { generateCredentialKeys } from '@ev/rivian'
 import { beforeAll, describe, expect, it } from 'vitest'
 import { loadConnectorConfig } from '../src/config.js'
+import { frameFor } from '../src/queue.js'
 
 let BASE: Record<string, string>
 
@@ -120,6 +121,20 @@ describe('loadConnectorConfig', () => {
   // The VIN is a topic segment: `/`, `+` and `#` in it would publish to a topic
   // ingest is not listening on, or to none.
   it.each(['', 'ABC/DEF', 'ABC+DEF', 'ABC#', 'with space'])('refuses the VIN %j', (vin) => {
+    expect(() => loadConnectorConfig({ ...BASE, EV_VEHICLE_VIN: vin })).toThrow(/EV_VEHICLE_VIN/)
+  })
+
+  // Rivian spells a VIN in capitals, ingest upper-cases the one it is given
+  // (so that `rivian/<VIN>/<stream>` is one topic however the variable was
+  // typed), and a connector that published to `rivian/7pd.../state` would be
+  // talking to a topic nobody listens on.
+  it('upper-cases the VIN, so every published topic carries the capitals', () => {
+    const config = loadConnectorConfig({ ...BASE, EV_VEHICLE_VIN: '7pd2eaab2vn016249' })
+    expect(config.vin).toBe('7PD2EAAB2VN016249')
+    expect(frameFor(config.vin, 'state', new Date(0), {}).topic).toBe('rivian/7PD2EAAB2VN016249/state')
+  })
+
+  it.each(['', 'ABC/DEF', 'abc+def'])('still refuses a malformed lower-case VIN %j', (vin) => {
     expect(() => loadConnectorConfig({ ...BASE, EV_VEHICLE_VIN: vin })).toThrow(/EV_VEHICLE_VIN/)
   })
 

@@ -170,9 +170,30 @@ export class RivianApiError extends Error {
     this.what = what
   }
 
-  /** UNAUTHENTICATED anywhere in codes. */
+  /**
+   * The session is not welcome: `UNAUTHENTICATED` anywhere in codes, or an
+   * HTTP 401 that has no code this class recognises.
+   *
+   * The second clause is for a gateway in front of the GraphQL server, which
+   * answers an expired or revoked session with a bare 401 and no GraphQL body,
+   * so there is no code to read. The connector treats `unauthenticated` as the
+   * dead-session rule (one retry, then stop and wait for a new credential), and
+   * missing it would turn a dead session into an ordinary failure, which is
+   * retried, and retrying a dead session is how accounts get flagged. A 401
+   * that DOES carry a code of ours is something else and is read as that
+   * (`BAD_CURRENT_PASSWORD` is a wrong password, not a dead session), so the
+   * status only counts when nothing else claims the response.
+   */
   get unauthenticated(): boolean {
-    return this.codes.some((c) => c.code === 'UNAUTHENTICATED')
+    if (this.codes.some((c) => c.code === 'UNAUTHENTICATED')) return true
+    return (
+      this.httpStatus === 401 &&
+      !this.rateLimited &&
+      !this.validationFailed &&
+      !this.badCredentials &&
+      !this.badOtp &&
+      !this.locked
+    )
   }
 
   /** `RATE_LIMIT`, or HTTP 429 from a gateway that answers before GraphQL does. */

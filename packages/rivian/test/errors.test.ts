@@ -292,6 +292,30 @@ describe('RivianApiError', () => {
       })
     })
 
+    // A gateway in front of GraphQL answers a dead session with a bare 401 and
+    // no GraphQL body, so no code to read. Retrying a dead session is how
+    // accounts get flagged, so the status alone is a verdict, unless the
+    // response says it is something else.
+    it('reads an HTTP 401 with no recognised code as unauthenticated', () => {
+      expect(flags(make(401))).toEqual({ ...none, unauthenticated: true })
+      expect(flags(make(401, ['SOME_GATEWAY_CODE']))).toEqual({ ...none, unauthenticated: true })
+    })
+
+    it('does not read a 401 that carries a code of its own as the session being dead', () => {
+      expect(flags(make(401, ['BAD_CURRENT_PASSWORD']))).toEqual({ ...none, badCredentials: true })
+      expect(flags(make(401, ['BAD_USER_INPUT', 'INVALID_OTP']))).toEqual({ ...none, badOtp: true })
+      expect(flags(make(401, ['SESSION_MANAGER_ERROR']))).toEqual({ ...none, locked: true })
+      expect(flags(make(401, ['RATE_LIMIT']))).toEqual({ ...none, rateLimited: true })
+      expect(flags(make(401, ['GRAPHQL_VALIDATION_FAILED']))).toEqual({ ...none, validationFailed: true })
+    })
+
+    it('reads no other status, with no code, as unauthenticated', () => {
+      for (const status of [200, 400, 403, 404, 500, 502, 503]) {
+        expect(flags(make(status)).unauthenticated, String(status)).toBe(false)
+      }
+      expect(flags(make(null, ['NETWORK'])).unauthenticated).toBe(false)
+    })
+
     it('reads RATE_LIMIT, or HTTP 429 with no code at all', () => {
       expect(flags(make(200, ['RATE_LIMIT']))).toEqual({ ...none, rateLimited: true })
       expect(flags(make(429))).toEqual({ ...none, rateLimited: true })

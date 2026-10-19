@@ -83,13 +83,19 @@ export function loadConnectorConfig(env: NodeJS.ProcessEnv = process.env): Conne
  * different topic than the one ingest listens on, or to none at all. A VIN is
  * alphanumeric by definition, and a value that is not is a typo that is much
  * better refused at startup than discovered as an empty tape.
+ *
+ * It is upper-cased here, once, because everything downstream takes the string
+ * as it finds it: the topic, the envelope and `rivian_status.vin` all carry
+ * `config.vin`. Rivian writes a VIN in capitals and ingest upper-cases the one
+ * it is configured with, so a connector left holding `7pd...` would publish to a
+ * topic that no ingest worker subscribes to, with every log line looking fine.
  */
 function vinOf(env: NodeJS.ProcessEnv): string {
   const vin = required(env, 'EV_VEHICLE_VIN')
   if (!/^[A-Za-z0-9]+$/.test(vin)) {
     throw new Error('EV_VEHICLE_VIN must contain only letters and digits')
   }
-  return vin
+  return vin.toUpperCase()
 }
 
 /**

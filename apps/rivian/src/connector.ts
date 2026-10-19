@@ -697,6 +697,11 @@ export class Connector {
     } catch (e) {
       if (!(e instanceof RivianApiError && e.unauthenticated)) throw e
     }
+    // The refusal may have arrived after the lifecycle ended (a sign-out, a dead
+    // session reported by the socket, shutdown). A new app session would be a
+    // Rivian call made for nobody, and one after a sign-out is exactly the
+    // traffic the user asked us to stop sending.
+    if (!this.#alive(epoch)) throw new Superseded()
     const fresh = await this.#deps.http.createCsrf()
     if (!this.#alive(epoch)) throw new Superseded()
     this.#app = fresh
@@ -1125,7 +1130,8 @@ export class Connector {
   }
 
   /**
-   * Read the saved status once, for the dropped list and the last frame time.
+   * Read the saved status once, for the dropped list, the last frame time and
+   * any backoff still owed.
    * A failure is not remembered as "none": nothing is concluded from it, and it
    * is tried again by whatever needs it next.
    *
@@ -1153,6 +1159,15 @@ export class Connector {
     if (this.#plan === null) this.#dropped = unique([...saved, ...this.#dropped])
     else this.#carried = unique(saved)
     this.#lastFrameAt ??= row?.lastFrameAt ?? null
+    // A backoff the previous process was serving when it ended. The row is the
+    // only place it survives a restart, and a restart (a deploy, a crash loop)
+    // must not cut short the wait Rivian's rate limit asked for: that would be
+    // the reconnect storm the floor exists to rule out, delivered by the
+    // supervisor. `#reconnectAt` only moves forward, `#acquire` consults it
+    // before the first Rivian call, and a time already past delays nothing.
+    if (row?.backoffUntil) {
+      this.#reconnectAt = Math.max(this.#reconnectAt, row.backoffUntil.getTime())
+    }
     this.#deps.metrics.droppedProperties(this.#droppedForRow().length)
   }
 
