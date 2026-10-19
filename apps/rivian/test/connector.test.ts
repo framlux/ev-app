@@ -1479,6 +1479,322 @@ describe('the server ending a subscription', () => {
   })
 })
 
+describe('a server that keeps refusing a subscription', () => {
+  /** A server that errors (or completes) every subscribe, recording when each plan key was asked for. */
+  function refuseEverything(kind: 'error' | 'complete', code = 'INTERNAL_SERVER_ERROR'): Map<string, number[]> {
+    const times = new Map<string, number[]>()
+    h.fake.respond = (socket, id) => {
+      const key = id.split('#')[0]!
+      times.set(key, [...(times.get(key) ?? []), h.clock.now() - START])
+      if (kind === 'error') socket.fail(id, code)
+      else socket.end(id)
+    }
+    return times
+  }
+
+  // The flat 30 s this replaces was 120 subscribes an hour per subscription,
+  // 1,920 for the sixteen, with the state still `subscribed` and nothing said.
+  it.each(['error', 'complete'] as const)(
+    'is retried on 30 s doubling per subscription, not every 30 s (%s)',
+    async (kind) => {
+      h = await makeHarness()
+      const times = refuseEverything(kind)
+      await h.connect()
+      await h.clock.tick(HOUR)
+
+      // Waits of 30, 60, 120, 240, 480, 900 and 900 s after the first subscribe.
+      const schedule = [0, 30, 90, 210, 450, 930, 1830, 2730].map((s) => s * SECOND)
+      expect(times.size).toBe(INITIAL_SUBSCRIPTIONS)
+      for (const [key, at] of times) expect(at, key).toEqual(schedule)
+      expect(h.socket.subscribes).toHaveLength(INITIAL_SUBSCRIPTIONS * schedule.length)
+      // None of it is a reconnect, and none of it is a dead session.
+      expect(h.fake.opens).toHaveLength(1)
+      expect(h.connector.state).toBe('subscribed')
+    },
+  )
+
+  it('adds up to 30 s of jitter to each wait', async () => {
+    h = await makeHarness({ random: () => 0.5 })
+    const times = refuseEverything('error')
+    await h.connect()
+    await h.clock.tick(255 * SECOND)
+
+    // 30 s + 15 s, then 60 s + 15 s, then 120 s + 15 s.
+    expect(times.get('cloud')).toEqual([0, 45, 120, 255].map((s) => s * SECOND))
+  })
+
+  it('caps the wait at 900 s', async () => {
+    h = await makeHarness()
+    const times = refuseEverything('error')
+    await h.connect()
+    await h.clock.tick(3 * HOUR)
+
+    const at = times.get('cloud')!
+    const gaps = at.slice(1).map((t, i) => (t - at[i]!) / SECOND)
+    expect(gaps).toEqual([30, 60, 120, 240, 480, ...Array<number>(10).fill(900)])
+  })
+
+  it('keeps one subscription’s failures out of another’s schedule', async () => {
+    h = await makeHarness()
+    const times = new Map<string, number[]>()
+    h.fake.respond = (socket, id) => {
+      const key = id.split('#')[0]!
+      if (key !== 'cloud') return
+      times.set(key, [...(times.get(key) ?? []), h.clock.now() - START])
+      socket.fail(id)
+    }
+    await h.connect()
+    // The geofence stream is refused once, much later, and starts from the floor.
+    await h.clock.tick(HOUR)
+    expect(times.get('cloud')!.length).toBeGreaterThan(5)
+    // (Silence has renewed the live ones all the while, so count from here.)
+    const geofences = () => h.socket.subscribes.filter((s) => s.id.startsWith('geofence#')).length
+    const before = geofences()
+    h.socket.fail(h.socket.idFor('geofence'))
+    await settle()
+    await h.clock.tick(30 * SECOND - 1)
+    expect(geofences()).toBe(before)
+    await h.clock.tick(1)
+    expect(geofences()).toBe(before + 1)
+  })
+
+  it('goes back to 30 s once that subscription has been heard from', async () => {
+    h = await makeHarness()
+    const times = new Map<string, number[]>()
+    let refusing = true
+    h.fake.respond = (socket, id) => {
+      const key = id.split('#')[0]!
+      if (key !== 'cloud' || !refusing) return
+      times.set(key, [...(times.get(key) ?? []), h.clock.now() - START])
+      socket.fail(id)
+    }
+    await h.connect()
+    // Refused at 0, 30 s and 90 s: the next wait would be 120 s.
+    await h.clock.tick(90 * SECOND)
+    expect(times.get('cloud')).toEqual([0, 30 * SECOND, 90 * SECOND])
+
+    // The 120 s wait ends with an accepted subscribe, and a frame.
+    refusing = false
+    await h.clock.tick(120 * SECOND)
+    await h.next('cloud')
+
+    // Refused again: the schedule starts over at 30 s, not at 240 s.
+    refusing = true
+    const refusedAt = h.clock.now()
+    h.socket.fail(h.socket.idFor('cloud'))
+    await settle()
+    await h.clock.tick(90 * SECOND)
+    expect(times.get('cloud')!.slice(3).map((at) => at - (refusedAt - START))).toEqual([
+      30 * SECOND,
+      90 * SECOND,
+    ])
+  })
+
+  it('a frame from another subscription does not reset this one', async () => {
+    h = await makeHarness()
+    const times = new Map<string, number[]>()
+    h.fake.respond = (socket, id) => {
+      if (id.split('#')[0] !== 'cloud') return
+      times.set('cloud', [...(times.get('cloud') ?? []), h.clock.now() - START])
+      socket.fail(id)
+    }
+    await h.connect()
+    await h.next('charging')
+    await h.next('geofence')
+    await h.clock.tick(90 * SECOND)
+    await h.next('charging')
+    await h.clock.tick(120 * SECOND)
+
+    expect(times.get('cloud')).toEqual([0, 30, 90, 210].map((s) => s * SECOND))
+  })
+
+  it('drops the waits with the socket: a reconnect starts every subscription from the floor', async () => {
+    h = await makeHarness()
+    const times = refuseEverything('error')
+    await h.connect()
+    await h.clock.tick(10 * MINUTE)
+    const before = times.get('cloud')!.length
+
+    h.socket.handlers.onClose('closed', 'websocket closed with code 1006')
+    await settle()
+    // The old socket's retry timers are gone with it: nothing fires into the new one.
+    await h.clock.tick(30 * SECOND)
+    await h.until(() => h.fake.opens.length === 2, 'the reconnect')
+    await h.until(() => h.connector.state === 'subscribed', 'subscribed')
+    await settle()
+    expect(h.fake.sockets).toHaveLength(2)
+    expect(h.fake.sockets[0]!.subscribes.length).toBeGreaterThan(0)
+    const first = h.fake.sockets[0]!.subscribes.length
+    await h.clock.tick(10 * MINUTE)
+    expect(h.fake.sockets[0]!.subscribes).toHaveLength(first)
+    expect(times.get('cloud')!.length).toBeGreaterThan(before)
+  })
+
+  describe('says so in last_error', () => {
+    it('names the stream and the code while it is refused, and clears when it is heard from', async () => {
+      h = await makeHarness()
+      await h.connect()
+      expect(h.store.writes.at(-1)!.lastError).toBeNull()
+
+      h.socket.fail(h.socket.idFor('cloud'), 'INTERNAL_SERVER_ERROR')
+      await settle()
+      expect(h.connector.state).toBe('subscribed')
+      expect(h.store.writes.at(-1)).toMatchObject({
+        state: 'subscribed',
+        lastError: 'subscription cloud refused: INTERNAL_SERVER_ERROR',
+      })
+
+      await h.clock.tick(30 * SECOND)
+      await h.next('cloud')
+      expect(h.store.writes.at(-1)!.lastError).toBeNull()
+    })
+
+    it('keeps saying it while any subscription is still refused, and the latest one is the one named', async () => {
+      h = await makeHarness()
+      await h.connect()
+
+      h.socket.fail(h.socket.idFor('cloud'), 'INTERNAL_SERVER_ERROR')
+      await settle()
+      h.socket.fail(h.socket.idFor('geofence'), 'SERVICE_UNAVAILABLE')
+      await settle()
+      expect(h.store.writes.at(-1)!.lastError).toBe('subscription geofence refused: SERVICE_UNAVAILABLE')
+
+      await h.clock.tick(30 * SECOND)
+      await h.next('geofence')
+      // The cloud subscription has not been heard from yet.
+      expect(h.store.writes.at(-1)!.lastError).toBe('subscription cloud refused: INTERNAL_SERVER_ERROR')
+
+      await h.next('cloud')
+      expect(h.store.writes.at(-1)!.lastError).toBeNull()
+    })
+
+    it('says it with the first code Rivian gave, and nothing else of what Rivian said', async () => {
+      h = await makeHarness()
+      await h.connect()
+
+      const id = h.socket.idFor('ota-state')
+      h.socket.ended.add(id)
+      h.socket.handlers.onError(id, [
+        { message: `nope ${TOKEN}`, extensions: { code: 'FORBIDDEN', reason: TOKEN } },
+        { message: 'second', extensions: { code: 'OTHER_CODE' } },
+      ])
+      await settle()
+
+      // The stream, not the subscription's own name, and a code that passed the filter.
+      expect(h.store.writes.at(-1)!.lastError).toBe('subscription ota refused: FORBIDDEN')
+      expect(JSON.stringify([h.logs, h.store.writes])).not.toContain('SECRET')
+    })
+
+    it('leaves the code out when none of Rivian’s survived the filter', async () => {
+      h = await makeHarness()
+      await h.connect()
+
+      // A "code" shaped like a token is refused by the error type, so nothing is left to say.
+      h.socket.fail(h.socket.idFor('cloud'), TOKEN)
+      await settle()
+
+      expect(h.store.writes.at(-1)!.lastError).toBe('subscription cloud refused')
+      expect(JSON.stringify([h.logs, h.store.writes])).not.toContain('SECRET')
+    })
+
+    it('does not outlive the socket: a close replaces it, and a new connection starts clean', async () => {
+      h = await makeHarness()
+      await h.connect()
+      h.socket.fail(h.socket.idFor('cloud'))
+      await settle()
+      expect(h.store.writes.at(-1)!.lastError).toMatch(/^subscription cloud refused/)
+
+      h.socket.handlers.onClose('rate_limited', 'websocket closed: rate limited')
+      await settle()
+      expect(h.store.writes.at(-1)).toMatchObject({
+        state: 'backing_off',
+        lastError: 'websocket closed: rate limited',
+      })
+
+      await h.clock.tick(30 * SECOND)
+      await h.until(() => h.connector.state === 'subscribed', 'subscribed')
+      await settle()
+      expect(h.store.writes.at(-1)!.lastError).toBeNull()
+    })
+
+    it('is not set by a server that merely completes a subscription', async () => {
+      h = await makeHarness()
+      await h.connect()
+      h.socket.end(h.socket.idFor('cloud'))
+      await settle()
+
+      expect(h.store.writes.at(-1)!.lastError).toBeNull()
+    })
+  })
+
+  describe('UNAUTHENTICATED on a subscription', () => {
+    it('is a dead session: stop, no retry of anything, and a new credential starts again', async () => {
+      h = await makeHarness()
+      await h.connect()
+      const socket = h.socket
+      const calls = { ...h.gateway.calls }
+      const subscribed = socket.subscribes.length
+
+      socket.fail(socket.idFor('cloud'), 'UNAUTHENTICATED')
+      await settle()
+      expect(h.connector.state).toBe('unauthenticated')
+      expect(socket.closed).toBe(true)
+      expect(h.store.writes.at(-1)).toMatchObject({
+        state: 'unauthenticated',
+        lastError: 'subscription cloud refused: UNAUTHENTICATED',
+      })
+
+      await h.clock.tick(HOUR)
+      // No subscribe, no socket, no HTTP, no backoff: it has stopped.
+      expect(socket.subscribes).toHaveLength(subscribed)
+      expect(h.fake.opens).toHaveLength(1)
+      expect(h.gateway.calls).toEqual(calls)
+      expect(h.metrics.reconnects).toEqual([])
+      expect(h.connector.state).toBe('unauthenticated')
+
+      await h.signIn()
+      await h.clock.tick(POLL)
+      await h.until(() => h.connector.state === 'subscribed', 'subscribed')
+      expect(h.fake.opens).toHaveLength(2)
+    })
+
+    it('wins over a validation failure in the same error', async () => {
+      h = await makeHarness()
+      await h.connect()
+      const bad = RIVIAN_PROPERTIES[0]!.name
+      const group = h.socket.subscribeFor(bad)!
+
+      h.socket.handlers.onError(group.id, [
+        { extensions: { code: 'GRAPHQL_VALIDATION_FAILED' } },
+        { extensions: { code: 'UNAUTHENTICATED' } },
+      ])
+      await settle()
+      await h.clock.tick(HOUR)
+
+      expect(h.connector.state).toBe('unauthenticated')
+      expect(h.store.writes.at(-1)!.droppedProperties).toEqual([])
+      expect(h.socket.subscribes).toHaveLength(INITIAL_SUBSCRIPTIONS)
+    })
+
+    it('is a dead session whichever id carries it, and stops a retry already waiting', async () => {
+      h = await makeHarness()
+      await h.connect()
+      const socket = h.socket
+      // An ended subscription is waiting out its 30 s when the verdict arrives.
+      socket.fail(socket.idFor('geofence'))
+      await settle()
+
+      socket.handlers.onError('cloud#9999', [{ extensions: { code: 'UNAUTHENTICATED' } }])
+      await settle()
+      expect(h.connector.state).toBe('unauthenticated')
+      const subscribed = socket.subscribes.length
+
+      await h.clock.tick(HOUR)
+      expect(socket.subscribes).toHaveLength(subscribed)
+    })
+  })
+})
+
 describe('redaction (review focus 5)', () => {
   it('no session token appears in any log line, status row or published frame across the run', async () => {
     h = await makeHarness()

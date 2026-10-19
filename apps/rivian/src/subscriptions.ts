@@ -183,6 +183,15 @@ export class SubscriptionPlan {
   }
 
   /**
+   * The subscription this id is, for the connector to key its per-subscription
+   * state on (`key` is stable across the fresh ids a retry gives it); null for
+   * an id that is not live.
+   */
+  subOf(id: string): PlannedSubscription | null {
+    return this.#live.get(id) ?? null
+  }
+
+  /**
    * A fresh id for every subscription that is live, for the connector to
    * `complete` the old and `subscribe` the new (silence, or a drop in the
    * publish queue). The old ids stop mapping to anything at once.

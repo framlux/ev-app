@@ -106,6 +106,19 @@ describe('SubscriptionPlan.initial', () => {
 
   it('returns null for an id it never handed out', () => {
     expect(planOf(props(3)).streamOf('state:0#999')).toBeNull()
+    expect(planOf(props(3)).subOf('state:0#999')).toBeNull()
+  })
+
+  it('names the subscription behind an id, and the key stays the same under the fresh id of a retry', () => {
+    const plan = planOf(props(3))
+    const cloud = plan.initial().find((s) => s.sub.key === 'cloud')!
+    expect(plan.subOf(cloud.id)).toBe(cloud.sub)
+
+    const ended = plan.ended(cloud.id)!
+    expect(plan.subOf(cloud.id)).toBeNull()
+    const again = plan.activate(ended)
+    expect(again).not.toBe(cloud.id)
+    expect(plan.subOf(again)?.key).toBe('cloud')
   })
 
   it('does not build a document from an empty group when there are no properties', () => {

@@ -118,8 +118,14 @@ const ACK_TIMEOUT_MS = 15_000
 /** Nothing for this long on an acknowledged socket means resubscribe (design §5.2). */
 const SILENCE_MS = 60_000
 
-/** Before a rejected half, an ended subscription or an errored one is subscribed again (design §5.2, §5.4). */
-const RESUBSCRIBE_DELAY_MS = 30_000
+/**
+ * Before a rejected half of a bisected group is subscribed (design §5.4). A
+ * subscription the server ended or errored is NOT on this fixed wait: it is on
+ * its own backoff (`#retryLater`), because a flat 30 s for a subscription that
+ * keeps being refused was 120 subscribes an hour each, for ever, and nobody
+ * could see it.
+ */
+const BISECT_DELAY_MS = 30_000
 
 /**
  * The least time between two renewals of everything. A renewal re-sends a
@@ -226,6 +232,23 @@ function schemaFields(data: unknown): { name: string; typeName: string | null }[
   return out
 }
 
+/**
+ * The line `last_error` carries for a refused subscription. It is built from
+ * the stream's name (ours) and a code that has already passed the filter in
+ * `errors.ts`, and from nothing else, so it is a fixed shape that cannot hold
+ * anything Rivian wrote beyond that code. `code` is null when none of what
+ * Rivian sent survived the filter, and the line then says no more than it knows.
+ */
+function refusalLine(stream: RivianStream | null, code: string | null): string {
+  const head = stream === null ? 'subscription refused' : `subscription ${stream} refused`
+  return code === null ? head : `${head}: ${code}`
+}
+
+/** A wait for a log line: `45 s`. */
+function seconds(ms: number): string {
+  return `${Math.round(ms / 1000)} s`
+}
+
 /** The errors of a subscription's `error` message, which is a list (and, from a stricter server, `{ errors }`). */
 function errorListOf(payload: unknown): unknown {
   if (Array.isArray(payload)) return payload
@@ -287,6 +310,24 @@ export class Connector {
   #lastRenewAt = Number.NEGATIVE_INFINITY
   /** The publisher has reported the queue empty since the last frame was queued. */
   #queueEmpty = true
+
+  /**
+   * One backoff per subscription (by plan key) that the server has ended or
+   * refused, so that each retries on 30 s doubling with its own jitter and a
+   * subscription that is refused for ever settles at one subscribe per 15
+   * minutes instead of two a minute. A subscription's entry goes when a frame
+   * arrives for it, which is the only proof it works (`#onNext`); all of them
+   * go with the socket, whose `initial()` numbers the keys afresh.
+   */
+  readonly #subBackoffs = new Map<string, Backoff>()
+  /**
+   * The subscriptions the server has refused and not since been heard from,
+   * each with the fixed line that says so, in the order they were last
+   * refused. `last_error` shows the newest while there is any.
+   */
+  readonly #refused = new Map<string, string>()
+  /** `last_error` is currently a line from `#refused`, which is the only kind this class clears on its own. */
+  #refusalShown = false
 
   /** SHA-256 of the last `meta` data published, per kind, for the change-only rule. */
   readonly #metaHashes = new Map<string, string>()
@@ -729,8 +770,15 @@ export class Connector {
    */
   #onNext(connId: number, id: string, payload: unknown): void {
     if (connId !== this.#connId || this.#stopped) return
-    const stream = this.#plan?.streamOf(id) ?? null
-    if (stream === null) return
+    const sub = this.#plan?.subOf(id) ?? null
+    if (sub === null) return
+    const stream = sub.stream
+
+    // A frame is the proof a subscription works, and the only one: it forgives
+    // that subscription's failures (its next refusal starts from 30 s again)
+    // and, if it was one of those named in `last_error`, takes it off the list.
+    this.#subBackoffs.delete(sub.key)
+    if (this.#refused.delete(sub.key)) this.#syncRefusal()
 
     // The first frame after a connect is what proves the connection works: an
     // ack on its own is not, since a server that acknowledges and closes in the
@@ -847,26 +895,44 @@ export class Connector {
   }
 
   /**
-   * A subscription the server rejected. A validation failure goes to the plan
-   * to bisect (design §5.4); anything else is an ordinary end and comes back
-   * after 30 s. The errors are read only for their codes (design §4.4).
+   * A subscription the server rejected. The errors are read only for their
+   * codes (design §4.4), and the codes decide:
+   *
+   * - `UNAUTHENTICATED` is the session being dead, as the close reason is, and
+   *   is answered the same way: stop, and wait for a new credential. Retrying a
+   *   dead session is how accounts get flagged, and a retry per subscription
+   *   would be sixteen of them every 30 s. It is checked first, and on any id:
+   *   a late error for a subscription already renewed is still the server
+   *   saying the session is gone.
+   * - A validation failure goes to the plan to bisect (design §5.4).
+   * - Anything else is an ordinary refusal: the subscription comes back on its
+   *   own backoff, and `last_error` says which stream and with what code until
+   *   it is heard from again.
    */
   #onError(connId: number, id: string, payload: unknown): void {
     const plan = this.#plan
     if (connId !== this.#connId || this.#stopped || plan === null) return
     const error = toRivianApiError(null, { errors: errorListOf(payload) }, 'subscription')
+    const known = plan.subOf(id)
     this.#live.delete(id)
+
+    if (error.unauthenticated) {
+      this.#log(`subscription ${known?.key ?? 'unknown'} was refused as unauthenticated; the session is dead`)
+      this.#unauthenticated(refusalLine(known?.stream ?? null, 'UNAUTHENTICATED'))
+      return
+    }
 
     if (!error.validationFailed) {
       const sub = plan.ended(id)
       if (sub === null) return
-      this.#log(`subscription ${sub.key} was refused: ${error.redacted()}; trying again in 30 s`)
-      this.#resubscribeLater(sub)
+      this.#refuse(sub, refusalLine(sub.stream, error.codes[0]?.code ?? null))
+      const wait = this.#retryLater(sub)
+      this.#log(`subscription ${sub.key} was refused: ${error.redacted()}; trying again in ${seconds(wait)}`)
       return
     }
 
     const { probes, newlyDropped, unavailable } = plan.rejected(id, this.#deps.clock.now())
-    for (const probe of probes) this.#resubscribeLater(probe)
+    for (const probe of probes) this.#resubscribeLater(probe, BISECT_DELAY_MS)
     if (unavailable !== null) {
       this.#log(`subscription ${unavailable} is rejected and has nothing to bisect; trying again in a day`)
     }
@@ -876,18 +942,72 @@ export class Connector {
     }
   }
 
-  /** The server completed a subscription: it comes back after 30 s under a fresh id. */
+  /**
+   * The server completed a subscription. It comes back on its own backoff, as
+   * a refused one does, but `last_error` is not touched: a `complete` carries
+   * no code to report, and may be routine for a car that is not reporting.
+   */
   #onComplete(connId: number, id: string): void {
     if (connId !== this.#connId || this.#stopped) return
     this.#live.delete(id)
     const sub = this.#plan?.ended(id) ?? null
     if (sub === null) return
-    this.#log(`subscription ${sub.key} was ended by the server; trying again in 30 s`)
-    this.#resubscribeLater(sub)
+    const wait = this.#retryLater(sub)
+    this.#log(`subscription ${sub.key} was ended by the server; trying again in ${seconds(wait)}`)
   }
 
-  #resubscribeLater(sub: PlannedSubscription): void {
-    this.#schedule(this.#connTimers, RESUBSCRIBE_DELAY_MS, () => this.#activate(sub))
+  /**
+   * Subscribe `sub` again after `wait` ms, under the fresh id `activate` gives
+   * it. The timer belongs to the socket (`#connTimers`), so a replaced or
+   * closed socket cancels every retry it was holding.
+   */
+  #resubscribeLater(sub: PlannedSubscription, wait: number): void {
+    this.#schedule(this.#connTimers, wait, () => this.#activate(sub))
+  }
+
+  /**
+   * Retry an ended subscription on ITS OWN backoff (design §5.2): 30 s doubling,
+   * plus up to 30 s of jitter, capped at 900 s, kept per plan key so that one
+   * subscription's failures never lengthen another's wait. Returns the wait.
+   */
+  #retryLater(sub: PlannedSubscription): number {
+    let backoff = this.#subBackoffs.get(sub.key)
+    if (backoff === undefined) {
+      backoff = new Backoff(this.#deps.random)
+      this.#subBackoffs.set(sub.key, backoff)
+    }
+    const wait = backoff.next()
+    this.#resubscribeLater(sub, wait)
+    return wait
+  }
+
+  /** Note that the server refused `sub`, and say so in `last_error`. */
+  #refuse(sub: PlannedSubscription, line: string): void {
+    // Deleted first so that the newest refusal is the last entry, which is the
+    // one `last_error` names.
+    this.#refused.delete(sub.key)
+    this.#refused.set(sub.key, line)
+    this.#syncRefusal()
+  }
+
+  /**
+   * Make `last_error` say what `#refused` says: the newest refusal while there
+   * is one, and nothing once there is none. It only ever clears a line it
+   * wrote itself (`#refusalShown`), so it can never wipe the reason for a
+   * state change.
+   */
+  #syncRefusal(): void {
+    const latest = [...this.#refused.values()].at(-1) ?? null
+    if (latest === null) {
+      if (!this.#refusalShown) return
+      this.#refusalShown = false
+      this.#lastError = null
+    } else {
+      if (this.#refusalShown && this.#lastError === latest) return
+      this.#refusalShown = true
+      this.#lastError = latest
+    }
+    this.#persist()
   }
 
   /** Subscribe something the plan handed back, under the fresh id `activate` gives it. */
@@ -1060,6 +1180,9 @@ export class Connector {
     opts: { error?: string; backoffUntil?: number } = {},
   ): void {
     this.#state = state
+    // Whatever `last_error` was, it is this state's now: a refusal line does
+    // not carry over into a state that has no subscriptions to be refused.
+    this.#refusalShown = false
     if (state === 'signed_out' || state === 'starting' || state === 'subscribed') {
       this.#lastError = null
     }
@@ -1232,6 +1355,8 @@ export class Connector {
     this.#silenceTimer = null
     this.#renewTimer = null
     this.#live.clear()
+    this.#subBackoffs.clear()
+    this.#refused.clear()
     this.#flowing = false
     this.#renewPending = false
   }

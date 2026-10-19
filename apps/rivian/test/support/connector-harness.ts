@@ -138,10 +138,20 @@ export class FakeSocket implements SocketLike {
   readonly ended = new Set<string>()
   closed = false
 
+  /**
+   * When set, what the server does with every subscribe: it is called a turn
+   * after the subscribe, as a real server's answer would be. It is how a test
+   * says "a server that errors every subscription" once, instead of failing
+   * each id by hand as the connector retries it.
+   */
+  respond: ((socket: FakeSocket, id: string, doc: SubscriptionDocument) => void) | null = null
+
   constructor(readonly handlers: SocketHandlers) {}
 
   subscribe(id: string, doc: SubscriptionDocument): void {
     this.subscribes.push({ id, doc })
+    const answer = this.respond
+    if (answer !== null) queueMicrotask(() => answer(this, id, doc))
   }
 
   complete(id: string): void {
@@ -199,6 +209,8 @@ export interface FakeSockets {
   outcomes: ('ack' | SocketOpenError)[]
   /** While true, an open does not answer until `releaseOpens`. */
   hold: boolean
+  /** Becomes `respond` on every socket opened from now on (see `FakeSocket.respond`). */
+  respond: FakeSocket['respond']
   releaseOpens(): void
 }
 
@@ -209,6 +221,7 @@ export function fakeOpenSocket(): FakeSockets {
     opens: [],
     outcomes: [],
     hold: false,
+    respond: null,
     releaseOpens() {
       fake.hold = false
       for (const release of waiting.splice(0)) release()
@@ -219,6 +232,7 @@ export function fakeOpenSocket(): FakeSockets {
       const outcome = fake.outcomes.shift() ?? 'ack'
       if (outcome !== 'ack') throw outcome
       const socket = new FakeSocket(opts.handlers)
+      socket.respond = fake.respond
       fake.sockets.push(socket)
       return socket
     },
