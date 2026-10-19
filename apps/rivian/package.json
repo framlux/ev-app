@@ -1,0 +1,22 @@
+{
+  "name": "@ev/rivian-connector",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@ev/core": "workspace:*",
+    "@ev/db": "workspace:*",
+    "@ev/rivian": "workspace:*",
+    "mqtt": "^5.10.0",
+    "prom-client": "^15.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.0"
+  }
+}
