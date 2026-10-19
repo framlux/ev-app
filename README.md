@@ -127,6 +127,15 @@ PGHOST=localhost PGPORT=55432 PGUSER=ev PGPASSWORD=ev PGDATABASE=ev pnpm test
 
 CI does exactly this (`.github/workflows/test.yml`).
 
+Each vitest project that writes to Postgres (`@ev/db`, `@ev/ingest`, `web`) is
+given a database of its own, `<PGDATABASE>_test_<project>` (`ev_test_web` and so
+on), dropped and recreated at the start of every run. The projects run at the
+same time, and sharing one database made unrelated tests fail intermittently on
+each other's rows. It means the role needs `CREATEDB` (the container's `ev` user
+has it), the `PGDATABASE` you name is only used to connect and create, and two
+test runs against one server at the same moment will drop each other's
+databases.
+
 To run the website against that database:
 
 ```sh

@@ -39,8 +39,17 @@ const hasDb = Boolean(process.env['PGHOST'])
  * no vehicle column, so unlike everything else here its rows cannot be scoped
  * to a test vehicle — they are scoped to one implausible instant instead, so
  * afterAll can delete exactly what this file wrote and nothing else.
+ *
+ * It is AFTER repo.test.ts's rate window (2020), and that is load-bearing. This
+ * file and repo.test.ts share a database and run at the same time, and
+ * `rateAt` answers "the newest rate at or before this instant" — so a rate
+ * written here at 2019 sat before every rate in that window, and repo.test.ts's
+ * "returns null before every rate" case failed whenever it ran while this file
+ * was between its insert and its cleanup. Observed as `pricePerKwh: 0.31`, the
+ * manual fixture below, where null was expected. A rate AFTER the window cannot
+ * be the answer to any instant that file asks about.
  */
-const RATE_AT = new Date('2019-05-05T05:05:05.000Z')
+const RATE_AT = new Date('2022-05-05T05:05:05.000Z')
 
 if (!hasDb && process.env['CI']) {
   throw new Error(

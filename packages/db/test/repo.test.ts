@@ -80,6 +80,11 @@ const TS = new Date('2026-09-04T10:00:00.000Z')
  * moment" stays a true statement about a database that may also hold genuine
  * rates, since `rateAt` only ever considers rows at or before the instant asked
  * about.
+ *
+ * NOTHING ELSE MAY WRITE A RATE BEFORE THIS WINDOW. The case that asks for the
+ * rate before every rate depends on it, and migrate.test.ts shares this
+ * database: its fixtures are deliberately written after the window (2022), not
+ * before it.
  */
 const RATE_WINDOW_FROM = new Date('2020-01-01T00:00:00.000Z')
 const RATE_WINDOW_TO = new Date('2021-01-01T00:00:00.000Z')

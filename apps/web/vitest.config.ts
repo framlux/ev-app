@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { compile, compileModule } from 'svelte/compiler'
 import { transformWithEsbuild } from 'vite'
 import { defineConfig, type Plugin } from 'vitest/config'
+import { isolatedDatabase } from '../../packages/db/test/support/isolated-database.js'
 
 /**
  * Compiles .svelte files for SSR so test/components.test.ts can render them
@@ -29,6 +30,14 @@ import { defineConfig, type Plugin } from 'vitest/config'
  * took the whole component suite out of the run.
  */
 const LIB = fileURLToPath(new URL('./src/lib', import.meta.url))
+
+/**
+ * This project's own database, so its tests cannot race the other projects'
+ * writes to the same tables. api-db.test.ts holds a pending charge in `session`
+ * while it runs, which @ev/db's invoice-gate test would otherwise find. See
+ * packages/db/test/support/isolated-database.ts.
+ */
+const db = isolatedDatabase('web')
 
 function svelteSsrForTests(): Plugin {
 	return {
@@ -100,6 +109,7 @@ export default defineConfig({
 		 * The settings page imports it, so the suite needs a value; this is the
 		 * one its assertions pin.
 		 */
-		env: { EV_TELEMETRY_HOSTNAME: 'ev-telemetry.example.com' }
+		env: { EV_TELEMETRY_HOSTNAME: 'ev-telemetry.example.com', ...db.env },
+		globalSetup: db.globalSetup
 	}
 })

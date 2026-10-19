@@ -38,8 +38,9 @@ if (!hasDb && process.env['CI']) {
 	)
 }
 
-// Ids are prefixed so this file and packages/db/test/migrate.test.ts can share
-// a database in CI without either one seeing the other's rows.
+// Ids are prefixed so a row left behind by a crashed run is recognisably this
+// file's. The web project has a database of its own, so no other project's rows
+// are here to collide with: see packages/db/test/support/isolated-database.ts.
 const V1 = 'web-test-v1'
 const V2 = 'web-test-v2'
 /**
