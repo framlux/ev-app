@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Pipeline, readEnvelope } from '../src/pipeline.js'
+import { teslaProfile } from '../src/profiles/tesla.js'
 import {
   attach,
   parseTopic,
@@ -71,7 +72,7 @@ class FakeClient implements MqttClientLike {
 
 function wire(hooks: MqttHooks = {}) {
   const db = new FakeDb()
-  const pipeline = new Pipeline(db, { usableCapacityKwh: 75 })
+  const pipeline = new Pipeline(teslaProfile, db, { usableCapacityKwh: 75 })
   const client = new FakeClient()
   attach(client, OPTS, async (raw) => {
     await pipeline.handle(raw)

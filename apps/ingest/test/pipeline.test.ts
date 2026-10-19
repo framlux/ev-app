@@ -7,10 +7,10 @@ import {
   Pipeline,
   QUIET_PERIOD_MS,
   STALE_VALUE_MS,
-  VOLATILE_FIELDS,
   VOLATILE_STALE_MS,
-  staleWindowFor,
+  type Store,
 } from '../src/pipeline.js'
+import { VOLATILE_FIELDS, staleWindowFor, teslaProfile } from '../src/profiles/tesla.js'
 import { FakeDb, openSessions } from './support/fake-db.js'
 
 const OPTS = { usableCapacityKwh: 75 }
@@ -65,7 +65,7 @@ async function burst(
 describe('Pipeline.handle: the tape', () => {
   it('writes every field message to the tape, mappable or not', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Soc', 80))
     // An unknown field and an unreadable value: counted, taped, never a crash
@@ -87,7 +87,7 @@ describe('Pipeline.handle: the tape', () => {
 
   it('creates the month partition before inserting into a partitioned table', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Soc', 80))
     expect(db.state.partitions).toContain('2026-8')
@@ -102,7 +102,7 @@ describe('Pipeline.handle: the tape', () => {
 
   it('advances the ingest cursor and never rewinds it', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await pipeline.handle(field('2026-09-04T10:05:00.000Z', 'Soc', 80))
     expect(db.state.cursor?.toISOString()).toBe('2026-09-04T10:05:00.000Z')
@@ -115,7 +115,7 @@ describe('Pipeline.handle: the tape', () => {
 describe('Pipeline accumulation', () => {
   it('emits ONE sample carrying the whole burst, not one per field', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await burst(pipeline, '2026-09-04T10:00:00.000Z',
       { Soc: 80, VehicleSpeed: MOVING, Odometer: 1000, TpmsPressureFl: 2.8 })
@@ -137,7 +137,7 @@ describe('Pipeline accumulation', () => {
 
   it('leaves a field that was never reported null, never 0', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Soc', 80))
     await pipeline.handle(field('2026-09-04T10:00:05.000Z', 'Soc', 79))
@@ -153,7 +153,7 @@ describe('Pipeline accumulation', () => {
 
   it('carries the latest known value of a field into later samples', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     // Odometer is published far less often than speed. Dropping it between
     // samples would make almost every sample all-null, which is what wrecks
@@ -168,7 +168,7 @@ describe('Pipeline accumulation', () => {
 
   it('stops carrying a value once it is stale', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'VehicleSpeed', MOVING))
     await pipeline.handle(field('2026-09-04T10:00:05.000Z', 'Soc', 80))
@@ -191,13 +191,13 @@ describe('Pipeline accumulation', () => {
     const at = (ms: number) => new Date(start.getTime() + ms)
 
     const early = new FakeDb()
-    const a = new Pipeline(early, OPTS)
+    const a = new Pipeline(teslaProfile, early, OPTS)
     await a.handle(field(start, 'Soc', 80))
     await a.handle(field(at(QUIET_PERIOD_MS - 1), 'VehicleSpeed', 0))
     expect(early.state.samples).toHaveLength(0)
 
     const onTime = new FakeDb()
-    const b = new Pipeline(onTime, OPTS)
+    const b = new Pipeline(teslaProfile, onTime, OPTS)
     await b.handle(field(start, 'Soc', 80))
     await b.handle(field(at(QUIET_PERIOD_MS), 'VehicleSpeed', 0))
     expect(onTime.state.samples).toHaveLength(1)
@@ -206,7 +206,7 @@ describe('Pipeline accumulation', () => {
 
   it('emits at MAX_SAMPLE_INTERVAL_MS even if the car never goes quiet', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
     const start = t('2026-09-04T10:00:00.000Z')
     const step = 1_000
 
@@ -228,7 +228,7 @@ describe('Pipeline accumulation', () => {
     // last emit instead of from the burst's own start, any gap over 30 s made
     // the next burst's SECOND message look overdue, splitting it in two.
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
     await burst(pipeline, '2026-09-04T10:00:00.000Z', { Soc: 80 })
     await pipeline.flush(t('2026-09-04T10:00:05.000Z'))
     expect(db.state.samples).toHaveLength(1)
@@ -248,7 +248,7 @@ describe('Pipeline accumulation', () => {
     // split-off first field took that instant, and the whole burst, stamped
     // the same, was then dropped by the sample table's ON CONFLICT DO NOTHING.
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
     await burst(pipeline, '2026-09-04T10:00:00.000Z', { Soc: 80, ACChargingPower: 1.2 })
     await pipeline.flush(t('2026-09-04T10:00:05.000Z'))
 
@@ -262,7 +262,7 @@ describe('Pipeline accumulation', () => {
 
   it('flushes what is pending on shutdown', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await burst(pipeline, '2026-09-04T10:00:00.000Z', { Soc: 80, VehicleSpeed: 0 })
     // A restart without this drops the last burst: no further message will ever
@@ -279,7 +279,7 @@ describe('Pipeline accumulation', () => {
 
   it('takes power state from connectivity messages', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await pipeline.handle(connectivity('2026-09-04T10:00:00.000Z', 'CONNECTED'))
     await pipeline.handle(field('2026-09-04T10:00:00.000Z', 'Soc', 80))
@@ -290,7 +290,7 @@ describe('Pipeline accumulation', () => {
 
   it('ignores alerts and errors', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     const result = await pipeline.handle({
       vehicleId: 'veh-1', vendor: 'tesla', receivedAt: t('2026-09-04T10:00:00.000Z'),
@@ -308,7 +308,7 @@ describe('Pipeline accumulation', () => {
 describe('Pipeline session handling', () => {
   it('opens a drive session when the car starts moving', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await burst(pipeline, '2026-09-04T10:00:00.000Z',
       { VehicleSpeed: MOVING, Odometer: 1000, Soc: 80, ChargeState: 'Disconnected' })
@@ -324,7 +324,7 @@ describe('Pipeline session handling', () => {
     // points, and that sample was never one: 2026-09-22's charge came out a
     // minute short and 0.2 kWh light.
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
     await burst(pipeline, '2026-09-22T11:56:00.000Z', {
       DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 11, ACChargingEnergyIn: 0.1, Soc: 37.6,
     })
@@ -345,7 +345,7 @@ describe('Pipeline session handling', () => {
 
   it('closes a drive once parked and summarises it from the collected points', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await burst(pipeline, '2026-09-04T10:00:00.000Z',
       { VehicleSpeed: MOVING, Odometer: 1000, Soc: 80 })
@@ -371,7 +371,7 @@ describe('Pipeline session handling', () => {
 
   it('records a battery health estimate when a charge session closes', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await burst(pipeline, '2026-09-04T20:00:00.000Z', {
       DetailedChargeState: 'DetailedChargeStateCharging',
@@ -396,7 +396,7 @@ describe('Pipeline session handling', () => {
 
   it('measures a DC charge against the DC counter, not the stale AC one', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     // The AC counter still holds 40 kWh from last night's charge at home: these
     // fields are cumulative, so the idle rail does not read 0. Taking the larger
@@ -421,7 +421,7 @@ describe('Pipeline session handling', () => {
 
   it('does not record battery health for a drive', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     // A drive's energy is inferred FROM the nameplate capacity, so feeding it
     // back into a capacity estimate would just restate the configured number.
@@ -467,7 +467,7 @@ describe('Pipeline: a drive that went nowhere', () => {
 
   it('discards it when it closes, points and all, and still reports the close', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
     await shuffle(pipeline, 39571)
     expect(openSessions(db).map((x) => x.kind)).toEqual(['drive'])
 
@@ -483,7 +483,7 @@ describe('Pipeline: a drive that went nowhere', () => {
 
   it('discards one that ends in a plug-in, and opens the charge', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
     await shuffle(pipeline, 39571)
     await burst(pipeline, '2026-09-26T00:40:43.000Z', {
       DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 1.2,
@@ -496,7 +496,7 @@ describe('Pipeline: a drive that went nowhere', () => {
   it('keeps a short hop that went somewhere, and a slow crawl that moved the odometer', async () => {
     // 2026-09-09 17:52: 0.16 km at up to 23 km/h. A real trip, however short.
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
     await burst(pipeline, '2026-09-09T17:52:25.000Z', { VehicleSpeed: 14, Odometer: 38000 })
     await burst(pipeline, '2026-09-09T17:53:25.000Z', { VehicleSpeed: 0, Odometer: 38000 })
     await burst(pipeline, '2026-09-09T17:59:00.000Z', { VehicleSpeed: 0 })
@@ -513,7 +513,7 @@ describe('Pipeline: a drive that went nowhere', () => {
     // The worker died after the car's next report, which it taped but never
     // got to emit: the replay's final flush is what closes the drive.
     const scratch = new FakeDb()
-    const s = new Pipeline(scratch, OPTS)
+    const s = new Pipeline(teslaProfile, scratch, OPTS)
     await shuffle(s, 39571)
     await s.handle(field('2026-09-26T00:44:00.000Z', 'Soc', 56))
     const [open] = scratch.state.sessions
@@ -522,7 +522,7 @@ describe('Pipeline: a drive that went nowhere', () => {
     db.state.raw = scratch.state.raw.slice()
     db.state.sessions = structuredClone(scratch.state.sessions)
     db.state.points = structuredClone(scratch.state.points)
-    const report = await new Pipeline(db, OPTS).resume(
+    const report = await new Pipeline(teslaProfile, db, OPTS).resume(
       db.state.raw, openSessions(db).map(({ id, kind, startedAt }) => ({ id, kind, startedAt })),
       t('2026-09-26T00:44:00.000Z'))
 
@@ -536,7 +536,7 @@ describe('Pipeline: a drive that went nowhere', () => {
 describe('Pipeline: measured battery capacity', () => {
   it("records the car's measured pack energy once per UTC day", async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await burst(pipeline, '2026-09-04T22:00:00.000Z',
       { NominalFullPackEnergyKwh: 72.4, Soc: 60 })
@@ -560,7 +560,7 @@ describe('Pipeline: measured battery capacity', () => {
 
   it('records nothing on a day the car never reported its pack energy', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await burst(pipeline, '2026-09-04T10:00:00.000Z', { Soc: 60, VehicleSpeed: 0 })
     await pipeline.flush(t('2026-09-04T10:00:05.000Z'))
@@ -570,7 +570,7 @@ describe('Pipeline: measured battery capacity', () => {
 
   it('derives rated range at 100% when the pack is full enough to extrapolate', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     // 200 miles of rated range on 50 of 72.4 kWh: 69% of the pack, so the
     // extrapolation to 100% is a short one. Tesla streams miles.
@@ -586,7 +586,7 @@ describe('Pipeline: measured battery capacity', () => {
 
   it('leaves rated range null when the pack is too empty to extrapolate from', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     // 15 of 72.4 kWh. Multiplying a near-empty pack's rated range by five
     // invents precision the car never claimed - no row beats a bad row, and
@@ -603,7 +603,7 @@ describe('Pipeline: measured battery capacity', () => {
 
   it('unwrites the measurement when its transaction rolls back', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     // The day-written memory lives in the pipeline, not in the database, so a
     // rollback that keeps it would skip the retry's write and lose the day's
@@ -622,7 +622,7 @@ describe('Pipeline: measured battery capacity', () => {
 describe('Pipeline idempotency', () => {
   it('leaves one row when the same messages are replayed', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
     const messages = [
       field('2026-09-04T10:00:00.000Z', 'VehicleSpeed', MOVING),
       field('2026-09-04T10:00:00.000Z', 'Odometer', 1000),
@@ -642,13 +642,13 @@ describe('Pipeline idempotency', () => {
 
   it('adopts the open session instead of opening a second one', async () => {
     const db = new FakeDb()
-    const first = new Pipeline(db, OPTS)
+    const first = new Pipeline(teslaProfile, db, OPTS)
     await burst(first, '2026-09-04T10:00:00.000Z', { VehicleSpeed: MOVING, Odometer: 1000 })
     await first.flush(t('2026-09-04T10:00:05.000Z'))
 
     // A worker that restarted without recovering state: fresh segmenter, same
     // database. The partial unique index must stop a duplicate open session.
-    const second = new Pipeline(db, OPTS)
+    const second = new Pipeline(teslaProfile, db, OPTS)
     await burst(second, '2026-09-04T10:02:00.000Z', { VehicleSpeed: MOVING, Odometer: 1002 })
     await second.flush(t('2026-09-04T10:02:05.000Z'))
 
@@ -659,7 +659,7 @@ describe('Pipeline idempotency', () => {
 describe('Pipeline transaction failure', () => {
   it('rolls the segmenter back with the transaction', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
 
     await burst(pipeline, '2026-09-04T10:00:00.000Z', { VehicleSpeed: MOVING, Odometer: 1000 })
     const trigger = field('2026-09-04T10:00:05.000Z', 'VehicleSpeed', MOVING)
@@ -685,7 +685,7 @@ describe('Pipeline transaction failure', () => {
 
   it('re-creates the month partition after a rolled-back transaction', async () => {
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
     const raw = field('2026-09-04T10:00:00.000Z', 'Soc', 80)
 
     db.failNextCommit = new Error('deadlock detected')
@@ -697,6 +697,39 @@ describe('Pipeline transaction failure', () => {
     // insert for this month would fail forever.
     await pipeline.handle(raw)
     expect(db.state.partitions).toContain('2026-8')
+  })
+})
+
+describe('Pipeline: handle and flush take turns', () => {
+  it('runs a flush started during a handle after it, not interleaved with it', async () => {
+    // The flush timer fires on its own schedule, so it can start while a handle
+    // is still awaiting its COMMIT. Each snapshots the in-memory state, and a
+    // rollback in one used to restore its snapshot over the other's progress;
+    // flush also read the accumulators before the handle had put anything in
+    // them. The gate holds the handle's transaction open so the flush has to
+    // queue behind it.
+    const db = new FakeDb() // FakeDb IS the StoreRunner: it has run(fn), no .runner
+    const order: string[] = []
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    const runner = {
+      run: async <T,>(fn: (s: Store) => Promise<T>) => {
+        order.push('start')
+        const out = await db.run(fn)
+        await gate
+        order.push('end')
+        return out
+      },
+    }
+    const p = new Pipeline(teslaProfile, runner, OPTS)
+    const h = p.handle(field('2026-09-01T00:00:00Z', 'Soc', 50))
+    // A minute later the burst is due, so the flush has real work - once the handle has run.
+    const f = p.flush(new Date('2026-09-01T00:01:00Z'))
+    await new Promise((r) => setTimeout(r, 0))
+    release()
+    await Promise.all([h, f])
+    expect(order).toEqual(['start', 'end', 'start', 'end'])
+    expect(db.state.samples).toHaveLength(1)
   })
 })
 
@@ -732,7 +765,7 @@ describe('Pipeline.resume', () => {
     // and the worker in between had no charge state, so it wrote samples and
     // no session.
     const db = new FakeDb()
-    const first = new Pipeline(db, OPTS)
+    const first = new Pipeline(teslaProfile, db, OPTS)
     const started = at('16:00') + 43_000
     await burst(first, iso(started), {
       DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 60,
@@ -742,11 +775,11 @@ describe('Pipeline.resume', () => {
     const [charge] = openSessions(db)
     expect(charge?.kind).toBe('charge')
 
-    const cold = new Pipeline(db, OPTS)
+    const cold = new Pipeline(teslaProfile, db, OPTS)
     await charging(cold, at('21:24'), at('21:32'), 76)
     await cold.flush(new Date(at('21:32') + 30_000), true)
 
-    const resumed = new Pipeline(db, OPTS)
+    const resumed = new Pipeline(teslaProfile, db, OPTS)
     await resumed.resume(tape(db), openRows(db), new Date(at('21:33')))
     await charging(resumed, at('21:33'), at('23:30'), 77)
     await burst(resumed, iso(at('23:31')), {
@@ -803,7 +836,7 @@ describe('Pipeline.resume', () => {
 
   async function straightThrough(): Promise<FakeDb> {
     const db = new FakeDb()
-    const p = new Pipeline(db, OPTS)
+    const p = new Pipeline(teslaProfile, db, OPTS)
     const bursts = afternoon()
     for (const [ms, fields] of bursts) await burst(p, iso(ms), fields)
     await p.flush(new Date(bursts.at(-1)![0] + 60_000), true)
@@ -813,12 +846,12 @@ describe('Pipeline.resume', () => {
   async function restartedAt(cut: number, graceful: boolean): Promise<FakeDb> {
     const db = new FakeDb()
     const bursts = afternoon()
-    const before = new Pipeline(db, OPTS)
+    const before = new Pipeline(teslaProfile, db, OPTS)
     for (const [ms, fields] of bursts.slice(0, cut)) await burst(before, iso(ms), fields)
     const stoppedAt = bursts[cut - 1]![0] + 30_000
     if (graceful) await before.flush(new Date(stoppedAt), true)
 
-    const after = new Pipeline(db, OPTS)
+    const after = new Pipeline(teslaProfile, db, OPTS)
     await after.resume(tape(db), openRows(db), new Date(stoppedAt))
     for (const [ms, fields] of bursts.slice(cut)) await burst(after, iso(ms), fields)
     await after.flush(new Date(bursts.at(-1)![0] + 60_000), true)
@@ -838,7 +871,7 @@ describe('Pipeline.resume', () => {
 
   it('splits a row that absorbed a second charge, closing it where the first one ended', async () => {
     const scratch = new FakeDb()
-    const s = new Pipeline(scratch, OPTS)
+    const s = new Pipeline(teslaProfile, scratch, OPTS)
     const first = at('16:00')
     await burst(s, iso(first), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40 })
     await charging(s, at('16:01'), at('16:40'), 40)
@@ -853,7 +886,7 @@ describe('Pipeline.resume', () => {
     db.state.sessions.push({
       id: 'merged', vehicleId: 'veh-1', kind: 'charge', startedAt: new Date(first), isOpen: true, summary: null,
     })
-    await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('18:21')))
+    await new Pipeline(teslaProfile, db, OPTS).resume(tape(db), openRows(db), new Date(at('18:21')))
 
     const merged = db.state.sessions.find((x) => x.id === 'merged')
     expect(merged?.isOpen).toBe(false)
@@ -863,7 +896,7 @@ describe('Pipeline.resume', () => {
 
   it('gives each row exactly the replay\'s points: no hole, and none of the charge it absorbed', async () => {
     const scratch = new FakeDb()
-    const s = new Pipeline(scratch, OPTS)
+    const s = new Pipeline(teslaProfile, scratch, OPTS)
     const first = at('16:00')
     await burst(s, iso(first), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40 })
     await charging(s, at('16:01'), at('16:40'), 40)
@@ -887,7 +920,7 @@ describe('Pipeline.resume', () => {
     db.state.points = scratch.state.points
       .filter((p) => p.sessionId === two!.id || p.ts.getTime() <= at('16:20'))
       .map((p) => ({ sessionId: 'merged', ts: p.ts }))
-    await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('18:21')))
+    await new Pipeline(teslaProfile, db, OPTS).resume(tape(db), openRows(db), new Date(at('18:21')))
 
     expect(pointsOf(db, 'merged')).toEqual(pointsOf(scratch, one!.id))
     const [second] = openRows(db)
@@ -898,7 +931,7 @@ describe('Pipeline.resume', () => {
     // A cold worker opens a charge only once the car says it is charging again,
     // and a row can be dated after the first point the replay gives it.
     const scratch = new FakeDb()
-    const s = new Pipeline(scratch, OPTS)
+    const s = new Pipeline(teslaProfile, scratch, OPTS)
     await burst(s, iso(at('16:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40 })
     await charging(s, at('16:01'), at('16:30'), 40)
     await s.flush(new Date(at('16:31')), true)
@@ -909,7 +942,7 @@ describe('Pipeline.resume', () => {
     db.state.sessions.push({
       id: 'late', vehicleId: 'veh-1', kind: 'charge', startedAt: new Date(at('16:05')), isOpen: true, summary: null,
     })
-    await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('16:31')))
+    await new Pipeline(teslaProfile, db, OPTS).resume(tape(db), openRows(db), new Date(at('16:31')))
 
     expect(openRows(db)).toEqual([{ id: 'late', kind: 'charge', startedAt: replayed!.startedAt }])
     expect(db.state.points.filter((p) => p.sessionId === 'late').map((p) => p.ts.getTime()))
@@ -921,7 +954,7 @@ describe('Pipeline.resume', () => {
     // live timer races the database near the quiet boundary. Here the row
     // falls between two charges, 10 s before the second began.
     const scratch = new FakeDb()
-    const s = new Pipeline(scratch, OPTS)
+    const s = new Pipeline(teslaProfile, scratch, OPTS)
     await burst(s, iso(at('16:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40 })
     await charging(s, at('16:01'), at('16:40'), 40)
     await burst(s, iso(at('16:41')), { DetailedChargeState: 'DetailedChargeStateDisconnected', ACChargingPower: 0 })
@@ -933,7 +966,7 @@ describe('Pipeline.resume', () => {
     db.state.sessions.push({
       id: 'early', vehicleId: 'veh-1', kind: 'charge', startedAt: new Date(at('18:00') - 10_000), isOpen: true, summary: null,
     })
-    const report = await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('18:21')))
+    const report = await new Pipeline(teslaProfile, db, OPTS).resume(tape(db), openRows(db), new Date(at('18:21')))
 
     expect(report.abandoned).toEqual([])
     expect(db.state.sessions.map((x) => x.id)).toEqual(['early'])
@@ -942,7 +975,7 @@ describe('Pipeline.resume', () => {
 
   it('does not stretch the match to a row a whole sample interval before any session', async () => {
     const scratch = new FakeDb()
-    const s = new Pipeline(scratch, OPTS)
+    const s = new Pipeline(teslaProfile, scratch, OPTS)
     await burst(s, iso(at('18:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 45 })
     await charging(s, at('18:01'), at('18:20'), 45)
 
@@ -952,14 +985,14 @@ describe('Pipeline.resume', () => {
       id: 'stale', vehicleId: 'veh-1', kind: 'charge',
       startedAt: new Date(at('18:00') - MAX_SAMPLE_INTERVAL_MS - 1), isOpen: true, summary: null,
     })
-    const report = await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('18:21')))
+    const report = await new Pipeline(teslaProfile, db, OPTS).resume(tape(db), openRows(db), new Date(at('18:21')))
 
     expect(report.abandoned.map((r) => r.id)).toEqual(['stale'])
   })
 
   it('closes an open charge with its own summary and resumes the open drive', async () => {
     const scratch = new FakeDb()
-    const s = new Pipeline(scratch, OPTS)
+    const s = new Pipeline(teslaProfile, scratch, OPTS)
     await burst(s, iso(at('16:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40 })
     await charging(s, at('16:01'), at('16:30'), 40)
     await burst(s, iso(at('16:31')), { DetailedChargeState: 'DetailedChargeStateDisconnected', ACChargingPower: 0 })
@@ -971,7 +1004,7 @@ describe('Pipeline.resume', () => {
       { id: 'c', vehicleId: 'veh-1', kind: 'charge', startedAt: new Date(at('16:00')), isOpen: true, summary: null },
       { id: 'd', vehicleId: 'veh-1', kind: 'drive', startedAt: new Date(at('16:35')), isOpen: true, summary: null },
     )
-    const p = new Pipeline(db, OPTS)
+    const p = new Pipeline(teslaProfile, db, OPTS)
     await p.resume(tape(db), openRows(db), new Date(at('16:51')))
     await driving(p, at('16:52'), at('16:53'), 1017)
     await p.flush(new Date(at('16:54')))
@@ -989,7 +1022,7 @@ describe('Pipeline.resume', () => {
     // a charge closed at startup reaches the web tier and the counters like
     // one closed by a live message.
     const scratch = new FakeDb()
-    const s = new Pipeline(scratch, OPTS)
+    const s = new Pipeline(teslaProfile, scratch, OPTS)
     await burst(s, iso(at('16:00')), { DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2, Soc: 40 })
     await charging(s, at('16:01'), at('16:30'), 40)
     await burst(s, iso(at('16:31')), { DetailedChargeState: 'DetailedChargeStateDisconnected', ACChargingPower: 0 })
@@ -1002,7 +1035,7 @@ describe('Pipeline.resume', () => {
       { id: 'orphan', vehicleId: 'veh-1', kind: 'drive', startedAt: new Date(at('09:00')), isOpen: true, summary: null },
     )
     // Crashed: the last burst, at 16:50, was never written.
-    const report = await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('16:51')))
+    const report = await new Pipeline(teslaProfile, db, OPTS).resume(tape(db), openRows(db), new Date(at('16:51')))
 
     expect(report).toMatchObject({
       sessionsClosed: 2, sessionsOpened: 1, samples: 1, lastSampleTs: new Date(at('16:50')),
@@ -1014,18 +1047,18 @@ describe('Pipeline.resume', () => {
     db.state.sessions.push({
       id: 'orphan', vehicleId: 'veh-1', kind: 'drive', startedAt: new Date(at('09:00')), isOpen: true, summary: null,
     })
-    await new Pipeline(db, OPTS).resume([], openRows(db), new Date(at('12:00')))
+    await new Pipeline(teslaProfile, db, OPTS).resume([], openRows(db), new Date(at('12:00')))
     expect(db.state.sessions[0]).toMatchObject({ id: 'orphan', isOpen: false, summary: null })
   })
 
   it('writes nothing while it replays', async () => {
     const db = new FakeDb()
-    const p = new Pipeline(db, OPTS)
+    const p = new Pipeline(teslaProfile, db, OPTS)
     await driving(p, at('10:00'), at('10:10'), 1000)
     await p.flush(new Date(at('10:10') + 30_000), true)
     const before = structuredClone(db.state)
 
-    await new Pipeline(db, OPTS).resume(tape(db), openRows(db), new Date(at('10:11')))
+    await new Pipeline(teslaProfile, db, OPTS).resume(tape(db), openRows(db), new Date(at('10:11')))
 
     expect(db.state.raw).toEqual(before.raw)
     expect(db.state.samples).toEqual(before.samples)
@@ -1039,7 +1072,7 @@ describe('Pipeline.resume', () => {
     // be by the session's start, so a restart that straddles a rate change
     // cannot make last week's charge cost this week's money.
     const scratch = new FakeDb()
-    const s = new Pipeline(scratch, OPTS, HOME)
+    const s = new Pipeline(teslaProfile, scratch, OPTS, HOME)
     await burst(s, '2026-09-04T20:00:00.000Z', {
       DetailedChargeState: 'DetailedChargeStateCharging', ACChargingPower: 7.2,
       ACChargingEnergyIn: 0, Soc: 30, LocatedAtHome: true,
@@ -1054,7 +1087,7 @@ describe('Pipeline.resume', () => {
       id: 'c', vehicleId: 'veh-1', kind: 'charge',
       startedAt: t('2026-09-04T20:00:00.000Z'), isOpen: true, summary: null,
     })
-    await new Pipeline(db, OPTS, HOME).resume(tape(db), openRows(db), t('2026-09-05T08:00:00.000Z'))
+    await new Pipeline(teslaProfile, db, OPTS, HOME).resume(tape(db), openRows(db), t('2026-09-05T08:00:00.000Z'))
 
     expect(openSessions(db)).toHaveLength(0)
     expect(db.state.rateLookups).toEqual([t('2026-09-04T20:00:00.000Z')])
@@ -1072,7 +1105,7 @@ describe('Pipeline: a charge longer than the six-hour level window', () => {
     // comes every twenty minutes (one gap of 34), sparser than the tape's
     // 4 min 18 s, so the hold does not depend on the counter being frequent.
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
     const start = t('2026-09-26T16:00:43.000Z').getTime()
     const iso = (ms: number) => new Date(ms).toISOString()
 
@@ -1110,7 +1143,7 @@ describe('Pipeline: a charge longer than the six-hour level window', () => {
     // every 4 min 18 s; the DC counter rising too, every 6 min 40 s. Power
     // is what claims the AC rail, and it is six hours old long before the end.
     const db = new FakeDb()
-    const pipeline = new Pipeline(db, OPTS)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS)
     const iso = (ms: number) => new Date(ms).toISOString()
     const at = (s: string) => t(`2026-09-26T${s}Z`).getTime()
     const complete = t('2026-09-27T00:39:45.000Z').getTime()
@@ -1162,7 +1195,7 @@ describe('Pipeline: pricing a charge as it closes', () => {
   it('prices a charge at home from the rate in force when it started', async () => {
     const db = new FakeDb()
     db.state.rates = [OLD_RATE, NEW_RATE]
-    const pipeline = new Pipeline(db, OPTS, HOME)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS, HOME)
 
     await chargeAt(pipeline, { LocatedAtHome: true })
 
@@ -1177,7 +1210,7 @@ describe('Pipeline: pricing a charge as it closes', () => {
   it('leaves a charge unpriced, but still at home, when no rate covers it', async () => {
     const db = new FakeDb()
     db.state.rates = [NEW_RATE]
-    const pipeline = new Pipeline(db, OPTS, HOME)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS, HOME)
 
     await chargeAt(pipeline, { LocatedAtHome: true })
 
@@ -1194,7 +1227,7 @@ describe('Pipeline: pricing a charge as it closes', () => {
   it('files a Supercharger stop as pending without looking a rate up', async () => {
     const db = new FakeDb()
     db.state.rates = [OLD_RATE]
-    const pipeline = new Pipeline(db, OPTS, HOME)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS, HOME)
 
     await chargeAt(pipeline, { FastChargerPresent: true })
 
@@ -1211,7 +1244,7 @@ describe('Pipeline: pricing a charge as it closes', () => {
   it('files an unidentifiable charger as unknown, never as free', async () => {
     const db = new FakeDb()
     db.state.rates = [OLD_RATE]
-    const pipeline = new Pipeline(db, OPTS, HOME)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS, HOME)
 
     await chargeAt(pipeline)
 
@@ -1227,7 +1260,7 @@ describe('Pipeline: pricing a charge as it closes', () => {
     // the failure would only show on some sessions.
     const db = new FakeDb()
     db.state.rates = [OLD_RATE]
-    const pipeline = new Pipeline(db, OPTS, HOME)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS, HOME)
 
     await chargeAt(pipeline, { LocatedAtHome: true })
 
@@ -1241,7 +1274,7 @@ describe('Pipeline: pricing a charge as it closes', () => {
     // from a meter — an invented number wearing a measured one's clothes.
     const db = new FakeDb()
     db.state.rates = [OLD_RATE]
-    const pipeline = new Pipeline(db, OPTS, HOME)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS, HOME)
 
     await burst(pipeline, '2026-09-04T09:00:00.000Z',
       { VehicleSpeed: MOVING, Location: { latitude: 47.6062, longitude: -122.3321 }, Soc: 80 })
@@ -1260,7 +1293,7 @@ describe('Pipeline: pricing a charge as it closes', () => {
     // coordinate is the fallback, and without a configured home there is none.
     const db = new FakeDb()
     db.state.rates = [OLD_RATE]
-    const pipeline = new Pipeline(db, OPTS, HOME)
+    const pipeline = new Pipeline(teslaProfile, db, OPTS, HOME)
 
     await chargeAt(pipeline, { Location: { latitude: 47.60665, longitude: -122.3321 } })
 
@@ -1380,36 +1413,36 @@ describe('FieldAccumulator staleness, at the boundaries', () => {
   it('carries a tyre pressure that is older than the volatile window', () => {
     // The regression the two-class split exists to prevent: under one 15-minute
     // window this returned undefined and the sample recorded null.
-    const acc = new FieldAccumulator()
-    acc.apply({ tpms: { fl: 2.9 } }, at(0))
-    acc.apply({ socPct: 71 }, at(40 * 60_000))
+    const acc = new FieldAccumulator(teslaProfile)
+    acc.apply({ slots: { tpms: { fl: 2.9 } } }, at(0))
+    acc.apply({ slots: { socPct: 71 } }, at(40 * 60_000))
     const taken = acc.take()
     expect(taken?.state.tpms).toEqual({ fl: 2.9 })
   })
 
   it('drops a speed that is older than the volatile window', () => {
-    const acc = new FieldAccumulator()
-    acc.apply({ speedKph: 96 }, at(0))
-    acc.apply({ socPct: 71 }, at(VOLATILE_STALE_MS))
+    const acc = new FieldAccumulator(teslaProfile)
+    acc.apply({ slots: { speedKph: 96 } }, at(0))
+    acc.apply({ slots: { socPct: 71 } }, at(VOLATILE_STALE_MS))
     expect(acc.take()?.state.speedKph).toBeUndefined()
   })
 
   it('keeps a speed one millisecond inside the window', () => {
-    const acc = new FieldAccumulator()
-    acc.apply({ speedKph: 96 }, at(0))
-    acc.apply({ socPct: 71 }, at(VOLATILE_STALE_MS - 1))
+    const acc = new FieldAccumulator(teslaProfile)
+    acc.apply({ slots: { speedKph: 96 } }, at(0))
+    acc.apply({ slots: { socPct: 71 } }, at(VOLATILE_STALE_MS - 1))
     expect(acc.take()?.state.speedKph).toBe(96)
   })
 
   it('drops a level exactly at its window and keeps it one millisecond inside', () => {
-    const stale = new FieldAccumulator()
-    stale.apply({ socPct: 55 }, at(0))
-    stale.apply({ speedKph: 0 }, at(STALE_VALUE_MS))
+    const stale = new FieldAccumulator(teslaProfile)
+    stale.apply({ slots: { socPct: 55 } }, at(0))
+    stale.apply({ slots: { speedKph: 0 } }, at(STALE_VALUE_MS))
     expect(stale.take()?.state.socPct).toBeUndefined()
 
-    const fresh = new FieldAccumulator()
-    fresh.apply({ socPct: 55 }, at(0))
-    fresh.apply({ speedKph: 0 }, at(STALE_VALUE_MS - 1))
+    const fresh = new FieldAccumulator(teslaProfile)
+    fresh.apply({ slots: { socPct: 55 } }, at(0))
+    fresh.apply({ slots: { speedKph: 0 } }, at(STALE_VALUE_MS - 1))
     expect(fresh.take()?.state.socPct).toBe(55)
   })
 
@@ -1419,18 +1452,18 @@ describe('FieldAccumulator staleness, at the boundaries', () => {
     // collapsed name as volatile expired nothing. A charge that stops being
     // reported must go null, not keep claiming 11 kW: a non-zero power holds a
     // charge session open exactly as a non-zero speed holds a drive open.
-    const acc = new FieldAccumulator()
-    acc.apply({ acPowerKw: 11, activeRail: 'ac' }, at(0))
-    acc.apply({ socPct: 71 }, at(VOLATILE_STALE_MS))
+    const acc = new FieldAccumulator(teslaProfile)
+    acc.apply({ slots: { acPowerKw: 11, activeRail: 'ac' } }, at(0))
+    acc.apply({ slots: { socPct: 71 } }, at(VOLATILE_STALE_MS))
     const taken = acc.take()
     expect(taken?.state.acPowerKw).toBeUndefined()
     expect(teslaStateToSample('veh-1', taken!.ts, taken!.state).chargePowerKw).toBeNull()
   })
 
   it('keeps a charge power one millisecond inside the volatile window', () => {
-    const acc = new FieldAccumulator()
-    acc.apply({ dcPowerKw: 48, activeRail: 'dc' }, at(0))
-    acc.apply({ socPct: 71 }, at(VOLATILE_STALE_MS - 1))
+    const acc = new FieldAccumulator(teslaProfile)
+    acc.apply({ slots: { dcPowerKw: 48, activeRail: 'dc' } }, at(0))
+    acc.apply({ slots: { socPct: 71 } }, at(VOLATILE_STALE_MS - 1))
     const taken = acc.take()
     expect(teslaStateToSample('veh-1', taken!.ts, taken!.state).chargePowerKw).toBe(48)
   })
@@ -1445,42 +1478,42 @@ describe('FieldAccumulator staleness, at the boundaries', () => {
    * hours after the last one, so a lost `Complete` cannot hold a charge open.
    */
   it('keeps the charge state past its window when charging power is reported', () => {
-    const acc = new FieldAccumulator()
-    acc.apply({ chargeStateDetailed: 'charging' }, at(0))
-    acc.apply({ acPowerKw: 7.2, activeRail: 'ac' }, at(STALE_VALUE_MS + 60_000))
+    const acc = new FieldAccumulator(teslaProfile)
+    acc.apply({ slots: { chargeStateDetailed: 'charging' } }, at(0))
+    acc.apply({ slots: { acPowerKw: 7.2, activeRail: 'ac' } }, at(STALE_VALUE_MS + 60_000))
     expect(acc.take()?.state.chargeStateDetailed).toBe('charging')
   })
 
   it('keeps the charge state while the energy counter rises, with no power reported', () => {
-    const acc = new FieldAccumulator()
-    acc.apply({ chargeStateDetailed: 'charging' }, at(0))
-    acc.apply({ acEnergyKwh: 10 }, at(60 * 60_000))
-    acc.apply({ acEnergyKwh: 10.5 }, at(5 * 60 * 60_000))
-    acc.apply({ socPct: 80 }, at(STALE_VALUE_MS + 30 * 60_000))
+    const acc = new FieldAccumulator(teslaProfile)
+    acc.apply({ slots: { chargeStateDetailed: 'charging' } }, at(0))
+    acc.apply({ slots: { acEnergyKwh: 10 } }, at(60 * 60_000))
+    acc.apply({ slots: { acEnergyKwh: 10.5 } }, at(5 * 60 * 60_000))
+    acc.apply({ slots: { socPct: 80 } }, at(STALE_VALUE_MS + 30 * 60_000))
     expect(acc.take()?.state.chargeStateDetailed).toBe('charging')
   })
 
   it('does not count a zero power or a counter that stays put as charging', () => {
-    const acc = new FieldAccumulator()
-    acc.apply({ chargeStateDetailed: 'charging' }, at(0))
-    acc.apply({ acEnergyKwh: 10 }, at(60 * 60_000))
-    acc.apply({ acEnergyKwh: 10, acPowerKw: 0 }, at(5 * 60 * 60_000))
-    acc.apply({ socPct: 80 }, at(STALE_VALUE_MS))
+    const acc = new FieldAccumulator(teslaProfile)
+    acc.apply({ slots: { chargeStateDetailed: 'charging' } }, at(0))
+    acc.apply({ slots: { acEnergyKwh: 10 } }, at(60 * 60_000))
+    acc.apply({ slots: { acEnergyKwh: 10, acPowerKw: 0 } }, at(5 * 60 * 60_000))
+    acc.apply({ slots: { socPct: 80 } }, at(STALE_VALUE_MS))
     expect(acc.take()?.state.chargeStateDetailed).toBeUndefined()
   })
 
   it('drops the charge state six hours after the last sign of charging', () => {
-    const acc = new FieldAccumulator()
-    acc.apply({ chargeStateDetailed: 'charging' }, at(0))
-    acc.apply({ acPowerKw: 7.2, activeRail: 'ac' }, at(60 * 60_000))
-    acc.apply({ socPct: 80 }, at(60 * 60_000 + STALE_VALUE_MS))
+    const acc = new FieldAccumulator(teslaProfile)
+    acc.apply({ slots: { chargeStateDetailed: 'charging' } }, at(0))
+    acc.apply({ slots: { acPowerKw: 7.2, activeRail: 'ac' } }, at(60 * 60_000))
+    acc.apply({ slots: { socPct: 80 } }, at(60 * 60_000 + STALE_VALUE_MS))
     expect(acc.take()?.state.chargeStateDetailed).toBeUndefined()
   })
 
   it('never invents a value for a field that was never reported', () => {
     // Absent must stay absent so teslaStateToSample writes null, not 0.
-    const acc = new FieldAccumulator()
-    acc.apply({ socPct: 55 }, at(0))
+    const acc = new FieldAccumulator(teslaProfile)
+    acc.apply({ slots: { socPct: 55 } }, at(0))
     const taken = acc.take()
     expect(taken?.state.speedKph).toBeUndefined()
     expect('speedKph' in (taken?.state ?? {})).toBe(false)

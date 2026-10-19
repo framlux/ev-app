@@ -21,6 +21,7 @@ import {
   type OpenSessionRow,
 } from '@ev/db'
 import { loadConfig } from './config.js'
+import { profileFor } from './deps.js'
 import { Pipeline } from './pipeline.js'
 import { replayStoreOn } from './store.js'
 
@@ -91,6 +92,8 @@ async function main(): Promise<void> {
     // be replayed straight into the DO NOTHING. A backfill that silently skips
     // a vehicle is exactly the failure this is here to remove.
     const pipeline = new Pipeline(
+      // Tesla until the vendor is wired through config.
+      profileFor('tesla'),
       { run: (fn) => fn(replayStoreOn(client, config.cursorSource)) },
       { usableCapacityKwh: config.usableCapacityKwh },
       // The same home the live worker prices with, and not optional here. A

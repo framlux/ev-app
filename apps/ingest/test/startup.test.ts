@@ -8,6 +8,7 @@ import {
   runMigrationsUnderGate, VEHICLE_CHANGED_CHANNEL, withTransaction,
 } from '@ev/db'
 import { Pipeline } from '../src/pipeline.js'
+import { teslaProfile } from '../src/profiles/tesla.js'
 import { pgRunner, registerVehicle, resumeFromTape } from '../src/store.js'
 
 /**
@@ -70,7 +71,7 @@ describe.skipIf(!hasDb)('worker startup', () => {
   it('registers the configured vehicle, so the first message is ingested', async () => {
     await registerVehicle(getPool(), identity)
 
-    const pipeline = new Pipeline(pgRunner(getPool(), 'startup-test', VEHICLE), {
+    const pipeline = new Pipeline(teslaProfile, pgRunner(getPool(), 'startup-test', VEHICLE), {
       usableCapacityKwh: 75,
     })
     await pipeline.handle(field('Soc', 80))
@@ -128,7 +129,7 @@ describe.skipIf(!hasDb)('worker startup', () => {
     listener.on('notification', (msg) => heard.push(parseVehicleChange(msg.payload ?? '')))
     await listener.query(`LISTEN ${VEHICLE_CHANGED_CHANNEL}`)
 
-    const pipeline = new Pipeline(pgRunner(pool, 'startup-test', VEHICLE), { usableCapacityKwh: 75 })
+    const pipeline = new Pipeline(teslaProfile, pgRunner(pool, 'startup-test', VEHICLE), { usableCapacityKwh: 75 })
     const report = await resumeFromTape(pool, pipeline, VEHICLE, new Date(Date.UTC(2027, 1, 10, 10, 20)))
     await new Promise((r) => setTimeout(r, 200))
     await listener.query(`UNLISTEN ${VEHICLE_CHANGED_CHANNEL}`)

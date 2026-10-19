@@ -1,12 +1,4 @@
 import {
-  TESLA_FIELDS,
-  slotsOf,
-  teslaStateToSample,
-  type TeslaFieldState,
-  type TeslaFieldUpdate,
-} from '@ev/tesla'
-import { decodeIfKnown } from './deps.js'
-import {
   classifyCharge,
   priceCharge,
   type ChargeCost,
@@ -25,6 +17,24 @@ import {
   type SessionSummary,
   type VehicleSample,
 } from './deps.js'
+import type { Decoded, VendorProfile } from './profile.js'
+import {
+  MAX_SAMPLE_INTERVAL_MS,
+  QUIET_PERIOD_MS,
+} from './timing.js'
+
+// The clocks live in timing.ts so a vendor profile can use them without
+// importing this file. Re-exported so every existing import keeps working.
+export {
+  MAX_SAMPLE_INTERVAL_MS,
+  QUIET_PERIOD_MS,
+  STALE_VALUE_MS,
+  VOLATILE_STALE_MS,
+} from './timing.js'
+
+// The Tesla envelope moved to its profile with the code that reads it. Re-exported
+// because mqtt.ts writes it and the tests read it back through this module.
+export { readEnvelope, type RecordKind, type TeslaEnvelope } from './profiles/tesla.js'
 
 /**
  * The pipeline's view of persistence.
@@ -108,26 +118,6 @@ export interface StoreRunner {
   run<T>(fn: (store: Store) => Promise<T>): Promise<T>
 }
 
-export type RecordKind = 'metrics' | 'alert' | 'error' | 'connectivity'
-
-/**
- * One fleet-telemetry MQTT message, as it is written to the tape.
- *
- * The transport publishes ONE FIELD PER MESSAGE and puts the field name in the
- * topic, not in the body, so the body alone is meaningless: `72.5` could be a
- * state of charge or an inside temperature. `mqtt.ts` therefore folds the topic
- * into this envelope before the message is stored, which is what keeps
- * `raw_message` replayable - `reprocess` sees exactly what the handler saw.
- */
-export interface TeslaEnvelope {
-  kind: RecordKind
-  vin: string
-  /** Metrics: the Tesla field name. Alerts/errors: the alert or error name. */
-  field: string | null
-  /** The decoded JSON body: a number, string, boolean, object, or null. */
-  value: unknown
-}
-
 export interface PipelineResult {
   /** Samples handed to the store. Rows may be deduplicated by the store. */
   samples: number
@@ -137,182 +127,36 @@ export interface PipelineResult {
   fieldsApplied: number
   /** Messages carrying nothing we could place: unknown field, unreadable value. */
   unmapped: number
+  /**
+   * Properties that arrived without a usable timestamp of their own and were
+   * stamped with the message's arrival instead (spec §6.4). Always 0 for Tesla,
+   * which publishes none; for Rivian it is the count a rising
+   * `ev_ingest_untimed_values_total` is read from.
+   */
+  untimed: number
   /** Timestamp of the newest sample emitted here, for the staleness gauge. */
   lastSampleTs: Date | null
 }
 
 const EMPTY: PipelineResult = {
   samples: 0, sessionsOpened: 0, sessionsClosed: 0,
-  fieldsApplied: 0, unmapped: 0, lastSampleTs: null,
-}
-
-/**
- * How long a vehicle must go quiet before its accumulated fields are emitted as
- * one sample.
- *
- * WHY DEBOUNCE AT ALL. fleet-telemetry publishes one message per field, so the
- * naive "a message is a sample" rule would write one row per field, each with
- * every other field null. That is worse than merely wasteful: the segmenter
- * reads speed, charge state and SoC off each sample, and a stream in which
- * almost every field is null looks like a car that keeps forgetting how fast it
- * is going. Drives would split, charges would end early, and the derived tables
- * would be wrong in a way that no later fix can distinguish from reality.
- *
- * Two seconds because the car publishes a burst of fields at each of its
- * reporting intervals: a gap that long means the burst is over, so the sample we
- * emit is a coherent snapshot rather than half of one.
- */
-export const QUIET_PERIOD_MS = 2_000
-
-/**
- * A hard ceiling on how long accumulation may continue without emitting.
- *
- * A continuously chatty car (a fast-charging session publishes power and SoC
- * without pause) may never leave a two-second gap. Without this it would
- * accumulate forever and produce no samples at all - exactly the silent stall
- * the ingest alert exists to catch, but with the worker looking perfectly
- * healthy. 30s is under the segmenter's one-minute-scale thresholds, so the
- * emitted stream still resolves everything the segmenter reasons about.
- */
-export const MAX_SAMPLE_INTERVAL_MS = 30_000
-
-/**
- * How long a field's value may be carried into later samples.
- *
- * DECISION: values DO persist between samples. Fields are published on change or
- * on their own interval, so the last reported value genuinely is the current
- * one; dropping it would put us back to samples that are almost entirely null.
- * A field never reported at all stays null - it is simply absent from the map,
- * and `teslaStateToSample` writes null for what is absent, never 0.
- *
- * But the window is PER FIELD CLASS, because a single global one is wrong in
- * both directions at once, and the first version of this used 15 minutes for
- * everything and was wrong both ways:
- *
- *  - TOO SHORT for level fields. scripts/push-telemetry-config.sh asks for
- *    TpmsPressure* every 3600s and Locked/DoorState/RatedRange/temps every 300s,
- *    and those are MINIMUM intervals - an unchanged value may simply not be
- *    resent. Expiring them turns a perfectly current tyre pressure into null and
- *    writes that null into the sample table as though the car had stopped
- *    reporting it.
- *  - TOO LONG for instantaneous fields. A car that reports 60 kph and then only
- *    publishes tyre pressures for the next quarter of an hour would keep
- *    emitting samples saying it is still doing 60, holding a drive open against
- *    a car that has actually parked.
- *
- * So: a level is true until contradicted, and a rate is only true for a moment.
- */
-
-/** Rates and instantaneous readings. A stale one of these actively misleads. */
-export const VOLATILE_STALE_MS = 5 * 60_000
-
-/**
- * Levels: state that remains true until the car says otherwise. Six hours is
- * comfortably past the longest interval we request (TPMS, 3600s) while still
- * bounding the carry so an abandoned accumulator cannot describe a car that has
- * been gone for days.
- */
-export const STALE_VALUE_MS = 6 * 60 * 60_000
-
-/**
- * Drive-tier fields whose last value is still true in Park, so they are carried
- * like levels despite their tier.
- *
- * `Location` and `Gear` are on the drive tier because they are asked for often
- * while moving, not because they decay: a parked car is still where it parked,
- * and a car left in P stays in P. Expiring either would write a null over a
- * fact - the position column would blank mid-drive whenever GPS went quiet for
- * five minutes, which is a gap in the route rather than an absence of one.
- */
-const CARRIED_DRIVE_FIELDS: ReadonlySet<string> = new Set(['Location', 'Gear'])
-
-/**
- * Slots that are volatile for a reason the tier does not express.
- *
- * `speedKph` is also drive-tier, and is repeated here because it is the one
- * that matters most: the segmenter reads a null speed as 'unknown' motion,
- * which does NOT start the parked clock, so a stale non-zero speed is what
- * wedges a drive open. The two charge rails are the same argument for charge
- * sessions - a carried non-zero power holds a session open against a car that
- * has been unplugged - and they are charge-tier, so nothing below would pick
- * them up.
- *
- * `satisfies keyof TeslaFieldState` is the load-bearing part: this list is the
- * hand-written half of the set, and it is exactly where the bug lived.
- * `chargePowerKw` was listed here for a year and expired nothing, because it is
- * a COLUMN - `teslaStateToSample` collapses the two rails into it - and never a
- * slot, so `staleWindowFor` was never called with that name. Written this way
- * the same mistake is a compile error.
- */
-const ALWAYS_VOLATILE = [
-  'speedKph',
-  'acPowerKw',
-  'dcPowerKw',
-] as const satisfies readonly (keyof TeslaFieldState)[]
-
-/**
- * The slots treated as volatile: a rate or an instantaneous reading, whose
- * staleness actively misleads rather than merely ages.
- *
- * DERIVED FROM THE FIELD CATALOGUE, not listed. The drive tier already means
- * "pins to a constant in Park" - speed 0, torque 0, pedals released - which is
- * the same statement as "a value carried out of a drive is a lie". Listing them
- * by hand at 20 fields (and at 204 signals, growing) is how the `chargePowerKw`
- * entry survived: a name that matches no slot is silently inert, and the field
- * it was meant to expire is carried for six hours instead of five minutes.
- *
- * Everything not here - SoC, odometer, range, lock state, doors, temperatures,
- * tyre pressures, charge state - is a level, and its last value stays true.
- */
-export const VOLATILE_FIELDS: ReadonlySet<string> = new Set<string>([
-  ...ALWAYS_VOLATILE,
-  ...TESLA_FIELDS
-    .filter((e) => e.tier === 'drive' && !CARRIED_DRIVE_FIELDS.has(e.field))
-    .flatMap(slotsOf),
-])
-
-/**
- * The slots a charge's state lives in, and the signs that a charge is going on.
- *
- * The car sends a field only when it changes, so a steady charge reports its
- * state once, when it starts, and its power only when it moves by 0.5 kW: the
- * 2026-09-26 charge sent no power at all for eight hours. Expired like any other
- * level, the state vanished six hours in, the segmenter read the charge as
- * paused, closed it ten minutes later with energy still flowing, and ignored
- * the `Complete` that followed. So a sign of charging - positive power, or an
- * energy counter above where it stood (its delta is 0.1 kWh, so it moves every
- * few minutes while energy flows) - refreshes the state as if the car had just
- * said it again. It still expires six hours after the last sign, so a lost
- * `Complete` cannot hold a charge open forever.
- *
- * `activeRail` is refreshed with it. Only positive power claims a rail, and it
- * says which counter measures the charge; expired, both counters are known and
- * `chooseEnergy` gives up, so the same charge was measured only to 22:00 (8.3
- * of its 12.0 kWh). A rising counter does not claim a rail itself: the DC
- * counter rose through that AC charge too.
- */
-const CHARGE_STATE_SLOTS = [
-  'chargeStateDetailed',
-  'chargeStateBasic',
-  'activeRail',
-] as const satisfies readonly (keyof TeslaFieldState)[]
-const CHARGING_POWER_SLOTS = [
-  'acPowerKw',
-  'dcPowerKw',
-] as const satisfies readonly (keyof TeslaFieldState)[]
-const CHARGING_ENERGY_SLOTS = [
-  'acEnergyKwh',
-  'dcEnergyKwh',
-] as const satisfies readonly (keyof TeslaFieldState)[]
-
-export function staleWindowFor(field: string): number {
-  return VOLATILE_FIELDS.has(field) ? VOLATILE_STALE_MS : STALE_VALUE_MS
+  fieldsApplied: 0, unmapped: 0, untimed: 0, lastSampleTs: null,
 }
 
 /** One field's latest value and when that value arrived. */
 interface Entry {
   value: unknown
+  /**
+   * What the carry window runs from: the vehicle's own observation time where
+   * the profile gave one, otherwise the arrival of the frame that carried it.
+   */
   at: number
+  /**
+   * The vehicle's observation time, set only when `Decoded.observedAt` gave one.
+   * It is what separates "newer than what we hold" from "merely arrived later"
+   * (see `apply`), and is undefined for every Tesla value.
+   */
+  observed?: number | undefined
 }
 
 /**
@@ -327,6 +171,12 @@ interface Entry {
  * The live worker still needs `Pipeline.flush()` on an interval for the other
  * half of the problem: a car that goes quiet sends no further message, so
  * nothing would arrive to trigger the emit.
+ *
+ * Arrival drives WHEN a sample is emitted; it need not drive how long a value is
+ * carried. Where the profile says when the vehicle observed a value
+ * (`Decoded.observedAt`, spec §6.4) the carry window runs from that, so a
+ * snapshot re-sent after a resubscribe cannot make an old value look new.
+ * Everything vendor-specific - the windows, the charge slots - is the profile's.
  */
 export class FieldAccumulator {
   private slots = new Map<string, Entry>()
@@ -335,16 +185,32 @@ export class FieldAccumulator {
   /** Arrival of the oldest field in the pending sample, for the hard-ceiling rule. */
   private pendingSince: number | null = null
 
-  apply(update: TeslaFieldUpdate, at: Date): void {
+  constructor(private readonly profile: VendorProfile) {}
+
+  /**
+   * Fold one decoded message in. `at` is the message's arrival, which drives the
+   * emit timing whatever the values inside say about when they were observed.
+   */
+  apply(decoded: Decoded, at: Date): void {
     const ms = at.getTime()
     // Before the slots move: a rising counter is judged against where it stood.
-    const charging = this.showsCharging(update)
-    for (const [key, value] of Object.entries(update)) {
+    const charging = this.showsCharging(decoded.slots)
+    for (const [key, value] of Object.entries(decoded.slots)) {
       if (value === undefined) continue
-      this.slots.set(key, { value, at: ms })
+      // The vehicle's own observation time where the vendor gives one (spec
+      // §6.4), never later than the frame that carried it; arrival otherwise.
+      const observed = decoded.observedAt?.[key]
+      const stamp = observed === undefined ? ms : Math.min(observed, ms)
+      // A re-sent snapshot can carry an OLDER observation than the one we hold
+      // (a resubscribe replays the car's last-known values); it must not
+      // overwrite a newer one. Only values with an observation time compete
+      // this way - Tesla never sets one, so its behaviour is unchanged.
+      const held = this.slots.get(key)
+      if (observed !== undefined && held?.observed !== undefined && stamp < held.observed) continue
+      this.slots.set(key, { value, at: stamp, observed: observed === undefined ? undefined : stamp })
     }
     if (charging) {
-      for (const key of CHARGE_STATE_SLOTS) {
+      for (const key of this.profile.chargeStateSlots) {
         const entry = this.slots.get(key)
         // A new entry, not a mutation: `clone` shares entries with its copy.
         if (entry) this.slots.set(key, { value: entry.value, at: ms })
@@ -354,14 +220,17 @@ export class FieldAccumulator {
     this.pendingSince ??= ms
   }
 
-  /** Positive power, or an energy counter above where it stood. See CHARGE_STATE_SLOTS. */
-  private showsCharging(update: TeslaFieldUpdate): boolean {
-    for (const key of CHARGING_POWER_SLOTS) {
-      const value = update[key]
+  /**
+   * Positive power, or an energy counter above where it stood. The slots are the
+   * profile's; the reasoning is on `CHARGE_STATE_SLOTS` in `profiles/tesla.ts`.
+   */
+  private showsCharging(slots: Record<string, unknown>): boolean {
+    for (const key of this.profile.chargingPowerSlots) {
+      const value = slots[key]
       if (typeof value === 'number' && value > 0) return true
     }
-    for (const key of CHARGING_ENERGY_SLOTS) {
-      const value = update[key]
+    for (const key of this.profile.chargingEnergySlots) {
+      const value = slots[key]
       const before = this.slots.get(key)?.value
       if (typeof value === 'number' && typeof before === 'number' && value > before) return true
     }
@@ -388,14 +257,15 @@ export class FieldAccumulator {
 
   /**
    * Take the pending sample's state, stamped with the arrival time of its newest
-   * field. Values older than STALE_VALUE_MS are dropped rather than carried.
+   * field. Values older than the profile's window for their slot (measured from
+   * when the vehicle observed them, where it said) are dropped rather than carried.
    */
-  take(): { state: TeslaFieldUpdate; ts: Date } | null {
+  take(): { state: Record<string, unknown>; ts: Date } | null {
     if (this.newestAt === null) return null
     const ts = this.newestAt
     const state: Record<string, unknown> = {}
     for (const [key, entry] of this.slots) {
-      if (ts - entry.at >= staleWindowFor(key)) {
+      if (ts - entry.at >= this.profile.staleWindowFor(key)) {
         this.slots.delete(key)
         continue
       }
@@ -403,12 +273,12 @@ export class FieldAccumulator {
     }
     this.pendingSince = null
     // newestAt is kept: it is the anchor for the staleness of what remains.
-    return { state: state as TeslaFieldUpdate, ts: new Date(ts) }
+    return { state, ts: new Date(ts) }
   }
 
   /** Deep enough copy for transaction rollback. Entries are immutable. */
   clone(): FieldAccumulator {
-    const copy = new FieldAccumulator()
+    const copy = new FieldAccumulator(this.profile)
     copy.slots = new Map(this.slots)
     copy.newestAt = this.newestAt
     copy.pendingSince = this.pendingSince
@@ -459,14 +329,21 @@ export class Pipeline {
    * UPDATE a day.
    */
   private measuredDays = new Map<string, string>()
+  /** The tail of the work queue. See `locked`. */
+  private chain: Promise<unknown> = Promise.resolve()
 
   /**
+   * `profile` is the vendor: how a message is read, how long each slot stays
+   * true, which slots mean a charge is going on, and how the merged state
+   * becomes a row. The pipeline itself names no vendor.
+   *
    * `home` is optional and defaults to off, because EV_HOME_LAT/LON are
    * optional: without them the coordinate fallback is disabled and the car's
    * own `locatedAtHome` is the only test of where a charge happened, which is
    * the better signal anyway (spec §3.8).
    */
   constructor(
+    private profile: VendorProfile,
     private runner: StoreRunner,
     private opts: MetricsOptions,
     private home: HomeLocation | null = null,
@@ -499,10 +376,11 @@ export class Pipeline {
         result = merge(result, await this.emit(store, raw.vehicleId, acc))
       }
 
-      const update = decode(raw)
-      if (update) {
-        acc.apply(update, raw.receivedAt)
+      const decoded = this.profile.decode(raw)
+      if (decoded) {
+        acc.apply(decoded, raw.receivedAt)
         result.fieldsApplied = 1
+        result.untimed = decoded.untimed ?? 0
       } else {
         result.unmapped = 1
       }
@@ -521,17 +399,29 @@ export class Pipeline {
    * the interval a car that goes quiet leaves its last burst in memory until the
    * next message, which may be hours away or (across a restart) never; `force`
    * at shutdown is what stops a planned restart from dropping it.
+   *
+   * The lock is taken ONCE for the whole loop, and each emit is an `attempt`
+   * inside it. Two reasons. Taking it per vehicle would let a handle() slip in
+   * between two emits of one flush; and the loop reads `this.accumulators`, which
+   * a queued handle may be about to change, so it must not start until that
+   * handle has run. Each accumulator is re-read from the map as the loop reaches
+   * it, because an `attempt` that rolls back replaces the whole map with its
+   * snapshot's clones, and an accumulator held from before would be one the
+   * pipeline no longer owns.
    */
   async flush(now: Date = new Date(), force = false): Promise<PipelineResult> {
-    let result = { ...EMPTY }
-    for (const [vehicleId, acc] of this.accumulators) {
-      if (!(force ? acc.pending : acc.due(now))) continue
-      result = merge(
-        result,
-        await this.transactionally((store) => this.emit(store, vehicleId, acc)),
-      )
-    }
-    return result
+    return this.locked(async () => {
+      let result = { ...EMPTY }
+      for (const vehicleId of [...this.accumulators.keys()]) {
+        const acc = this.accumulators.get(vehicleId)
+        if (!acc || !(force ? acc.pending : acc.due(now))) continue
+        result = merge(
+          result,
+          await this.attempt((store) => this.emit(store, vehicleId, this.accumulators.get(vehicleId)!)),
+        )
+      }
+      return result
+    })
   }
 
   /** Feed one already-normalised sample. Used by reprocess and by tests. */
@@ -637,7 +527,7 @@ export class Pipeline {
   private accumulatorFor(vehicleId: string): FieldAccumulator {
     let acc = this.accumulators.get(vehicleId)
     if (!acc) {
-      acc = new FieldAccumulator()
+      acc = new FieldAccumulator(this.profile)
       this.accumulators.set(vehicleId, acc)
     }
     return acc
@@ -648,10 +538,28 @@ export class Pipeline {
   ): Promise<PipelineResult> {
     const pending = acc.take()
     if (!pending) return { ...EMPTY }
-    return this.applySample(store, teslaStateToSample(vehicleId, pending.ts, pending.state))
+    return this.applySample(store, this.profile.toSample(vehicleId, pending.ts, pending.state))
   }
 
-  private async transactionally<T>(fn: (store: Store) => Promise<T>): Promise<T> {
+  /**
+   * One unit of work at a time. The flush timer used to be able to run in the
+   * middle of a handle(): each snapshots the in-memory state, and a rollback in
+   * one restored its snapshot over the other's committed progress - and flush
+   * read `this.accumulators` before a queued handle had run. A promise chain,
+   * not a mutex library: the queue is never deeper than one flush and the
+   * message mqtt.js is already waiting on.
+   *
+   * NEVER call `locked` or `transactionally` from inside a `locked` callback:
+   * the inner call would wait on the outer one forever.
+   */
+  private locked<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.chain.then(fn, fn)
+    this.chain = next.catch(() => undefined)
+    return next
+  }
+
+  /** Snapshot, run one transaction, restore on failure. No lock: callers hold it. */
+  private async attempt<T>(fn: (store: Store) => Promise<T>): Promise<T> {
     const snapshot = this.snapshot()
     try {
       return await this.runner.run(fn)
@@ -664,6 +572,10 @@ export class Pipeline {
       this.restore(snapshot)
       throw err
     }
+  }
+
+  private transactionally<T>(fn: (store: Store) => Promise<T>): Promise<T> {
+    return this.locked(() => this.attempt(fn))
   }
 
   private async applySample(store: Store, sample: VehicleSample): Promise<PipelineResult> {
@@ -894,37 +806,6 @@ function ratedRangeAtFull(s: VehicleSample): number | null {
   return Math.round((rated / fraction) * 10) / 10
 }
 
-/**
- * One taped message -> the fields it contributes.
- *
- * The vendor dispatch lives in `deps.ts`, which is the seam Rivian will be added
- * at. It is imported lazily inside the function because deps.ts imports
- * `readEnvelope` from this module, and a top-level import would make that cycle
- * load-bearing at module-evaluation time.
- */
-function decode(raw: RawMessage): TeslaFieldUpdate | null {
-  return decodeIfKnown(raw)
-}
-
-/**
- * Read the envelope back off the tape.
- *
- * Defensive because `reprocess` feeds rows written by older builds of this
- * worker: an unrecognised payload shape yields null (counted as unmapped) rather
- * than an exception that would abort the whole replay transaction.
- */
-export function readEnvelope(payload: unknown): TeslaEnvelope | null {
-  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null
-  const o = payload as Record<string, unknown>
-  const kind = o['kind']
-  if (kind !== 'metrics' && kind !== 'alert' && kind !== 'error' && kind !== 'connectivity') {
-    return null
-  }
-  const vin = typeof o['vin'] === 'string' ? o['vin'] : ''
-  const field = typeof o['field'] === 'string' ? o['field'] : null
-  return { kind, vin, field, value: o['value'] }
-}
-
 function merge(a: PipelineResult, b: PipelineResult): PipelineResult {
   return {
     samples: a.samples + b.samples,
@@ -932,6 +813,7 @@ function merge(a: PipelineResult, b: PipelineResult): PipelineResult {
     sessionsClosed: a.sessionsClosed + b.sessionsClosed,
     fieldsApplied: a.fieldsApplied + b.fieldsApplied,
     unmapped: a.unmapped + b.unmapped,
+    untimed: a.untimed + b.untimed,
     lastSampleTs: later(a.lastSampleTs, b.lastSampleTs),
   }
 }

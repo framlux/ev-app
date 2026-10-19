@@ -1,5 +1,6 @@
 import { closePool, getPool, type DbPool } from '@ev/db'
 import { loadConfig } from './config.js'
+import { profileFor } from './deps.js'
 import {
   handlerErrorsTotal,
   initialiseSeries,
@@ -87,6 +88,8 @@ async function main(): Promise<void> {
   // merged into the next one (see Pipeline.resume).
   const { pipeline, report } = await resumeOrStartCold(
     () => new Pipeline(
+      // Tesla until the vendor is wired through config.
+      profileFor('tesla'),
       pgRunner(pool, config.cursorSource, config.vehicle.id),
       { usableCapacityKwh: config.usableCapacityKwh },
       // Where the car lives, for the charges its own `locatedAtHome` never
